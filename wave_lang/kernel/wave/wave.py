@@ -53,7 +53,9 @@ from .constraints import (
     TilingConstraint,
     WaveConstraint,
     WorkgroupConstraint,
+    DeviceConstraint,
     get_grid_shape,
+    get_device_layout,
 )
 from .construct_index_mapping import construct_index_mapping
 from .debug_log_hoist import (
@@ -65,6 +67,7 @@ from .decompose_dot_mma import decompose_dot_mma
 from .decompose_reduce_ops import decompose_reduce_ops
 from .decompose_scan_ops import decompose_scan_ops
 from .decompose_vmma_ops import decompose_vmma_ops
+from .device_reshape import reshape_per_device
 from .expansion.expansion import add_get_results, expand_graph
 from .gather_to_shared import gather_to_shared, gather_to_shared_swizzling
 from .generate_bounds_exprs import generate_bounds_exprs
@@ -96,6 +99,7 @@ from .utils.print_utils import print_trace, try_apply_pass
 # Utils
 from .utils.symbol_utils import safe_subs, subs_idxc, get_induction_symbol
 from .workgroup_reordering import reorder_workgroups
+
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +196,10 @@ class LaunchableWave(Launchable):
         self._name = name
         self._f = eager_function
         self._sig = inspect.signature(eager_function)
-
-        self.grid_type = Grid[tuple(get_grid_shape(self.workgroup_constraints))]
+        self.grid_type = Grid[
+            tuple(get_grid_shape(self.workgroup_constraints, self.device_constraints))
+        ]
+        self.device_layout = Grid[tuple(get_device_layout(self.device_constraints))]
 
         # TODO: needed for the wave_runtime grid calculations, we should really
         # just generate host wrapper suitable for wave_runtime instead of doing
@@ -218,6 +224,14 @@ class LaunchableWave(Launchable):
 
                 symbols_args_map[symbol] = (arg_idx, dim)
         self.symbols_args_map = symbols_args_map
+
+    @property
+    def device_constraints(self) -> list[DeviceConstraint]:
+        return [
+            constraint
+            for constraint in self.constraints
+            if isinstance(constraint, DeviceConstraint)
+        ]
 
     @property
     def workgroup_constraints(self) -> list[WorkgroupConstraint]:
@@ -497,6 +511,20 @@ class LaunchableWave(Launchable):
             )
             self.grid_type.dims[dim] *= safe_subs(constraint.count, idxc.subs)
 
+    def infer_device_layout(self, idxc: IndexingContext):
+        self.device_layout.dims = [1, 1, 1]
+        max_device_dim = 2
+        aliases = [x.source for x in self.constraints if isinstance(x, SymbolicAlias)]
+        for constraint in self.device_constraints:
+            if constraint.dim in aliases:
+                continue
+            dim = (
+                constraint.device_dim
+                if constraint.device_dim < max_device_dim
+                else max_device_dim
+            )
+            self.device_layout.dims[dim] *= safe_subs(constraint.count, idxc.subs)
+
     def compile_to_mlir(
         self,
         trace: CapturedTrace,
@@ -538,7 +566,7 @@ class LaunchableWave(Launchable):
         )
 
         emitter = WaveEmitter(
-            dispatch_entrypoint, trace, self.constraints, options, self.grid_type
+            dispatch_entrypoint, trace, self.constraints[2:], options, self.grid_type
         )
         try:
             emitter.emit(trace.get_root_graph())
@@ -575,6 +603,7 @@ class LaunchableWave(Launchable):
             self.hardware_constraints[0].subs_vector_shapes(idxc.subs)
 
         return [
+            partial(reshape_per_device, trace, self.constraints),
             partial(debug_log_hoist, trace, debug_handlers),
             partial(initialize_iter_args, trace),
             partial(self.create_induction_vars, trace),
@@ -623,6 +652,7 @@ class LaunchableWave(Launchable):
         str,
         WaveCompileOptions,
         Sequence[DebugArgInfo],
+        Grid,
     ]:
         # Issue a warning if IREE ver is too low.
         # Warning will only be issued if we are compiling the kernel and won't
@@ -759,8 +789,10 @@ class LaunchableWave(Launchable):
 
         # Determine grid shape.
         self.infer_grid_shape(IndexingContext.current())
+        self.infer_device_layout(IndexingContext.current())
         if options.print_grid:
             print(f"Grid: {self.grid_type}")
+            print(f"Grid: {self.device_layout}")
 
         # Add grid and block dims to kernel launch info.
         # Convert the grid into a lambda that we can use to compute the grid dimension.
@@ -781,8 +813,18 @@ class LaunchableWave(Launchable):
 
         idxc = IndexingContext.current()
         for sym, val in zip(
-            [THREAD_0, THREAD_1, THREAD_2, WORKGROUP_0, WORKGROUP_1, WORKGROUP_2],
-            chain(hw_constraint.threads_per_block, self.grid_type.dims),
+            [
+                THREAD_0,
+                THREAD_1,
+                THREAD_2,
+                WORKGROUP_0,
+                WORKGROUP_1,
+                WORKGROUP_2,
+                DEVICE_DIM_0,
+                DEVICE_DIM_1,
+                DEVICE_DIM_2,
+            ],
+            chain(hw_constraint.threads_per_block, self.grid_type.dims, [0, 0, 0]),
         ):
             if safe_subs(val, idxc.subs) == 1:
                 idxc.bind_constant(sym, 0)
@@ -792,6 +834,7 @@ class LaunchableWave(Launchable):
             options,
             debug_arg_info,
             debug_handlers,
+            self.device_layout,
         )
 
     def aot_execute(self, args, kwargs):
