@@ -564,6 +564,7 @@ class WorkgroupConstraint(DistributionConstraint):
     apply_fn: Optional[Callable] = None
     primary: Optional[bool] = True
     iters: Optional[IndexExpr | int] = None
+    device_constraint: Optional[IndexExpr] = None
 
     def __post_init__(self):
         self.wg_dim = None
@@ -582,7 +583,15 @@ class WorkgroupConstraint(DistributionConstraint):
         """
         if self.iters:
             return self.iters
-        return ceiling(self.dim / self.tile_size)
+        
+        return ceiling(self.device_constraint / self.tile_size)
+
+    def set_device_constraint(self, device_constraint: IndexExpr):
+        """
+        Sets the per device dimensions for the workgroup constraint. 
+        This is used to determine the total number of workgroups per device.
+        """
+        self.device_constraint = device_constraint
 
     def apply(self) -> IndexSequence:
         if self.apply_fn:
@@ -595,7 +604,7 @@ class WorkgroupConstraint(DistributionConstraint):
 
     @property
     def dim_bound(self) -> IndexExpr:
-        return self.dim
+        return self.device_constraint
 
     def get_index_bound(self, vector_shape: Optional[int]) -> Optional[IndexExpr]:
         bound = None
@@ -614,21 +623,6 @@ class WorkgroupConstraint(DistributionConstraint):
 
         return bound
 
-
-def get_grid_shape(wg_constraints: list[WorkgroupConstraint]) -> list[IndexExpr]:
-    sorted_constraints = sorted(
-        [x for x in wg_constraints if x.primary], key=lambda x: x.workgroup_dim
-    )
-    # Currently not more than one primary constraint in each dimension supported.
-    if any(
-        sorted_constraints[i].workgroup_dim == sorted_constraints[i + 1].workgroup_dim
-        for i in range(len(sorted_constraints) - 1)
-    ):
-        raise ValueError(
-            "Multiple constraints in the same workgroup dimension are currently not supported."
-        )
-    grid: list[IndexExpr] = [constraint.count for constraint in sorted_constraints]
-    return grid
 
 
 @dataclass
@@ -776,7 +770,6 @@ class WaveConstraint(DistributionConstraint):
             bound = (
                 self.wg_constraint.apply().start + self.apply().start + self.tile_size
             )
-
         return bound
 
     @property
@@ -870,3 +863,148 @@ class ReorderingConstraint:
                 self.wg_dim = get_workgroup_symbol(self.workgroup_dim)
             case _:
                 raise ValueError("Invalid workgroup dimension. Expected 0, 1, 2")
+
+@dataclass
+class DeviceConstraint(DistributionConstraint):
+    """
+    A constraint of the form `tkw.DeviceConstraint(M, BLOCK_M)` specifies
+    that we want to distribute dimension M along the device with a tile size of BLOCK_M.
+    This translates to an index constraint for all tensors of the shape [M, ?] ->
+    index += (device_id * BLOCK_M, 0), where device_id is the id
+    of the device on which the tensor is located.
+
+    Device constraints can be applied for multiple dimensions. For example,
+    constraint += [tkw.DeviceConstraint(M, BLOCK_M)]
+    constraint += [tkw.DeviceConstraint(N, BLOCK_N)]
+
+    specifies that we want to distribute BLOCK_M x BLOCK_N tiles of the tensor
+    across the devices, where BLOCK_M and BLOCK_N are the tile sizes for
+    dimensions M and N respectively.
+
+    Device id is a tuple of (dev_id_x, devid_y, dev_id_z) where
+    dev_id_x is the id of the device in the x dimension, dev_id_y is
+    the id of the device in the y dimension and dev_id_z is the id of the
+    device in the z dimension. The device id is used to compute the index
+    offset for the tensor along the specified dimension.
+
+    """
+
+    dim: IndexExpr
+    tile_size: Optional[IndexExpr] = None
+    device_dim: int = 0
+
+    def __post_init__(self):
+        self.dev_dim = None
+        match self.device_dim:
+            case 0:
+                self.dev_dim = DEVICE_DIM_0
+            case 1:
+                self.dev_dim = DEVICE_DIM_1 
+            case 2:
+                self.dev_dim = DEVICE_DIM_2
+            case _:
+                raise ValueError("Invalid workgroup dimension. Expected 0, 1 or 2.")
+
+    def apply(self) -> IndexSequence:
+        """
+        Apply the device constraint and return the index sequence.
+        
+        For single device_id: returns device_id * tile_size
+        """
+        if self.dev_dim is None:
+            raise ValueError("Index is being computed without setting device dimension")
+        
+        return IndexSequence(self.dev_dim * self.tile_size, 1)
+    
+    @property
+    def count(self) -> IndexExpr:
+        """
+        Returns an expression for the total number of devices for the specific device_dim.
+        """
+        return ceiling(self.dim / self.tile_size)
+
+    @property
+    def work_bound(self) -> IndexExpr:
+        """
+        Returns the work bound for device constraint.
+        
+        For device constraints, the work bound is simply the device's
+        starting position plus its tile size, representing the range
+        of data this device will process.
+        """
+        return self.apply().start + self.tile_size
+
+    @property
+    def dim_bound(self) -> IndexExpr:
+        """
+        Returns the actual dimension size being distributed.
+        """
+        return self.dim
+
+    def get_index_bound(self, vector_shape: Optional[int]) -> Optional[IndexExpr]:
+        """
+        Returns the index bound for safe memory access.
+        
+        For device constraints, bounds are needed when vector shapes
+        don't align with tile sizes to prevent out-of-bounds access.
+        """
+        bound = None
+        
+        # Check if vector shape alignment requires bounds checking
+        if (
+            vector_shape is not None
+            and vector_shape > 1
+            and subs_idxc(self.tile_size) % vector_shape != 0
+        ):
+            # Vector size doesn't divide evenly into tile size
+            # Need bounds to prevent accessing beyond device's tile
+            bound = self.apply().start + self.tile_size
+
+        return bound
+    
+
+def get_grid_shape(wg_constraints: list[WorkgroupConstraint], device_constraints: list[DeviceConstraint]) -> list[IndexExpr]:
+    dims = {}
+    for constraint in device_constraints:
+        if constraint.dim not in dims:
+            dims[constraint.dim] = constraint.tile_size
+        else:
+            raise ValueError(
+                f"Multiple device constraints for the same dimension {constraint.dim} are not supported."
+            ) 
+
+    for constraint in wg_constraints:
+        if constraint.dim in dims:
+            constraint.set_device_constraint(dims[constraint.dim])
+        else:
+            constraint.set_device_constraint(constraint.dim)
+    
+    sorted_constraints = sorted(
+        [x for x in wg_constraints if x.primary], key=lambda x: x.workgroup_dim
+    )
+    # Currently not more than one primary constraint in each dimension supported.
+    if any(
+        sorted_constraints[i].workgroup_dim == sorted_constraints[i + 1].workgroup_dim
+        for i in range(len(sorted_constraints) - 1)
+    ):
+        raise ValueError(
+            "Multiple constraints in the same workgroup dimension are currently not supported."
+        )
+    grid: list[IndexExpr] = [constraint.count for constraint in sorted_constraints]
+    return grid
+
+def get_device_layout(device_constraints: list[DeviceConstraint]) -> list[IndexExpr]:
+
+    sorted_constraints = sorted(
+        [x for x in device_constraints], key=lambda x: x.device_dim
+    )
+    # Currently not more than one primary constraint in each dimension supported.
+    if any(
+        sorted_constraints[i].device_dim == sorted_constraints[i + 1].device_dim
+        for i in range(len(sorted_constraints) - 1)
+    ):
+        raise ValueError(
+            "Multiple constraints in the same device dimension are currently not supported."
+        )
+    grid: list[IndexExpr] = [constraint.count for constraint in sorted_constraints]
+    return grid
