@@ -287,6 +287,7 @@ def wave_compile(options: WaveCompileOptions, kernel: "LaunchableWave") -> WaveK
         entrypoint_name,
         options,
         debug_arg_info,
+        device_layout,
     ) = kernel._trace_and_get_kernel_signature(options)
     options.kernel_sig = kernel_sig
 
@@ -308,6 +309,8 @@ def wave_compile(options: WaveCompileOptions, kernel: "LaunchableWave") -> WaveK
         options.dynamic_symbols,
         location_capture_config=options.location_capture_config,
         async_dispatch=is_async,
+        device_layout=device_layout,
+        device_constraints=kernel.device_constraints
     )
     asm = mb.module_op.get_asm(
         enable_debug_info=options.location_capture_config.level
