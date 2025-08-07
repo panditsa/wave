@@ -67,6 +67,7 @@ from .decompose_dot_mma import decompose_dot_mma
 from .decompose_reduce_ops import decompose_reduce_ops
 from .decompose_scan_ops import decompose_scan_ops
 from .decompose_vmma_ops import decompose_vmma_ops
+from .device_reshape import reshape_per_device
 from .expansion.expansion import add_get_results, expand_graph
 from .gather_to_shared import gather_to_shared
 from .generate_bounds_exprs import generate_bounds_exprs
@@ -552,6 +553,7 @@ class LaunchableWave(Launchable):
             self.hardware_constraints[0].subs_vector_shapes(idxc.subs)
 
         return [
+            partial(reshape_per_device, trace, self.constraints),
             partial(debug_log_hoist, trace),
             partial(initialize_iter_args, trace),
             partial(self.create_induction_vars, trace),
@@ -593,6 +595,7 @@ class LaunchableWave(Launchable):
         str,
         WaveCompileOptions,
         Sequence[DebugArgInfo],
+        Grid
     ]:
         # Issue a warning if IREE ver is too low.
         # Warning will only be issued if we are compiling the kernel and won't
@@ -749,6 +752,7 @@ class LaunchableWave(Launchable):
             *self.compile_to_mlir(trace, context, module_op, options=options),
             options,
             debug_arg_info,
+            self.device_layout
         )
 
     def aot_execute(self, args, kwargs):
