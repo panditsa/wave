@@ -343,6 +343,8 @@ def wave_compile(options: WaveCompileOptions, kernel: "LaunchableWave") -> WaveK
             options.dynamic_symbols,
             location_capture_config=options.location_capture_config,
             async_dispatch=is_async,
+            device_layout=device_layout,
+            device_constraints=kernel.device_constraints
         )
         mb.module_op.verify()
         asm = mb.module_op.get_asm(
