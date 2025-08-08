@@ -1,0 +1,58 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.13, pytest-8.0.0, pluggy-1.6.0 -- /home/sanketp/work/wave/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/sanketp/work/wave
+configfile: setup.cfg
+plugins: xdist-3.5.0, timeout-2.4.0
+collecting ... collected 1 item
+
+tests/kernel/wave/dist_gemm_test.py::testPureGemm[datatype0-MMAType.F32_16x16x16_F16-shape0] Total nodes across all graphs: 14
+
+=== ALL NODES ===
+0: acc (op: placeholder, target: acc)
+    Type: Register[BLOCK_M, BLOCK_N].of(f32)
+    Meta: {'arg_id': 0}
+
+1: a (op: placeholder, target: a)
+    Type: Memory[BLOCK_M, K].of(f16)
+    Meta: {'arg_id': 1, 'lifted': a}
+
+2: read (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of Read(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(read), tkw_op_name='read', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, memory=Proxy(a), elements_per_thread=None, mapping=None, mapping_dynamic_vals=(), bounds=None, _write_dependency=None)>)
+
+3: b (op: placeholder, target: b)
+    Type: Memory[BLOCK_N, K].of(f16)
+    Meta: {'arg_id': 2, 'lifted': b}
+
+4: read_1 (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of Read(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(read_1), tkw_op_name='read', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, memory=Proxy(b), elements_per_thread=None, mapping=None, mapping_dynamic_vals=(), bounds=None, _write_dependency=None)>)
+
+5: mma (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of MMA(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(mma), tkw_op_name='mma', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, lhs=Proxy(read), rhs=Proxy(read_1), acc=Proxy(acc), mma_type=None)>)
+
+6: output (op: output, target: output)
+    Type: Register[BLOCK_M, BLOCK_N].of(f32)
+
+7: a (op: placeholder, target: a)
+    Type: Memory[BLOCK_M, K].of(f16)
+    Meta: {'arg_id': 0}
+
+8: b (op: placeholder, target: b)
+    Type: Memory[BLOCK_N, K].of(f16)
+    Meta: {'arg_id': 1}
+
+9: c (op: placeholder, target: c)
+    Type: Memory[BLOCK_M, BLOCK_N].of(f32)
+    Meta: {'arg_id': 2}
+
+10: register (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of NewRegister(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(register), tkw_op_name='register', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, shape=(BLOCK_M, BLOCK_N), dtype=DataType(f32), value=0.0)>)
+
+11: iterate (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of Iterate(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(iterate), tkw_op_name='iterate', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, axis=K, init_args=[Proxy(register)], subgraph_name='region_0', implicit_captures=[Proxy(a), Proxy(b)], step=1, start=None, condition=None)>)
+
+12: write (op: call_function, target: <bound method define_op.<locals>.decorator.<locals>.new_function of Write(graph=<wave_lang.kernel._support.tracing.KernelRegionGraph object at 0x7f8413762b50>, fx_node=Proxy(write), tkw_op_name='write', _tracing_function=<bound method define_op.<locals>.decorator.<locals>.new_function of ...>, register_=Proxy(iterate), memory=Proxy(c), elements_per_thread=None, mapping=None, mapping_dynamic_vals=(), bounds=None)>)
+
+13: output (op: output, target: output)
+
+
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> PDB set_trace >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+> /home/sanketp/work/wave/wave_lang/kernel/wave/device_reshape.py(89)reshape_per_device()
+-> substitute_symbols_comprehensive(trace, device_symbol_map)
+(Pdb) {M: BLOCK_M, N: BLOCK_N}
+(Pdb) 

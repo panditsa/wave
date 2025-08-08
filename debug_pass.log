@@ -1,0 +1,273 @@
+Compiled gemm kernel: #map = affine_map<()[s0, s1] -> ((s1 * 16 + s0 floordiv 16) mod 64)>
+#map1 = affine_map<()[s0] -> (s0 * 2 - (s0 floordiv 16) * 32)>
+#map2 = affine_map<()[s0] -> (s0 mod 16)>
+#map3 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4)>
+#map4 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 16)>
+#map5 = affine_map<()[s0] -> (s0 mod 16 + 16)>
+#map6 = affine_map<()[s0] -> (s0 mod 16 + 32)>
+#map7 = affine_map<()[s0] -> (s0 mod 16 + 48)>
+#map8 = affine_map<()[s0, s1] -> (s0 * 32 + s1 * 2 - (s1 floordiv 16) * 32)>
+#map9 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 1)>
+#map10 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 2)>
+#map11 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 3)>
+#map12 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 17)>
+#map13 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 18)>
+#map14 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 19)>
+#map15 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 32)>
+#map16 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 33)>
+#map17 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 34)>
+#map18 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 35)>
+#map19 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 48)>
+#map20 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 49)>
+#map21 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 50)>
+#map22 = affine_map<()[s0] -> (((s0 mod 64) floordiv 16) * 4 + 51)>
+#translation = #iree_codegen.translation_info<pipeline = None workgroup_size = [256, 4, 1] subgroup_size = 64>
+module attributes {transform.with_named_sequence} {
+  stream.executable private @gemm {
+    stream.executable.export public @gemm workgroups() -> (index, index, index) {
+      %c1 = arith.constant 1 : index
+      stream.return %c1, %c1, %c1 : index, index, index
+    }
+    builtin.module {
+      func.func @gemm(%arg0: !stream.binding, %arg1: !stream.binding, %arg2: !stream.binding) attributes {translation_info = #translation} {
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c4608 = arith.constant 4608 : index
+        %c0 = arith.constant 0 : index
+        %cst = arith.constant dense<0.000000e+00> : vector<4xf32>
+        %thread_id_x = gpu.thread_id  x upper_bound 256
+        %thread_id_y = gpu.thread_id  y upper_bound 4
+        %alloc = memref.alloc() : memref<9216xi8, #gpu.address_space<workgroup>>
+        %view = memref.view %alloc[%c0][] : memref<9216xi8, #gpu.address_space<workgroup>> to memref<64x36xf16, #gpu.address_space<workgroup>>
+        %view_0 = memref.view %alloc[%c4608][] : memref<9216xi8, #gpu.address_space<workgroup>> to memref<64x36xf16, #gpu.address_space<workgroup>>
+        %0 = stream.binding.subspan %arg1[%c0] : !stream.binding -> memref<64x64xf16, strided<[64, 1], offset: ?>>
+        %1 = stream.binding.subspan %arg0[%c0] : !stream.binding -> memref<64x64xf16, strided<[64, 1], offset: ?>>
+        %2 = affine.apply #map()[%thread_id_x, %thread_id_y]
+        %3 = affine.apply #map1()[%thread_id_x]
+        %4 = affine.apply #map2()[%thread_id_x]
+        %5 = affine.apply #map3()[%thread_id_x]
+        %6 = affine.apply #map4()[%thread_id_x]
+        %7 = affine.apply #map5()[%thread_id_x]
+        %8 = affine.apply #map6()[%thread_id_x]
+        %9 = affine.apply #map7()[%thread_id_x]
+        %10:16 = scf.for %arg3 = %c0 to %c2 step %c1 iter_args(%arg4 = %cst, %arg5 = %cst, %arg6 = %cst, %arg7 = %cst, %arg8 = %cst, %arg9 = %cst, %arg10 = %cst, %arg11 = %cst, %arg12 = %cst, %arg13 = %cst, %arg14 = %cst, %arg15 = %cst, %arg16 = %cst, %arg17 = %cst, %arg18 = %cst, %arg19 = %cst) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+          %96 = affine.apply #map8()[%arg3, %thread_id_x]
+          %97 = vector.load %1[%2, %96] : memref<64x64xf16, strided<[64, 1], offset: ?>>, vector<2xf16>
+          amdgpu.lds_barrier
+          vector.store %97, %view_0[%2, %3] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<2xf16>
+          %98 = vector.load %0[%2, %96] : memref<64x64xf16, strided<[64, 1], offset: ?>>, vector<2xf16>
+          vector.store %98, %view[%2, %3] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<2xf16>
+          amdgpu.lds_barrier
+          %99 = vector.load %view[%4, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %100 = vector.load %view[%4, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %101 = vector.load %view[%7, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %102 = vector.load %view[%7, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %103 = vector.load %view[%8, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %104 = vector.load %view[%8, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %105 = vector.load %view[%9, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %106 = vector.load %view[%9, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %107 = vector.load %view_0[%4, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %108 = vector.load %view_0[%4, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %109 = vector.load %view_0[%7, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %110 = vector.load %view_0[%7, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %111 = vector.load %view_0[%8, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %112 = vector.load %view_0[%8, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %113 = vector.load %view_0[%9, %5] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %114 = vector.load %view_0[%9, %6] : memref<64x36xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+          %115 = amdgpu.mfma %107 * %99 + %arg4 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %116 = amdgpu.mfma %108 * %100 + %115 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %117 = amdgpu.mfma %107 * %101 + %arg5 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %118 = amdgpu.mfma %108 * %102 + %117 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %119 = amdgpu.mfma %107 * %103 + %arg6 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %120 = amdgpu.mfma %108 * %104 + %119 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %121 = amdgpu.mfma %107 * %105 + %arg7 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %122 = amdgpu.mfma %108 * %106 + %121 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %123 = amdgpu.mfma %109 * %99 + %arg8 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %124 = amdgpu.mfma %110 * %100 + %123 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %125 = amdgpu.mfma %109 * %101 + %arg9 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %126 = amdgpu.mfma %110 * %102 + %125 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %127 = amdgpu.mfma %109 * %103 + %arg10 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %128 = amdgpu.mfma %110 * %104 + %127 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %129 = amdgpu.mfma %109 * %105 + %arg11 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %130 = amdgpu.mfma %110 * %106 + %129 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %131 = amdgpu.mfma %111 * %99 + %arg12 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %132 = amdgpu.mfma %112 * %100 + %131 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %133 = amdgpu.mfma %111 * %101 + %arg13 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %134 = amdgpu.mfma %112 * %102 + %133 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %135 = amdgpu.mfma %111 * %103 + %arg14 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %136 = amdgpu.mfma %112 * %104 + %135 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %137 = amdgpu.mfma %111 * %105 + %arg15 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %138 = amdgpu.mfma %112 * %106 + %137 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %139 = amdgpu.mfma %113 * %99 + %arg16 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %140 = amdgpu.mfma %114 * %100 + %139 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %141 = amdgpu.mfma %113 * %101 + %arg17 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %142 = amdgpu.mfma %114 * %102 + %141 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %143 = amdgpu.mfma %113 * %103 + %arg18 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %144 = amdgpu.mfma %114 * %104 + %143 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %145 = amdgpu.mfma %113 * %105 + %arg19 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          %146 = amdgpu.mfma %114 * %106 + %145 {blocks = 1 : i32, k = 16 : i32, m = 16 : i32, n = 16 : i32} blgp =  none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+          scf.yield %116, %118, %120, %122, %124, %126, %128, %130, %132, %134, %136, %138, %140, %142, %144, %146 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+        }
+        %11 = vector.extract_strided_slice %10#0 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %12 = stream.binding.subspan %arg2[%c0] : !stream.binding -> memref<64x64xf32, strided<[64, 1], offset: ?>>
+        %13 = affine.apply #map3()[%thread_id_x]
+        %14 = affine.apply #map2()[%thread_id_x]
+        vector.store %11, %12[%13, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %15 = vector.extract_strided_slice %10#0 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %16 = affine.apply #map9()[%thread_id_x]
+        vector.store %15, %12[%16, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %17 = vector.extract_strided_slice %10#0 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %18 = affine.apply #map10()[%thread_id_x]
+        vector.store %17, %12[%18, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %19 = vector.extract_strided_slice %10#0 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %20 = affine.apply #map11()[%thread_id_x]
+        vector.store %19, %12[%20, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %21 = vector.extract_strided_slice %10#1 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %22 = affine.apply #map5()[%thread_id_x]
+        vector.store %21, %12[%13, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %23 = vector.extract_strided_slice %10#1 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %23, %12[%16, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %24 = vector.extract_strided_slice %10#1 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %24, %12[%18, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %25 = vector.extract_strided_slice %10#1 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %25, %12[%20, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %26 = vector.extract_strided_slice %10#2 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %27 = affine.apply #map6()[%thread_id_x]
+        vector.store %26, %12[%13, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %28 = vector.extract_strided_slice %10#2 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %28, %12[%16, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %29 = vector.extract_strided_slice %10#2 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %29, %12[%18, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %30 = vector.extract_strided_slice %10#2 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %30, %12[%20, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %31 = vector.extract_strided_slice %10#3 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %32 = affine.apply #map7()[%thread_id_x]
+        vector.store %31, %12[%13, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %33 = vector.extract_strided_slice %10#3 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %33, %12[%16, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %34 = vector.extract_strided_slice %10#3 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %34, %12[%18, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %35 = vector.extract_strided_slice %10#3 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %35, %12[%20, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %36 = vector.extract_strided_slice %10#4 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %37 = affine.apply #map4()[%thread_id_x]
+        vector.store %36, %12[%37, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %38 = vector.extract_strided_slice %10#4 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %39 = affine.apply #map12()[%thread_id_x]
+        vector.store %38, %12[%39, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %40 = vector.extract_strided_slice %10#4 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %41 = affine.apply #map13()[%thread_id_x]
+        vector.store %40, %12[%41, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %42 = vector.extract_strided_slice %10#4 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %43 = affine.apply #map14()[%thread_id_x]
+        vector.store %42, %12[%43, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %44 = vector.extract_strided_slice %10#5 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %44, %12[%37, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %45 = vector.extract_strided_slice %10#5 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %45, %12[%39, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %46 = vector.extract_strided_slice %10#5 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %46, %12[%41, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %47 = vector.extract_strided_slice %10#5 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %47, %12[%43, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %48 = vector.extract_strided_slice %10#6 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %48, %12[%37, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %49 = vector.extract_strided_slice %10#6 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %49, %12[%39, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %50 = vector.extract_strided_slice %10#6 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %50, %12[%41, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %51 = vector.extract_strided_slice %10#6 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %51, %12[%43, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %52 = vector.extract_strided_slice %10#7 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %52, %12[%37, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %53 = vector.extract_strided_slice %10#7 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %53, %12[%39, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %54 = vector.extract_strided_slice %10#7 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %54, %12[%41, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %55 = vector.extract_strided_slice %10#7 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %55, %12[%43, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %56 = vector.extract_strided_slice %10#8 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %57 = affine.apply #map15()[%thread_id_x]
+        vector.store %56, %12[%57, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %58 = vector.extract_strided_slice %10#8 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %59 = affine.apply #map16()[%thread_id_x]
+        vector.store %58, %12[%59, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %60 = vector.extract_strided_slice %10#8 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %61 = affine.apply #map17()[%thread_id_x]
+        vector.store %60, %12[%61, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %62 = vector.extract_strided_slice %10#8 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %63 = affine.apply #map18()[%thread_id_x]
+        vector.store %62, %12[%63, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %64 = vector.extract_strided_slice %10#9 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %64, %12[%57, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %65 = vector.extract_strided_slice %10#9 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %65, %12[%59, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %66 = vector.extract_strided_slice %10#9 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %66, %12[%61, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %67 = vector.extract_strided_slice %10#9 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %67, %12[%63, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %68 = vector.extract_strided_slice %10#10 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %68, %12[%57, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %69 = vector.extract_strided_slice %10#10 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %69, %12[%59, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %70 = vector.extract_strided_slice %10#10 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %70, %12[%61, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %71 = vector.extract_strided_slice %10#10 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %71, %12[%63, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %72 = vector.extract_strided_slice %10#11 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %72, %12[%57, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %73 = vector.extract_strided_slice %10#11 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %73, %12[%59, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %74 = vector.extract_strided_slice %10#11 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %74, %12[%61, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %75 = vector.extract_strided_slice %10#11 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %75, %12[%63, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %76 = vector.extract_strided_slice %10#12 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %77 = affine.apply #map19()[%thread_id_x]
+        vector.store %76, %12[%77, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %78 = vector.extract_strided_slice %10#12 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %79 = affine.apply #map20()[%thread_id_x]
+        vector.store %78, %12[%79, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %80 = vector.extract_strided_slice %10#12 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %81 = affine.apply #map21()[%thread_id_x]
+        vector.store %80, %12[%81, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %82 = vector.extract_strided_slice %10#12 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        %83 = affine.apply #map22()[%thread_id_x]
+        vector.store %82, %12[%83, %14] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %84 = vector.extract_strided_slice %10#13 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %84, %12[%77, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %85 = vector.extract_strided_slice %10#13 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %85, %12[%79, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %86 = vector.extract_strided_slice %10#13 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %86, %12[%81, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %87 = vector.extract_strided_slice %10#13 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %87, %12[%83, %22] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %88 = vector.extract_strided_slice %10#14 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %88, %12[%77, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %89 = vector.extract_strided_slice %10#14 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %89, %12[%79, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %90 = vector.extract_strided_slice %10#14 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %90, %12[%81, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %91 = vector.extract_strided_slice %10#14 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %91, %12[%83, %27] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %92 = vector.extract_strided_slice %10#15 {offsets = [0], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %92, %12[%77, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %93 = vector.extract_strided_slice %10#15 {offsets = [1], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %93, %12[%79, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %94 = vector.extract_strided_slice %10#15 {offsets = [2], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %94, %12[%81, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        %95 = vector.extract_strided_slice %10#15 {offsets = [3], sizes = [1], strides = [1]} : vector<4xf32> to vector<1xf32>
+        vector.store %95, %12[%83, %32] : memref<64x64xf32, strided<[64, 1], offset: ?>>, vector<1xf32>
+        return
+      }
+    }
+  }
+  func.func @isolated_benchmark$async(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view, %arg2: !hal.buffer_view, %arg3: !hal.fence, %arg4: !hal.fence) -> !hal.buffer_view {
+    %0 = hal.tensor.import wait(%arg3) => %arg0 : !hal.buffer_view -> tensor<64x64xf16>
+    %1 = hal.tensor.import wait(%arg3) => %arg1 : !hal.buffer_view -> tensor<64x64xf16>
+    %2 = hal.tensor.import wait(%arg3) => %arg2 : !hal.buffer_view -> tensor<64x64xf32>
+    %3 = flow.dispatch @gemm::@gemm(%0, %1, %2) : (tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32>) -> %2
+    %4 = hal.tensor.barrier join(%3 : tensor<64x64xf32>) => %arg4 : !hal.fence
+    %5 = hal.tensor.export %4 : tensor<64x64xf32> -> !hal.buffer_view
+    return %5 : !hal.buffer_view
+  }
+}
