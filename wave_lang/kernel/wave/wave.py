@@ -488,7 +488,6 @@ class LaunchableWave(Launchable):
         entrypoint_name = self._name
         root_graph = trace.get_root_graph()
         kernel_sig = kernel_codegen.KernelSignature()
-        breakpoint()
         kernel_sig.add_from_graph_placeholders(root_graph)
         kernel_sig.add_from_dynamic_symbols(options.dynamic_symbols)
         kernel_sig.add_grid(self.grid_type)
