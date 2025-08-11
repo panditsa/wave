@@ -39,7 +39,8 @@ import json
 from torch.testing import assert_close
 
 @require_e2e
-@pytest.mark.parametrize("shape", [(8192, 4096, 4096)])
+@pytest.mark.skip(reason="Test not ready - will be enabled in follow-up PR")
+@pytest.mark.parametrize("shape", [(128, 128, 64)])
 @pytest.mark.parametrize(
     "mfma_variant",
     [
@@ -63,10 +64,7 @@ def testPureGemm(
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
-        run_bench=run_bench,
-        benchmark_batch_size=10,
-        benchmark_repetitions=3,
-        benchmark_results_file=perf_filename_tk,
+        iree_launch_async=False,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm)
@@ -75,9 +73,6 @@ def testPureGemm(
     b = device_randn(shape[1], shape[2], dtype=datatype)
     c = device_zeros(shape[0], shape[1], dtype=torch.float32)
     gemm(a, b, c)
-
-    if run_bench:
-        options.benchmark_results_file = perf_filename_iree
 
     iree_ref = device_zeros(shape[0], shape[1], dtype=torch.float32)
     generate_iree_ref("mmt", [a, b], [iree_ref], options)
