@@ -74,6 +74,11 @@ def compile_to_vmfb(
                 f"--iree-hal-benchmark-dispatch-repeat-count={options.benchmark_batch_size}"
             )
 
+    if options.num_devices > 1:
+        target_devices = [f"--iree-hal-target-device=hip[{i}]" for i in range(options.num_devices)]
+        target_devices_str = " ".join(target_devices)
+        flags.append(target_devices_str)
+    breakpoint()
     res = compile_str(asm, target_backends=[options.backend], extra_args=flags)
     return res
 

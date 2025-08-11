@@ -291,6 +291,12 @@ def wave_compile(options: WaveCompileOptions, kernel: "LaunchableWave") -> WaveK
     ) = kernel._trace_and_get_kernel_signature(options)
     options.kernel_sig = kernel_sig
 
+    num_devices = 1
+    for dim in device_layout.dims:
+        num_devices *= dim
+
+    options.num_devices = num_devices
+
     # Get the trace from the kernel. Since the trace contains complex objects
     # that are not easily serializable, we don't cache the trace. So this trace
     # is not available for cached kernels. The primary use case for the trace is

@@ -33,6 +33,7 @@ class WaveCompileOptions:
     # === Backend options ===
     backend: str = "rocm"
     target: str = "gfx942"
+    num_devices: int = 1
     gpu_native_math_precision: bool = False
     iree_preprocessing_pass_pipeline: str = None
 
