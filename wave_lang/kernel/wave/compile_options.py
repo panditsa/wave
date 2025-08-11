@@ -36,6 +36,7 @@ class WaveCompileOptions:
     backend: str = "rocm"
     target: str = "gfx942"
     iree_preprocessing_pass_pipeline: str = None
+    num_devices: int = 1
 
     # === Benchmark options ===
     run_bench: bool = False
