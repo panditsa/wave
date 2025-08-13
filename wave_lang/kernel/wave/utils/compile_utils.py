@@ -36,7 +36,6 @@ def compile_to_vmfb(
     options: WaveCompileOptions,
 ):
     flags = [
-        f"--iree-hal-target-backends={options.backend}",
         "--iree-vm-bytecode-module-strip-source-map=true",
         "--iree-opt-strip-assertions=true",
         "--iree-vm-target-truncate-unsupported-floats",
@@ -69,11 +68,11 @@ def compile_to_vmfb(
             )
 
     if options.num_devices > 1:
-        target_devices = [f"--iree-hal-target-device=hip[{i}]" for i in range(options.num_devices)]
-        target_devices_str = " ".join(target_devices)
-        flags.append(target_devices_str)
-    breakpoint()
-    res = compile_str(asm, target_backends=[options.backend], extra_args=flags)
+        target_devices = [
+            f"--iree-hal-target-device=hip[{i}]" for i in range(options.num_devices)
+        ]
+        flags += target_devices
+    res = compile_str(asm, extra_args=flags)
     return res
 
 
