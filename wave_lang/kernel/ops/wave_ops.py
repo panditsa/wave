@@ -223,6 +223,14 @@ def atomic_min(
 ) -> "Register": ...
 
 
+def atomic_add(
+    lhs: "Register",
+    rhs: "Memory",
+    elements_per_thread: Optional[IndexExpr | int] = None,
+    mapping: Optional[IndexMapping] = None,
+) -> "Register": ...
+
+
 def broadcast(
     arg: "Register", target_shape: Optional[Sequence[IndexExpr | int]] = None
 ) -> "Register": ...
@@ -883,6 +891,7 @@ class BinaryOpBase(CustomOp, ABC):
         lhs_dim_set = set(lhs_type.symbolic_shape)
         rhs_dim_set = set(rhs_type.symbolic_shape)
         if lhs_dim_set.isdisjoint(rhs_dim_set):
+            breakpoint()
             raise ValueError(
                 "BinaryPyOp requires lhs and rhs shape to be at least broadcastable."
                 f" got {lhs_type.symbolic_shape} vs {rhs_type.symbolic_shape}"
@@ -1342,6 +1351,12 @@ class AtomicOp(BinaryOpBase, ABC):
     @property
     def memory_type(self) -> "Memory":
         return get_custom(self.lhs).type
+
+
+@define_op("atomic_add")
+@dataclass
+class AtomicAddOp(AtomicOp):
+    pass
 
 
 @define_op("scheduling_group_barrier")
@@ -2035,6 +2050,7 @@ class Write(CustomOp):
         resulted arg index will be $idx // ELEMS_PER_THREAD.
         """
         if arg in self.mapping_dynamic_vals:
+            breakpoint()
             assert self.mapping.is_input_identity()
             i = self.mapping_dynamic_vals.index(arg)
             iters = self.mapping.iters

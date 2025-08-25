@@ -63,6 +63,7 @@ from ...ops.wave_ops import (
     apply_expr,
     atan2,
     atomic_min,
+    atomic_add,
     bitcast,
     broadcast,
     cast,
@@ -831,6 +832,27 @@ def handle_atomic_min(
         value_element_type
     ):
         atomic_kind = arith_d.AtomicRMWKind.mins
+    else:
+        raise ValidationError(
+            f"Found unsupported type in atomic min: {value_element_type}"
+        )
+    result = memref_d.atomic_rmw(atomic_kind, val, buffer, idx)
+    return result
+
+
+@handle_atomic_op(atomic_add)
+def handle_atomic_add(
+    val: Value, buffer: Value, idx: list[Value], options: WaveCompileOptions
+) -> OpResult:
+    value_element_type = get_type_or_element_type(val.type)
+    atomic_kind = None
+    # Only scalars are supported currently
+    if _is_float_type(value_element_type):
+        atomic_kind = arith_d.AtomicRMWKind.fadd
+    elif _is_integer_like_type(value_element_type) and _is_signed_or_signless_type(
+        value_element_type
+    ):
+        atomic_kind = arith_d.AtomicRMWKind.add
     else:
         raise ValidationError(
             f"Found unsupported type in atomic min: {value_element_type}"
