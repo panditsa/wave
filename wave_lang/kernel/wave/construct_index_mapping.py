@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 from .._support.tracing import CapturedTrace
-from ..ops.wave_ops import Read, Write, get_custom
+from ..ops.wave_ops import Read, Write, get_custom, AtomicOp
 from ..lang.wave_types import IndexMapping, index_symbol, IndexSymbol
 from ..wave.constraints import Constraint, IteratorBindings
 import sympy
@@ -19,7 +19,7 @@ def construct_index_mapping(
     For those, create an IndexMapping and update the read/write node so that the mapping is set
     and update the type.
     """
-    nodes = trace.walk(lambda x: isinstance(get_custom(x), (Read, Write)))
+    nodes = trace.walk(lambda x: isinstance(get_custom(x), (Read, Write, AtomicOp)))
     iterator_bindings = [c for c in constraints if isinstance(c, IteratorBindings)]
     assert (
         len(iterator_bindings) <= 1

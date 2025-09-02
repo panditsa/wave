@@ -97,7 +97,9 @@ def combine_derived_index(
 
 
 def set_derived_index(trace):
-    sources = trace.walk(lambda node: isinstance(get_custom(node), (Read, Write)))
+    sources = trace.walk(
+        lambda node: isinstance(get_custom(node), (Read, Write, AtomicOp))
+    )
 
     worklist = []
     for source in sources:
@@ -185,7 +187,7 @@ def resolve_scaled_indices(trace):
                     dim_expr.subs({dim: source.vector_shapes[dim]})
                 )
                 custom = get_custom(source)
-                if isinstance(custom, (Read, Write)):
+                if isinstance(custom, (Read, Write, AtomicOp)):
                     assert (
                         custom.elements_per_thread % scale_factor == 0
                     ), "elem per thread needs to be divisble by scale."
@@ -736,7 +738,9 @@ def set_thread_dependent_index_from_mma(
     sources: list[MMABase] = list(mma_mapping.keys())
     assert sources and len(sources) >= 1, "Unexpected empty MMA mapping."
     if not sources:
-        sources = trace.walk(lambda node: isinstance(get_custom(node), (Read, Write)))
+        sources = trace.walk(
+            lambda node: isinstance(get_custom(node), (Read, Write, AtomicOp))
+        )
         sources = [get_custom(x) for x in sources]
         assert sources, "No read or mma nodes found in the graph."
 
@@ -771,7 +775,9 @@ def set_thread_dependent_index_from_read_write(
     Set the thread dependent index based on the hardware constraint.
     """
     hardware_constraint = get_hardware_constraint(constraints)
-    sources = trace.walk(lambda node: isinstance(get_custom(node), (Read, Write)))
+    sources = trace.walk(
+        lambda node: isinstance(get_custom(node), (Read, Write, AtomicOp))
+    )
     sources = [get_custom(x) for x in sources]
     assert sources, "No read nodes found in the graph."
 

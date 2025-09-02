@@ -7,7 +7,7 @@
 import sympy
 import torch.fx as fx
 
-from ..ops.wave_ops import Read, Write
+from ..ops.wave_ops import Read, Write, AtomicOp
 from .constraints import Constraint, DistributionConstraint
 from .utils.general_utils import (
     find_index_bounds,
@@ -41,7 +41,7 @@ def generate_bounds_exprs(trace: CapturedTrace, constraints: list[Constraint]):
     hardware_constraint = get_hardware_constraint(constraints)
 
     def is_read_write(node: fx.Node):
-        return isinstance(get_custom(node), (Read, Write))
+        return isinstance(get_custom(node), (Read, Write, AtomicOp))
 
     nodes = trace.walk(is_read_write)
     for node in nodes:
