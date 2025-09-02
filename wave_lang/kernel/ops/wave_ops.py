@@ -1403,7 +1403,6 @@ class AtomicOp(BinaryOpBase, ABC):
                 if v.start != 0
             }
 
-        breakpoint()
         return [(arg, transform_idx(arg)) for arg in self.mapping_dynamic_vals]
 
 
@@ -2104,7 +2103,6 @@ class Write(CustomOp):
         resulted arg index will be $idx // ELEMS_PER_THREAD.
         """
         if arg in self.mapping_dynamic_vals:
-            breakpoint()
             assert self.mapping.is_input_identity()
             i = self.mapping_dynamic_vals.index(arg)
             iters = self.mapping.iters
