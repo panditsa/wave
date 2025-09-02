@@ -266,6 +266,7 @@ def test_moe_align_block_size(
 
     options = WaveCompileOptions(
         subs=hyperparams,
+        minimize_shared_allocs=False,
     )
 
     kernel = wave_compile(
