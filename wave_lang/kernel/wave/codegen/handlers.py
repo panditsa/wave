@@ -488,7 +488,16 @@ def handle_atomic_op(op):
         @handle_op(op)
         def handle_generic_atomic(emitter: WaveEmitter, node: fx.Node):
             try:
-                lhs, rhs, elements_per_thread, mapping = node.args
+                (
+                    lhs,
+                    rhs,
+                    elements_per_thread,
+                    mapping,
+                    mapping_dynamic_vals,
+                    _,
+                    _,
+                    _,
+                ) = node.args
             except ValueError as e:
                 raise ValidationError("Malformed arguments") from e
             lhs = cast_py_value(emitter, lhs)
@@ -530,6 +539,14 @@ def handle_atomic_op(op):
                     mapping, symbolic_shape, start_index
                 )
 
+            # Handle mapping_dynamic_vals if present
+            dynamic_values = {}
+            if mapping_dynamic_vals:
+                derived_indices = get_custom(node).get_derived_indices()
+                for arg, derived_index in derived_indices:
+                    for dim, seq in derived_index.items():
+                        dynamic_values[dim] = cast_py_value(emitter, arg).ir_value
+
             # Get start indices for every element in thread and unroll the op
             atomic_results = []
             keys = list(start_index.keys())
@@ -538,7 +555,7 @@ def handle_atomic_op(op):
                 new_index = copy.deepcopy(start_index)
                 key = keys[fastest_dim]
                 new_index[key] += i
-                start_idx = _build_start_indices(emitter, new_index)
+                start_idx = _build_start_indices(emitter, new_index, dynamic_values)
                 lhs_val = vector_d.extract(
                     lhs, static_position=[i], dynamic_position=[]
                 )
