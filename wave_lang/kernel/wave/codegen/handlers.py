@@ -488,16 +488,7 @@ def handle_atomic_op(op):
         @handle_op(op)
         def handle_generic_atomic(emitter: WaveEmitter, node: fx.Node):
             try:
-                (
-                    lhs,
-                    rhs,
-                    elements_per_thread,
-                    mapping,
-                    mapping_dynamic_vals,
-                    _,
-                    _,
-                    _,
-                ) = node.args
+                (lhs, rhs, elements_per_thread, mapping, dyn_vals, *rest) = node.args
             except ValueError as e:
                 raise ValidationError("Malformed arguments") from e
             lhs = cast_py_value(emitter, lhs)
@@ -539,23 +530,33 @@ def handle_atomic_op(op):
                     mapping, symbolic_shape, start_index
                 )
 
-            # Handle mapping_dynamic_vals if present
-            dynamic_values = {}
-            if mapping_dynamic_vals:
-                derived_indices = get_custom(node).get_derived_indices()
-                for arg, derived_index in derived_indices:
-                    for dim, seq in derived_index.items():
-                        dynamic_values[dim] = cast_py_value(emitter, arg).ir_value
+            dynamic_vals = tuple(
+                cast_vector(emitter, reg, element_type=IndexType.get())
+                for reg in dyn_vals
+            )
+
+            def extract0(src):
+                static_pos = [0] * src.type.rank
+                return vector_d.extract(
+                    src, static_position=static_pos, dynamic_position=[]
+                )
+
+            dynamic_vals = {
+                sym: extract0(val)
+                for sym, val in zip(mapping.dynamic_val_indices.keys(), dynamic_vals)
+            }
 
             # Get start indices for every element in thread and unroll the op
             atomic_results = []
             keys = list(start_index.keys())
             fastest_dim = get_fastest_index(node.index)
+            if elements_per_thread is None:
+                elements_per_thread = 1
             for i in range(elements_per_thread):
                 new_index = copy.deepcopy(start_index)
                 key = keys[fastest_dim]
                 new_index[key] += i
-                start_idx = _build_start_indices(emitter, new_index, dynamic_values)
+                start_idx = _build_start_indices(emitter, new_index, dynamic_vals)
                 lhs_val = vector_d.extract(
                     lhs, static_position=[i], dynamic_position=[]
                 )
@@ -865,11 +866,11 @@ def handle_atomic_add(
     atomic_kind = None
     # Only scalars are supported currently
     if _is_float_type(value_element_type):
-        atomic_kind = arith_d.AtomicRMWKind.fadd
+        atomic_kind = arith_d.AtomicRMWKind.addf
     elif _is_integer_like_type(value_element_type) and _is_signed_or_signless_type(
         value_element_type
     ):
-        atomic_kind = arith_d.AtomicRMWKind.add
+        atomic_kind = arith_d.AtomicRMWKind.addi
     else:
         raise ValidationError(
             f"Found unsupported type in atomic min: {value_element_type}"
