@@ -220,6 +220,7 @@ def atomic_min(
     rhs: "Memory",
     elements_per_thread: Optional[IndexExpr | int] = None,
     mapping: Optional[IndexMapping] = None,
+    mapping_dynamic_vals: "Register" | tuple["Register", ...] = (),
 ) -> "Register": ...
 
 
@@ -228,6 +229,7 @@ def atomic_add(
     rhs: "Memory",
     elements_per_thread: Optional[IndexExpr | int] = None,
     mapping: Optional[IndexMapping] = None,
+    mapping_dynamic_vals: "Register" | tuple["Register", ...] = (),
 ) -> "Register": ...
 
 
@@ -1338,6 +1340,10 @@ class AtomicOp(BinaryOpBase, ABC):
 
     elements_per_thread: Optional[Any] = None
     mapping: Optional[IndexMapping] = None
+    mapping_dynamic_vals: tuple[fx.Node, ...] = ()
+    source: Optional[tuple[IndexExpr]] = None
+    target: Optional[tuple[IndexExpr]] = None
+    bounds: Optional[dict[IndexSymbol, IndexExpr]] = None
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
@@ -1351,6 +1357,54 @@ class AtomicOp(BinaryOpBase, ABC):
     @property
     def memory_type(self) -> "Memory":
         return get_custom(self.lhs).type
+
+    def transform_index_backwards(
+        self, index: dict[IndexSymbol, IndexSequence], arg: fx.Node
+    ) -> dict[IndexSymbol, IndexSequence]:
+        """
+        Propagate index backwards.
+
+        Dynamic values potentially can have non-identity mapping, so we need
+        to update index when walking from the node to dyn val arguments.
+
+        E.g. if `index` is $idx and dynamic_val_mappings={N: j // ELEMS_PER_THREAD}
+        resulted arg index will be $idx // ELEMS_PER_THREAD.
+        """
+        if arg in self.mapping_dynamic_vals:
+            assert self.mapping.is_output_identity()
+            i = self.mapping_dynamic_vals.index(arg)
+            iters = self.mapping.iters
+            mapping = self.mapping.dynamic_val_mappings[i]
+
+            # This logic assumes that the output mapping is identity.
+            subs = {
+                k: index[v] for k, v in zip(iters, self.mapping.output_mapping.keys())
+            }
+            return {
+                k: IndexSequence.from_expr(mapping[k], subs)
+                for k in get_custom(arg).type.symbolic_shape
+                if k in mapping
+            }
+
+        return index
+
+    def get_derived_indices(
+        self,
+    ) -> list[tuple[dict[IndexSymbol, IndexSequence], fx.Node]]:
+        def transform_idx(arg):
+            # Treat zero index as 'not-set' and does't propagate it.
+            # TODO: `set_thread_independent_index` currently blindly sets zero
+            # index to all dims which are not participating in constraints, we
+            # need to refactor `index_sequence_analysis` into proper dataflow
+            # analysis.
+            return {
+                k: v
+                for k, v in self.transform_index_backwards(self.index, arg).items()
+                if v.start != 0
+            }
+
+        breakpoint()
+        return [(arg, transform_idx(arg)) for arg in self.mapping_dynamic_vals]
 
 
 @define_op("atomic_add")
