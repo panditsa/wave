@@ -187,7 +187,7 @@ def resolve_scaled_indices(trace):
                     dim_expr.subs({dim: source.vector_shapes[dim]})
                 )
                 custom = get_custom(source)
-                if isinstance(custom, (Read, Write, AtomicOp)):
+                if isinstance(custom, (Read, Write)):
                     assert (
                         custom.elements_per_thread % scale_factor == 0
                     ), "elem per thread needs to be divisble by scale."
@@ -738,9 +738,7 @@ def set_thread_dependent_index_from_mma(
     sources: list[MMABase] = list(mma_mapping.keys())
     assert sources and len(sources) >= 1, "Unexpected empty MMA mapping."
     if not sources:
-        sources = trace.walk(
-            lambda node: isinstance(get_custom(node), (Read, Write, AtomicOp))
-        )
+        sources = trace.walk(lambda node: isinstance(get_custom(node), (Read, Write)))
         sources = [get_custom(x) for x in sources]
         assert sources, "No read or mma nodes found in the graph."
 
@@ -775,9 +773,7 @@ def set_thread_dependent_index_from_read_write(
     Set the thread dependent index based on the hardware constraint.
     """
     hardware_constraint = get_hardware_constraint(constraints)
-    sources = trace.walk(
-        lambda node: isinstance(get_custom(node), (Read, Write, AtomicOp))
-    )
+    sources = trace.walk(lambda node: isinstance(get_custom(node), (Read, Write)))
     sources = [get_custom(x) for x in sources]
     assert sources, "No read nodes found in the graph."
 
@@ -991,9 +987,7 @@ def resolve_thread_shapes(trace: CapturedTrace, constraints: list[Constraint]):
             return custom.acc.index
         return custom.index
 
-    for node in trace.walk(
-        lambda x: isinstance(get_custom(x), (Read, Write, AtomicOp))
-    ):
+    for node in trace.walk(lambda x: isinstance(get_custom(x), (Read, Write))):
         custom = get_custom(node)
         if custom.elements_per_thread is None:
             _, size = get_largest_index_and_size(get_index(custom))
