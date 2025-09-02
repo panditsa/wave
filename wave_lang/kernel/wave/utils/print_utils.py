@@ -18,6 +18,7 @@ from wave_lang.kernel.ops.wave_ops import (
     Read,
     Write,
     get_custom,
+    AtomicOp,
 )
 
 from ..._support.tracing import CapturedTrace
@@ -40,7 +41,7 @@ def get_node_type(node: fx.Node) -> str:
     # As a result, this graph contains no placeholders since we don't want to schedule them
     # and so we can't use custom.memory_type.address_space because the global reads/writes have
     # no placeholders and custom.memory is None.
-    if isinstance(custom, (Read, Write)):
+    if isinstance(custom, (Read, Write, AtomicOp)):
         base_type = "Read" if isinstance(custom, Read) else "Write"
         uses_allocate = custom.memory and isinstance(
             get_custom(custom.memory), Allocate
