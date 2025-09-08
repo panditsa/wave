@@ -2645,7 +2645,7 @@ class ScanOp(CustomOp, ABC):
         else:
             indexing = get_custom(self.arg).indexing_dims
 
-        return [dim for dim in indexing if dim != self.dim]
+        return indexing
 
     def infer_type(self, *args):
         if isinstance(self.arg, Sequence):
