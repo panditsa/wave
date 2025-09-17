@@ -56,7 +56,7 @@ default_test_shapes["test_gemm"] = [
     ],
 )
 @pytest.mark.parametrize(
-    "devices", [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8)]
+    "devices", [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)]
 )
 @pytest.mark.parametrize("datatype", [torch.float16])
 def testPureGemm(
@@ -78,11 +78,8 @@ def testPureGemm(
     a = device_randn(shape[0], shape[2], dtype=datatype)
     b = device_randn(shape[1], shape[2], dtype=datatype)
     c = device_zeros(shape[0], shape[1], dtype=torch.float32)
-    out = gemm(a, b, c)
-    # print(gemm.asm)
+    gemm(a, b, c)
 
     iree_ref = device_zeros(shape[0], shape[1], dtype=torch.float32)
     generate_iree_ref("mmt", [a, b], [iree_ref], options)
-    # print(c)
-    # print(iree_ref)
     assert_close(c, iree_ref, check_device=False)
