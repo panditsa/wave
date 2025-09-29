@@ -71,31 +71,38 @@ class WaveKernel:
         self.debug_outputs = debug_outputs
         self.debug_handlers = debug_handlers
 
-        if not options.wave_runtime:
-            # Disable async dispatch for benchmarking.
-            is_async = options.iree_launch_async and not options.run_bench
+        # If we are compiling to MLIR, we don't have an executable
+        if options.compile_to_mlir:
+            return
 
-            # 'launchable' decides if function is async or not based on name.
-            self.func_name = options.func_name + ("$async" if is_async else "")
+        # If we are using the wave runtime, we don't need to create a launchable
+        if options.wave_runtime:
+            return
 
-            if self.options.num_devices > 1:
-                device_list = [f"hip://{d}" for d in range(options.num_devices)]
-                self.launchable = MultiDeviceLaunchable.from_vmfb(
-                    self.executable,
-                    devices=device_list,
-                    function_name=self.func_name,
-                    runtime_flags=["--hip_use_streams=true"],
-                )
-            else:
+        # Disable async dispatch for benchmarking.
+        is_async = options.iree_launch_async and not options.run_bench
 
-                def loader(device):
-                    vm_instance = device.vm_instance
-                    return rt.VmModule.copy_buffer(vm_instance, self.executable)
+        # 'launchable' decides if function is async or not based on name.
+        self.func_name = options.func_name + ("$async" if is_async else "")
 
-                self.launchable = Launchable.from_vm_module(
-                    loader,
-                    entry_point=self.func_name,
-                )
+        if self.options.num_devices > 1:
+            device_list = [f"hip://{d}" for d in range(options.num_devices)]
+            self.launchable = MultiDeviceLaunchable.from_vmfb(
+                self.executable,
+                devices=device_list,
+                function_name=self.func_name,
+                runtime_flags=["--hip_use_streams=true"],
+            )
+        else:
+
+            def loader(device):
+                vm_instance = device.vm_instance
+                return rt.VmModule.copy_buffer(vm_instance, self.executable)
+
+            self.launchable = Launchable.from_vm_module(
+                loader,
+                entry_point=self.func_name,
+            )
 
     def get_trace(self) -> Optional["CapturedTrace"]:
         """Returns the trace used to generate this kernel.
