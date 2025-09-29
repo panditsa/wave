@@ -19,6 +19,7 @@ from wave_lang.support.location_config import (
     LocationCaptureConfig,
     LocationCaptureLevel,
 )
+from wave_lang.kernel.wave.constraints import MMAType, DeviceConstraint
 
 M = tkl.sym.M
 N = tkl.sym.N
@@ -2845,3 +2846,117 @@ def test_atomic_add():
     # CHECK:            %[[RESULT:.+]] = vector.load %[[alloc]][%[[C0]]] : memref<{{.*}}xi32, #gpu.address_space<workgroup>>, vector<{{.*}}xi32>
     # CHECK:            %[[EXPERTS:.+]] = stream.binding.subspan %arg1[%[[C0]]] : !stream.binding -> memref<{{.*}}xi32, strided<[1], offset: ?>>
     # CHECK:            vector.store %[[RESULT]], %[[EXPERTS]][%[[C0]]] : memref<{{.*}}xi32, strided<[1], offset: ?>>, vector<{{.*}}xi32>
+
+
+@run_test
+def test_dist_gemm():
+    M = tkl.sym.M
+    N = tkl.sym.N
+    K = tkl.sym.K
+    BLOCK_M = tkl.sym.BLOCK_M
+    BLOCK_N = tkl.sym.BLOCK_N
+    BLOCK_K = tkl.sym.BLOCK_K
+    DEVICE_M = tkl.sym.DEVICE_M
+    DEVICE_N = tkl.sym.DEVICE_N
+    ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+
+    constraints: list[tkw.Constraint] = []
+    # Add device constraints for distribution
+    constraints += [DeviceConstraint(M, DEVICE_M, 0)]
+    constraints += [DeviceConstraint(N, DEVICE_N, 1)]
+    constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
+    constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
+    constraints += [tkw.TilingConstraint(K, BLOCK_K)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M / 2)]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]
+    constraints += [
+        tkw.HardwareConstraint(threads_per_wave=64, mma_type=MMAType.F32_32x32x8_F16)
+    ]
+
+    @tkw.wave(constraints)
+    def dist_gemm(
+        a: tkl.Memory[M, K, ADDRESS_SPACE, tkl.f16],
+        b: tkl.Memory[N, K, ADDRESS_SPACE, tkl.f16],
+        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
+    ):
+        c_reg = tkl.Register[M, N, tkl.f32](0.0)
+
+        @tkw.iterate(K, init_args=[c_reg])
+        def repeat(acc: tkl.Register[M, N, tkl.f32]) -> tkl.Register[M, N, tkl.f32]:
+            a_reg = tkw.read(a)
+            b_reg = tkw.read(b)
+            acc = tkw.mma(a_reg, b_reg, acc)
+            return acc
+
+        tkw.write(repeat, c)
+
+    # Set up hyperparams with device distribution (2x1 distribution)
+    hyperparams = {
+        M: 1024,
+        N: 5120,
+        K: 640,
+        DEVICE_M: 512,  # M distributed across 2 devices
+        DEVICE_N: 2560,  # N distributed across 2 devices
+        BLOCK_M: 64,
+        BLOCK_N: 64,
+        BLOCK_K: 32,
+        ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
+    }
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        canonicalize=True,
+        iree_launch_async=False,
+        compile_to_mlir=True,
+    )
+    dist_gemm = wave_compile(options, dist_gemm)
+    print(dist_gemm.asm)
+
+    # CHECK-LABEL: test_dist_gemm
+    # Core gemm function should remain simple
+    # CHECK: func.func @dist_gemm
+    # CHECK-SAME: (%{{.*}}: !stream.binding, %{{.*}}: !stream.binding, %{{.*}}: !stream.binding)
+    # CHECK: amdgpu.mfma
+
+    # The header should contain the full input and output tensor sizes
+    # CHECK: func.func @isolated_benchmark
+    # CHECK-SAME: (%{{.*}}: tensor<1024x640xf16>, %{{.*}}: tensor<5120x640xf16>, %{{.*}}: tensor<1024x5120xf32>) -> tensor<1024x5120xf32>
+
+    # Matrix A sliced along M dimension (2 slices of 512x640)
+    # CHECK-DAG: %[[SLICE_A0:.+]] = flow.tensor.slice %{{.*}}[%{{.*}}, %{{.*}} for %c512, %c640] : tensor<1024x640xf16> -> tensor<512x640xf16>
+    # CHECK-DAG: %[[SLICE_A1:.+]] = flow.tensor.slice %{{.*}}[%c512, %{{.*}} for %c512, %c640] : tensor<1024x640xf16> -> tensor<512x640xf16>
+
+    # Matrix B sliced along N dimension (2 slices of 2560x640)
+    # CHECK-DAG: %[[SLICE_B0:.+]] = flow.tensor.slice %{{.*}}[%{{.*}}, %{{.*}} for %c2560, %c640] : tensor<5120x640xf16> -> tensor<2560x640xf16>
+    # CHECK-DAG: %[[SLICE_B1:.+]] = flow.tensor.slice %{{.*}}[%c2560, %{{.*}} for %c2560, %c640] : tensor<5120x640xf16> -> tensor<2560x640xf16>
+
+    # Matrix C sliced along both dimensions (4 slices of 512x2560)
+    # CHECK-DAG: %[[SLICE_C00:.+]] = flow.tensor.slice %{{.*}}[%{{.*}}, %{{.*}} for %c512, %c2560] : tensor<1024x5120xf32> -> tensor<512x2560xf32>
+    # CHECK-DAG: %[[SLICE_C10:.+]] = flow.tensor.slice %{{.*}}[%c512, %{{.*}} for %c512, %c2560] : tensor<1024x5120xf32> -> tensor<512x2560xf32>
+    # CHECK-DAG: %[[SLICE_C01:.+]] = flow.tensor.slice %{{.*}}[%{{.*}}, %c2560 for %c512, %c2560] : tensor<1024x5120xf32> -> tensor<512x2560xf32>
+    # CHECK-DAG: %[[SLICE_C11:.+]] = flow.tensor.slice %{{.*}}[%c512, %c2560 for %c512, %c2560] : tensor<1024x5120xf32> -> tensor<512x2560xf32>
+
+    # Device transfers to 4 devices (2x2 grid)
+    # CHECK-DAG: %[[TRANSFER_A0:.+]] = flow.tensor.transfer %[[SLICE_A0]] : tensor<512x640xf16> to #hal.device.promise<@__device_0>
+    # CHECK-DAG: %[[TRANSFER_A1:.+]] = flow.tensor.transfer %[[SLICE_A1]] : tensor<512x640xf16> to #hal.device.promise<@__device_1>
+    # CHECK-DAG: %[[TRANSFER_B0:.+]] = flow.tensor.transfer %[[SLICE_B0]] : tensor<2560x640xf16> to #hal.device.promise<@__device_0>
+    # CHECK-DAG: %[[TRANSFER_B1:.+]] = flow.tensor.transfer %[[SLICE_B1]] : tensor<2560x640xf16> to #hal.device.promise<@__device_2>
+    # CHECK-DAG: %[[TRANSFER_C00:.+]] = flow.tensor.transfer %[[SLICE_C00]] : tensor<512x2560xf32> to #hal.device.promise<@__device_0>
+    # CHECK-DAG: %[[TRANSFER_C10:.+]] = flow.tensor.transfer %[[SLICE_C10]] : tensor<512x2560xf32> to #hal.device.promise<@__device_1>
+    # CHECK-DAG: %[[TRANSFER_C01:.+]] = flow.tensor.transfer %[[SLICE_C01]] : tensor<512x2560xf32> to #hal.device.promise<@__device_2>
+    # CHECK-DAG: %[[TRANSFER_C11:.+]] = flow.tensor.transfer %[[SLICE_C11]] : tensor<512x2560xf32> to #hal.device.promise<@__device_3>
+
+    # Four dispatches (one per device in 2x2 grid)
+    # CHECK-DAG: %[[DISPATCH00:.+]] = flow.dispatch @{{.*}}::@{{.*}}(%[[TRANSFER_A0]], %[[TRANSFER_B0]], %[[TRANSFER_C00]])
+    # CHECK-DAG: %[[DISPATCH10:.+]] = flow.dispatch @{{.*}}::@{{.*}}(%[[TRANSFER_A1]], %[[TRANSFER_B0]], %[[TRANSFER_C10]])
+    # CHECK-DAG: %[[DISPATCH01:.+]] = flow.dispatch @{{.*}}::@{{.*}}(%[[TRANSFER_A0]], %[[TRANSFER_B1]], %[[TRANSFER_C01]])
+    # CHECK-DAG: %[[DISPATCH11:.+]] = flow.dispatch @{{.*}}::@{{.*}}(%[[TRANSFER_A1]], %[[TRANSFER_B1]], %[[TRANSFER_C11]])
+
+    # Result reassembly with tensor.insert_slice (2x2 grid pattern)
+    # CHECK-DAG: %[[INSERT0:.+]] = tensor.insert_slice %[[DISPATCH00]] into %{{.*}}[0, 0] [512, 2560] [1, 1] : tensor<512x2560xf32> into tensor<1024x5120xf32>
+    # CHECK-DAG: %[[INSERT1:.+]] = tensor.insert_slice %[[DISPATCH10]] into %[[INSERT0]][512, 0] [512, 2560] [1, 1] : tensor<512x2560xf32> into tensor<1024x5120xf32>
+    # CHECK-DAG: %[[INSERT2:.+]] = tensor.insert_slice %[[DISPATCH01]] into %[[INSERT1]][0, 2560] [512, 2560] [1, 1] : tensor<512x2560xf32> into tensor<1024x5120xf32>
+    # CHECK-DAG: %[[INSERT3:.+]] = tensor.insert_slice %[[DISPATCH11]] into %[[INSERT2]][512, 2560] [512, 2560] [1, 1] : tensor<512x2560xf32> into tensor<1024x5120xf32>
+
+    # Terminate the DAG with the final return
+    # CHECK: return %{{.*}} : tensor<1024x5120xf32>
