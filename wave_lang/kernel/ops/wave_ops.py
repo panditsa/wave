@@ -1436,7 +1436,7 @@ class SchedulingBarrier(CustomOp):
 
 @define_op("atomic_min")
 @dataclass
-class AtomicOp(BinaryOpBase, ABC):
+class AtomicOp(BinaryOpBase):
     """
     Represents an atomic operation in the graph. Takes in Register and
     Memory as inputs and writes the modified value back on to the buffer.
