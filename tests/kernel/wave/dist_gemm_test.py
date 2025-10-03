@@ -29,6 +29,7 @@ from .common.utils import (
     require_cdna3,
     require_cdna_3_or_4,
     require_cdna_2_or_3_or_4,
+    require_gpus,
     perf_test,
     param_bool,
 )
@@ -59,7 +60,18 @@ default_test_shapes["test_gemm"] = [
 )
 @pytest.mark.parametrize(
     "devices",
-    [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)],
+    [
+        pytest.param((1, 1), marks=require_gpus(1)),
+        pytest.param((2, 1), marks=require_gpus(2)),
+        pytest.param((4, 1), marks=require_gpus(4)),
+        pytest.param((8, 1), marks=require_gpus(8)),
+        pytest.param((1, 2), marks=require_gpus(2)),
+        pytest.param((1, 4), marks=require_gpus(4)),
+        pytest.param((1, 8), marks=require_gpus(8)),
+        pytest.param((2, 2), marks=require_gpus(4)),
+        pytest.param((2, 4), marks=require_gpus(8)),
+        pytest.param((4, 2), marks=require_gpus(8)),
+    ],
 )
 @pytest.mark.parametrize("datatype", [torch.float16])
 def testDistGemm(
