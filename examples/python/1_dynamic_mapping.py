@@ -63,72 +63,7 @@ def get_wave_compile_options(
     )
 
 
-def test_read_write_dynamic_mapping_broadcast():
-    """Read from 2D tensor using dynamic offsets per row, demonstrating runtime-computed indices with broadcast."""
-    ONE = tkl.sym.ONE
-    constraints: list[tkw.Constraint] = [
-        tkw.HardwareConstraint(
-            threads_per_wave=64,
-            vector_shapes={M: 16, N: 16, ONE: 1},
-        )
-    ]
-    constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
-    constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
-    constraints += [tkw.WaveConstraint(M, BLOCK_M)]
-    constraints += [tkw.WaveConstraint(N, BLOCK_N)]
-
-    i = tkw.IndexMapping.iterator(0)
-    j = tkw.IndexMapping.iterator(1)
-    k = tkw.IndexMapping.dynamic_val(0)
-    mapping = tkw.IndexMapping(
-        num_iterators=2,
-        inputs={M: i, N: k + j % 16},
-        outputs={M: i, N: j},
-        dynamic_val_mappings={M: i, ONE: j // 16},
-    )
-
-    @tkw.wave(constraints)
-    def read_write_dynamic_mapping_broadcast(
-        a: tkl.Memory[M, N, ADDRESS_SPACE, tkl.i32],
-        off: tkl.Memory[M, ONE, ADDRESS_SPACE, tkl.i32],
-        b: tkl.Memory[M, N, ADDRESS_SPACE, tkl.i32],
-    ):
-        offset = tkw.read(off)
-        res = tkw.read(
-            a,
-            mapping=mapping,
-            mapping_dynamic_vals=(offset,),
-        )
-        tkw.write(res, b)
-
-    read_write_dynamic_mapping_broadcast = wave_compile(
-        get_wave_compile_options(
-            m=16,
-            n=16,
-            k=16,
-            block_m=16,
-            block_n=16,
-            block_k=16,
-            address_space=tkl.AddressSpace.SHARED_MEMORY.value,
-            canonicalize=True,
-            additional_symbols={ONE: 1, BLOCK_N: 16},
-        ),
-        read_write_dynamic_mapping_broadcast,
-    )
-    print(read_write_dynamic_mapping_broadcast.asm)
-
-    # Need at least offset_max + 16 columns
-    a = torch.arange(0, 16 * 16, dtype=torch.int32).reshape(16, 16).cuda()
-    off = torch.zeros((16, 1), dtype=torch.int32).cuda()
-    b = torch.zeros((16, 16), dtype=torch.int32).cuda()
-
-    read_write_dynamic_mapping_broadcast(a, off, b)
-    print(a)
-    print(off)
-    print(b)
-
-
-def test_one_read_write_dynamic_mapping_broadcast():
+def test_dynamic_offset():
     """1D tensor read with a single dynamic offset value, showcasing simpler offset-based indexing."""
     ONE = tkl.sym.ONE
 
@@ -151,7 +86,7 @@ def test_one_read_write_dynamic_mapping_broadcast():
     )
 
     @tkw.wave(constraints)
-    def read_write_dynamic_mapping_broadcast(
+    def kernel(
         a: tkl.Memory[N, ADDRESS_SPACE, tkl.i32],
         off: tkl.Memory[ONE, ADDRESS_SPACE, tkl.i32],
         b: tkl.Memory[N, ADDRESS_SPACE, tkl.i32],
@@ -164,11 +99,11 @@ def test_one_read_write_dynamic_mapping_broadcast():
         )
         tkw.write(res, b)
 
-    read_write_dynamic_mapping_broadcast = wave_compile(
+    compiled_kernel = wave_compile(
         get_wave_compile_options(canonicalize=True, additional_symbols={ONE: 1}),
-        read_write_dynamic_mapping_broadcast,
+        kernel,
     )
-    print(read_write_dynamic_mapping_broadcast.asm)
+    print(compiled_kernel.asm)
 
     # create input tensors
     a = (
@@ -181,13 +116,13 @@ def test_one_read_write_dynamic_mapping_broadcast():
     off = torch.ones((1,), dtype=torch.int32).cuda()
     b = torch.zeros((16,), dtype=torch.int32).cuda()
 
-    read_write_dynamic_mapping_broadcast(a, off, b)
+    compiled_kernel(a, off, b)
     print(a)
     print(off)
     print(b)
 
 
-def test_one_nooffset_dynamic_mapping_broadcast():
+def test_fixed_offset():
     """Simple read with constant offset mapping, demonstrating basic index transformation without dynamic values."""
     ONE = tkl.sym.ONE
 
@@ -212,11 +147,11 @@ def test_one_nooffset_dynamic_mapping_broadcast():
     seq_len_mapping_w = tkw.IndexMapping(
         num_iterators=1,
         inputs={N: j},
-        outputs={N: j + 1},
+        outputs={N: j + ONE},
     )
 
     @tkw.wave(constraints)
-    def read_write_dynamic_mapping_broadcast(
+    def kernel(
         a: tkl.Memory[N, ADDRESS_SPACE, tkl.i32],
         b: tkl.Memory[N, ADDRESS_SPACE, tkl.i32],
     ):
@@ -227,11 +162,11 @@ def test_one_nooffset_dynamic_mapping_broadcast():
         )
         tkw.write(temp, b, mapping=seq_len_mapping_w)
 
-    read_write_dynamic_mapping_broadcast = wave_compile(
+    compiled_kernel = wave_compile(
         get_wave_compile_options(canonicalize=True, additional_symbols={ONE: 1}),
-        read_write_dynamic_mapping_broadcast,
+        kernel,
     )
-    print(read_write_dynamic_mapping_broadcast.asm)
+    print(compiled_kernel.asm)
 
     # create input tensors
     a = (
@@ -243,7 +178,7 @@ def test_one_nooffset_dynamic_mapping_broadcast():
     )
     b = torch.zeros((16,), dtype=torch.int32).cuda()
 
-    read_write_dynamic_mapping_broadcast(a, b)
+    compiled_kernel(a, b)
     print(a)
     print(b)
 
