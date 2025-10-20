@@ -29,7 +29,7 @@ ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
 ADDRESS_SPACE_0 = tkl.sym.ADDRESS_SPACE_0
 
 
-def test_reduce_sum():
+def test_reduce_sum(is_debug=False):
     """Basic sum reduction along the last dimension of a 2D tensor."""
     shape = (64, 128)
     M = tkl.sym.M
@@ -70,15 +70,19 @@ def test_reduce_sum():
             ADDRESS_SPACE: tkl.AddressSpace.GLOBAL_MEMORY.value,
         },
         canonicalize=True,
+        print_ir_after="all" if is_debug else [],
     )
     test = wave_compile(options, test)
+
+    if is_debug:
+        print(test.asm)
 
     test(a, c)
     torch.testing.assert_close(ref, c, atol=0.1, rtol=1e-05)
     print("Test passed")
 
 
-def test_broadcast_reduce_sum():
+def test_broadcast_reduce_sum(is_debug=False):
     """Broadcast a 1D tensor to 2D, multiply element-wise, then reduce along last dimension."""
     shape = (64, 128)
     M = tkl.sym.M
@@ -128,8 +132,12 @@ def test_broadcast_reduce_sum():
             ADDRESS_SPACE: tkl.AddressSpace.GLOBAL_MEMORY.value,
         },
         canonicalize=True,
+        print_ir_after="all" if is_debug else [],
     )
     test = wave_compile(options, test)
+
+    if is_debug:
+        print(test.asm)
 
     test(a, b, c, c_temp)
     torch.testing.assert_close(ref_temp, c_temp, atol=0.1, rtol=1e-05)
@@ -137,7 +145,7 @@ def test_broadcast_reduce_sum():
     print("Test passed")
 
 
-def test_moe_weighted_sum():
+def test_moe_weighted_sum(is_debug=False):
     """3D weighted sum reduction matching MOE pattern: broadcast 2D weights to 3D, multiply, then sum along middle dimension."""
     shape = (64, 64, 128)  # (B, K, D)
     B = tkl.sym.B
@@ -202,8 +210,12 @@ def test_moe_weighted_sum():
             ADDRESS_SPACE: tkl.AddressSpace.GLOBAL_MEMORY.value,
         },
         canonicalize=True,
+        print_ir_after="all" if is_debug else [],
     )
     test = wave_compile(options, test)
+
+    if is_debug:
+        print(test.asm)
 
     test(out, topk_weights, result, temp_output)
     torch.testing.assert_close(ref_temp, temp_output, atol=0.1, rtol=1e-05)

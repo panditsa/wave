@@ -1,10 +1,18 @@
 # Wave Lang Python Examples
 
-This directory contains organized examples demonstrating various features of Wave Lang.
+Simple, focused examples demonstrating Wave Lang features. These tests are designed as a quick start for experimenting with the language.  Each example is small, easy to run, and showcases a specific capability.
 
-## Running Examples
+## Quick Start
 
-Each example file contains multiple tests. You can:
+**Setup:** First, ensure your environment is set up correctly by following the instructions in the main [README.md](../../README.md) at the repository root.
+
+**Activate environment:**
+```bash
+# From the repository root
+source .venv/bin/activate
+```
+
+**Run examples:** Each example file contains multiple tests that you can run individually:
 
 1. **List available tests:**
    ```bash
@@ -13,38 +21,15 @@ Each example file contains multiple tests. You can:
 
 2. **Run a specific test:**
    ```bash
-   python 1_dynamic_mapping.py --test test_read_write_dynamic_mapping_broadcast
+   python 1_dynamic_mapping.py --test test_dynamic_offset
    ```
 
-3. **Run with debug output:**
+3. **Run with debug output (prints IR):**
    ```bash
-   python 1_dynamic_mapping.py --test test_read_write_dynamic_mapping_broadcast --debug
+   python 1_dynamic_mapping.py --test test_dynamic_offset --debug
    ```
 
 4. **Repeat a test multiple times:**
    ```bash
-   python 1_dynamic_mapping.py --test test_read_write_dynamic_mapping_broadcast --repeat 5
+   python 1_dynamic_mapping.py --test test_dynamic_offset --repeat 5
    ```
-
-## Example Categories
-
-### 1. Dynamic Mapping (`1_dynamic_mapping.py`)
-Demonstrates reading and writing with dynamic index mappings and offset-based access patterns.
-- `test_read_write_dynamic_mapping_broadcast` - 2D read with dynamic offset and broadcast
-- `test_one_read_write_dynamic_mapping_broadcast` - 1D read with dynamic offset
-- `test_one_nooffset_dynamic_mapping_broadcast` - Read/write with constant offset mapping
-
-### 2. Control Flow (`2_control_flow.py`)
-Demonstrates unstructured loops with dynamic conditions and iteration patterns.
-- `test_iteration_with_condition` - Unstructured loop with runtime-determined exit condition
-
-### 3. Atomic Operations (`3_atomics.py`)
-Demonstrates atomic memory operations.
-- `test_atomic_add_return_value` - Basic atomic add with return value
-- `test_read_back_scalar` - Atomic operation followed by scalar readback
-
-### 4. Reduction Operations (`4_reductions.py`)
-Demonstrates various reduction patterns.
-- `test_reduce_sum` - Basic sum reduction
-- `test_broadcast_reduce_sum` - Broadcast then reduce pattern
-- `test_moe_weighted_sum` - 3D weighted sum (MOE-style pattern)

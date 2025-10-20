@@ -39,6 +39,7 @@ def get_wave_compile_options(
     canonicalize: bool = False,
     dynamic_symbols=[],
     additional_symbols={},
+    is_debug: bool = False,
 ):
     bindings = {
         M: m,
@@ -60,10 +61,11 @@ def get_wave_compile_options(
         subs=bindings,
         canonicalize=canonicalize,
         dynamic_symbols=dynamic_symbols,
+        print_ir_after="all" if is_debug else [],
     )
 
 
-def test_dynamic_offset():
+def test_dynamic_offset(is_debug=False):
     """1D tensor read with a single dynamic offset value, showcasing simpler offset-based indexing."""
     ONE = tkl.sym.ONE
 
@@ -100,10 +102,13 @@ def test_dynamic_offset():
         tkw.write(res, b)
 
     compiled_kernel = wave_compile(
-        get_wave_compile_options(canonicalize=True, additional_symbols={ONE: 1}),
+        get_wave_compile_options(
+            canonicalize=True, additional_symbols={ONE: 1}, is_debug=is_debug
+        ),
         kernel,
     )
-    print(compiled_kernel.asm)
+    if is_debug:
+        print(compiled_kernel.asm)
 
     # create input tensors
     a = (
@@ -122,7 +127,7 @@ def test_dynamic_offset():
     print(b)
 
 
-def test_fixed_offset():
+def test_fixed_offset(is_debug=False):
     """Simple read with constant offset mapping, demonstrating basic index transformation without dynamic values."""
     ONE = tkl.sym.ONE
 
@@ -163,10 +168,13 @@ def test_fixed_offset():
         tkw.write(temp, b, mapping=seq_len_mapping_w)
 
     compiled_kernel = wave_compile(
-        get_wave_compile_options(canonicalize=True, additional_symbols={ONE: 1}),
+        get_wave_compile_options(
+            canonicalize=True, additional_symbols={ONE: 1}, is_debug=is_debug
+        ),
         kernel,
     )
-    print(compiled_kernel.asm)
+    if is_debug:
+        print(compiled_kernel.asm)
 
     # create input tensors
     a = (

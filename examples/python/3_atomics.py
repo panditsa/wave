@@ -28,7 +28,7 @@ ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
 ADDRESS_SPACE_0 = tkl.sym.ADDRESS_SPACE_0
 
 
-def test_atomic_add_return_value():
+def test_atomic_add_return_value(is_debug=False):
     """Atomic add operation that returns the old value before the addition."""
     LIMIT_VAL = tkl.sym.LIMIT_VAL
 
@@ -77,11 +77,11 @@ def test_atomic_add_return_value():
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
         },
         canonicalize=True,
-        print_ir_after="all",
-        print_ir_before="all",
+        print_ir_after="all" if is_debug else [],
     )
     iterated_gemm = wave_compile(options, iterated_gemm)
-    print(iterated_gemm.asm)
+    if is_debug:
+        print(iterated_gemm.asm)
 
     # generate random input tensors between -1 and 1
     a = torch.randint(1, 2, (64,), dtype=torch.int32).cuda()
@@ -92,7 +92,7 @@ def test_atomic_add_return_value():
     print(c)
 
 
-def test_read_back_scalar():
+def test_read_back_scalar(is_debug=False):
     """Perform atomic add to shared memory then read back a scalar value using dynamic mapping."""
     ONE = tkl.sym.ONE
     constraints: list[tkw.Constraint] = [
@@ -154,12 +154,12 @@ def test_read_back_scalar():
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
         },
         canonicalize=True,
-        print_ir_after="all",
-        print_ir_before="all",
+        print_ir_after="all" if is_debug else [],
         minimize_shared_allocs=False,
     )
     iterated_gemm = wave_compile(options, iterated_gemm)
-    print(iterated_gemm.asm)
+    if is_debug:
+        print(iterated_gemm.asm)
 
     # generate random input tensors between -1 and 1
     a = torch.randint(1, 2, (64,), dtype=torch.int32).cuda()

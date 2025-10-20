@@ -28,7 +28,7 @@ ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
 ADDRESS_SPACE_0 = tkl.sym.ADDRESS_SPACE_0
 
 
-def test_iteration_with_condition():
+def test_iteration_with_condition(is_debug=False):
     """Unstructured loop with runtime-determined exit condition, showing per-thread iteration control."""
     LIMIT_VAL = tkl.sym.LIMIT_VAL
 
@@ -106,11 +106,11 @@ def test_iteration_with_condition():
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
         },
         canonicalize=True,
-        print_ir_after="all",
-        print_ir_before="all",
+        print_ir_after="all" if is_debug else [],
     )
     iterated_gemm = wave_compile(options, iterated_gemm)
-    print(iterated_gemm.asm)
+    if is_debug:
+        print(iterated_gemm.asm)
 
     # generate random input tensors between -1 and 1
     a = torch.randint(0, 4, (64,), dtype=torch.int32).cuda()
