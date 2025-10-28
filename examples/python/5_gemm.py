@@ -15,6 +15,11 @@ from wave_lang.kernel.lang.global_symbols import *
 from wave_lang.kernel.lang.wave_types import *
 from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
+from wave_lang.kernel.wave.scheduling.schedule import SchedulingType
+
+from wave_lang.kernel.wave.utils.general_utils import (
+    get_default_scheduling_params,
+)
 
 # Define symbolic dimensions for our matrices
 M = sym.M  # Rows of A and C
@@ -58,7 +63,7 @@ def simple_gemm_test(is_debug=False):
         tkw.WorkgroupConstraint(N, BLOCK_N, 1),
         tkw.TilingConstraint(K, BLOCK_K),
         tkw.WaveConstraint(M, BLOCK_M / 2),
-        tkw.WaveConstraint(N, BLOCK_N / 2),
+        tkw.WaveConstraint(N, BLOCK_N / 4),
         tkw.HardwareConstraint(
             threads_per_wave=64,
             mma_type=tkw.MMAType.F32_16x16x16_F16,
@@ -90,7 +95,7 @@ def simple_gemm_test(is_debug=False):
         tkw.write(repeat, c)
 
     # Create test matrices
-    m, n, k = 64, 64, 64  # Small dimensions for testing
+    m, n, k = 128, 256, 128
 
     # Initialize input matrices with random values
     torch.manual_seed(0)
@@ -100,23 +105,28 @@ def simple_gemm_test(is_debug=False):
 
     # Set hyperparameters for compilation
     hyperparams = {
-        ADDRESS_SPACE_A: GLOBAL_ADDRESS_SPACE,
-        ADDRESS_SPACE_B: GLOBAL_ADDRESS_SPACE,
+        ADDRESS_SPACE_A: SHARED_ADDRESS_SPACE,
+        ADDRESS_SPACE_B: SHARED_ADDRESS_SPACE,
         ADDRESS_SPACE_C: GLOBAL_ADDRESS_SPACE,
-        BLOCK_M: 64,
-        BLOCK_N: 64,
-        BLOCK_K: 32,
+        BLOCK_M: 128,
+        BLOCK_N: 256,
+        BLOCK_K: 64,
         M: m,
         N: n,
         K: k,
     }
 
+    hyperparams.update(get_default_scheduling_params())
+
     # Compile the kernel
     options = WaveCompileOptions(
         subs=hyperparams,
+        schedule=SchedulingType.PREFETCH,
+        use_scheduling_barriers=True,
         print_ir_after="all" if is_debug else [],
     )
     options = set_default_run_config(options)
+
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
@@ -1761,6 +1771,99 @@ def test_gemm_conditional_weights(is_debug=False):
         f"\nOutput difference when weights applied: {((c_with_weights - c_no_weights).abs().mean().item()):.4f}"
     )
     print("Conditional weight GEMM test passed!")
+
+
+def explicit_shared_gemm_test(is_debug=False):
+    """GEMM with explicit shared memory management."""
+
+    constraints = [
+        tkw.WorkgroupConstraint(M, BLOCK_M, 0),
+        tkw.WorkgroupConstraint(N, BLOCK_N, 1),
+        tkw.TilingConstraint(K, BLOCK_K),
+        tkw.WaveConstraint(M, BLOCK_M / 2),
+        tkw.WaveConstraint(N, BLOCK_N / 4),
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            mma_type=tkw.MMAType.F32_16x16x16_F16,
+            vector_shapes={M: 16, N: 16, K: 16},
+        ),
+    ]
+
+    @tkw.wave(constraints)
+    def gemm(
+        a: Memory[M, K, ADDRESS_SPACE_A, f16],
+        b: Memory[N, K, ADDRESS_SPACE_B, f16],
+        c: Memory[M, N, ADDRESS_SPACE_C, f32],
+    ):
+        # Allocate shared memory explicitly
+        # shape: logical shape, distributed_shape: per-workgroup tile size
+        a_shared = tkw.allocate((M, K), (BLOCK_M, BLOCK_K), f16, SHARED_ADDRESS_SPACE)
+        b_shared = tkw.allocate((N, K), (BLOCK_N, BLOCK_K), f16, SHARED_ADDRESS_SPACE)
+
+        c_acc = Register[M, N, f32](0.0)
+
+        @tkw.iterate(K, init_args=[c_acc])
+        def repeat(acc: Register[M, N, f32]) -> Register[M, N, f32]:
+            a_global = tkw.read(a)
+            b_global = tkw.read(b)
+
+            tkw.write(a_global, a_shared)
+            tkw.write(b_global, b_shared)
+
+            tkw.shared_memory_barrier()
+
+            a_reg = tkw.read(a_shared)
+            b_reg = tkw.read(b_shared)
+
+            acc = tkw.mma(a_reg, b_reg, acc)
+            return acc
+
+        tkw.write(repeat, c)
+
+    # Test setup
+    m, n, k = 128, 256, 128
+
+    torch.manual_seed(0)
+    a = torch.randn(m, k, dtype=torch.float16, device="cuda")
+    b = torch.randn(n, k, dtype=torch.float16, device="cuda")
+    c = torch.zeros(m, n, dtype=torch.float32, device="cuda")
+
+    hyperparams = {
+        BLOCK_M: 128,
+        BLOCK_N: 256,
+        BLOCK_K: 64,
+        M: m,
+        N: n,
+        K: k,
+        ADDRESS_SPACE_A: GLOBAL_ADDRESS_SPACE,
+        ADDRESS_SPACE_B: GLOBAL_ADDRESS_SPACE,
+        ADDRESS_SPACE_C: GLOBAL_ADDRESS_SPACE,
+    }
+    hyperparams.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        use_scheduling_barriers=False,
+        print_ir_after="all" if is_debug else [],
+        minimize_shared_allocs=False,
+    )
+    options = set_default_run_config(options)
+
+    compiled_gemm = wave_compile(options, gemm)
+
+    if is_debug:
+        print(compiled_gemm.asm)
+        with open("manual_pingpong.mlir", "w") as f:
+            f.write(compiled_gemm.asm)
+
+    compiled_gemm(a, b, c)
+
+    expected = torch.matmul(a, b.t())
+    assert torch.allclose(
+        c.to(torch.float16), expected, rtol=1e-2, atol=1e-2
+    ), f"Max difference: {(c - expected).abs().max()}"
+
+    print("Explicit shared GEMM test passed!")
 
 
 if __name__ == "__main__":
