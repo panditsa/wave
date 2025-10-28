@@ -121,8 +121,6 @@ def simple_gemm_test(is_debug=False):
 
     if is_debug:
         print(compiled_gemm.asm)
-        with open("gemm.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
 
     # Run the GEMM kernel
     compiled_gemm(a, b, c)
@@ -554,8 +552,8 @@ def test_gemm_reordered_input(is_debug=False):
     print("GEMM test passed!")
 
 
-def test_scatter_rows(is_debug=False):
-    """Scatter operation to reorder matrix rows based on dynamic indices."""
+def test_gather_rows(is_debug=False):
+    """Gather operation to reorder matrix rows based on dynamic indices."""
     M_DIV_2 = sym.M_DIV_2
     I = sym.I
     # Define constraints for the kernel
@@ -601,7 +599,7 @@ def test_scatter_rows(is_debug=False):
     ):
         # Initialize the accumulator register with zeros
         @tkw.conditional(THREAD_0 < M_DIV_2)
-        def scatter_op():
+        def gather_op():
             tid = tkw.scalar(THREAD_0, i32)
             reordered_idx = tkw.read(
                 reorder_a,
@@ -657,8 +655,7 @@ def test_scatter_rows(is_debug=False):
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
-        with open("scatter_a.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # create reorder_a such that it is a permutation of the rows of a
     reorder_a = torch.randperm(m // 2).to(torch.int32).to(device="cuda")
@@ -675,11 +672,11 @@ def test_scatter_rows(is_debug=False):
     print("A: ", a[reorder_a[0]])
     print("Reordered A: ", reordered_a[0])
 
-    print("scatter_a test passed!")
+    print("gather_a test passed!")
 
 
-def test_scatter_then_gemm(is_debug=False):
-    """Scatter rows into shared memory then perform GEMM on reordered data."""
+def test_gather_then_gemm(is_debug=False):
+    """Gather rows into shared memory then perform GEMM on reordered data."""
     M_DIV_2 = sym.M_DIV_2
     SHARED_MEM = sym.SHARED_MEM
     I = sym.I
@@ -746,7 +743,7 @@ def test_scatter_then_gemm(is_debug=False):
         valid_threads = THREAD_0 < M_DIV_2
 
         @tkw.conditional(valid_threads)
-        def scatter_op():
+        def gather_op():
             tid = tkw.Register[M_DIV_2, i32](THREAD_0)
             reordered_idx = tkw.read(
                 reorder_a,
@@ -826,8 +823,7 @@ def test_scatter_then_gemm(is_debug=False):
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
-        with open("scatter_a_simple_gemm.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # create reorder_a such that it is a permutation of the rows of a
     reorder_a = torch.randperm(4).to(torch.int32).to(device="cuda")
@@ -857,11 +853,11 @@ def test_scatter_then_gemm(is_debug=False):
         c.to(torch.float16), expected, rtol=1e-2, atol=1e-2
     ), f"GEMM result doesn't match expected output\nMax difference: {(c - expected).abs().max()}"
 
-    print("scatter_a_simple_gemm test passed!")
+    print("gather_then_gemm test passed!")
 
 
-def test_scatter_gemm_expert(is_debug=False):
-    """Scatter rows, then GEMM with expert selection."""
+def test_gather_gemm_expert(is_debug=False):
+    """Gather rows, then GEMM with expert selection."""
     E = sym.E
     M_DIV_2 = sym.M_DIV_2
     # Define constraints for the kernel
@@ -930,7 +926,7 @@ def test_scatter_gemm_expert(is_debug=False):
         condition = THREAD_0 < M_DIV_2
 
         @tkw.conditional(condition)
-        def scatter_op():
+        def gather_op():
             tid = tkw.Register[M_DIV_2, i32](THREAD_0)
             reordered_idx = tkw.read(
                 reorder_a,
@@ -1012,8 +1008,7 @@ def test_scatter_gemm_expert(is_debug=False):
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
-        with open("scatter_gemm.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # create reorder_a such that it is a permutation of the rows of a
     reorder_a = torch.randperm(m // 2).to(torch.int32).to(device="cuda")
@@ -1044,14 +1039,14 @@ def test_scatter_gemm_expert(is_debug=False):
     print("GEMM test passed!")
 
 
-def test_scatter_gemm_padded(is_debug=False):
-    """Scatter with padding support, GEMM, then scatter output back."""
+def test_gather_gemm_padded(is_debug=False):
+    """Gather with padding support, GEMM, then scatter output back."""
     E = sym.E
     BLOCK_SHAPE = sym.BLOCK_SHAPE
     PAD_VALUE = sym.PAD_VALUE
 
     IDX = sym.IDX
-    SCATTER_IDX = sym.SCATTER_IDX
+    GATHER_IDX = sym.GATHER_IDX
     # Define constraints for the kernel
     constraints = [
         tkw.WorkgroupConstraint(M, BLOCK_M, 0),
@@ -1135,7 +1130,7 @@ def test_scatter_gemm_padded(is_debug=False):
         condition = THREAD_0 < BLOCK_SHAPE
 
         @tkw.conditional(condition)
-        def scatter_op():
+        def gather_op():
             tid = tkw.Register[BLOCK_SHAPE, i32](THREAD_0)
             reordered_idx = tkw.read(
                 reorder_a,
@@ -1143,7 +1138,7 @@ def test_scatter_gemm_padded(is_debug=False):
                 mapping_dynamic_vals=(tid,),
             )
 
-            tkw.set_symbol(SCATTER_IDX, reordered_idx)
+            tkw.set_symbol(GATHER_IDX, reordered_idx)
             is_not_padding = reordered_idx < tkw.scalar(PAD_VALUE, i32)
 
             @tkw.conditional(is_not_padding)
@@ -1190,8 +1185,8 @@ def test_scatter_gemm_padded(is_debug=False):
                 mapping_dynamic_vals=(tid,),
             )
 
-            tkw.set_symbol(SCATTER_IDX, reordered_idx)
-            is_not_padding = SCATTER_IDX < PAD_VALUE
+            tkw.set_symbol(GATHER_IDX, reordered_idx)
+            is_not_padding = GATHER_IDX < PAD_VALUE
 
             @tkw.conditional(is_not_padding)
             def then():
@@ -1253,8 +1248,7 @@ def test_scatter_gemm_padded(is_debug=False):
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
-        with open("scatter_gemm_w_padding.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # create reorder_a such that it is a permutation of the rows of a
     reorder_a = torch.randperm(m).to(torch.int32).to(device="cuda")
@@ -1299,8 +1293,8 @@ def test_scatter_gemm_padded(is_debug=False):
     print("GEMM test passed!")
 
 
-def test_scatter_gemm_fused(is_debug=False):
-    """Fused scatter-GEMM-scatter with multiple experts (MOE-style)."""
+def test_gather_gemm_fused(is_debug=False):
+    """Fused gather-GEMM-scatter with multiple experts (MOE-style)."""
     E = sym.E
     TOTAL_ELEMS = sym.TOTAL_ELEMS
     NUM_BLOCKS = sym.NUM_BLOCKS
@@ -1308,7 +1302,7 @@ def test_scatter_gemm_fused(is_debug=False):
     PAD_VALUE = sym.PAD_VALUE
 
     IDX = sym.IDX
-    SCATTER_IDX = sym.SCATTER_IDX
+    GATHER_IDX = sym.GATHER_IDX
     # Define constraints for the kernel
     constraints = [
         tkw.WorkgroupConstraint(M, BLOCK_M, 0),
@@ -1423,7 +1417,7 @@ def test_scatter_gemm_fused(is_debug=False):
         condition = THREAD_0 < BLOCK_SHAPE
 
         @tkw.conditional(condition)
-        def scatter_op():
+        def gather_op():
             tid = tkw.Register[TOTAL_ELEMS, i32](THREAD_0)
             wid = tkw.Register[TOTAL_ELEMS, i32](WORKGROUP_2)
             tid_offset = tkw.Register[TOTAL_ELEMS, i32](BLOCK_SHAPE) * wid + tid
@@ -1433,8 +1427,8 @@ def test_scatter_gemm_fused(is_debug=False):
                 mapping_dynamic_vals=(tid_offset,),
             )
 
-            tkw.set_symbol(SCATTER_IDX, reordered_idx)
-            is_not_padding = SCATTER_IDX < PAD_VALUE
+            tkw.set_symbol(GATHER_IDX, reordered_idx)
+            is_not_padding = GATHER_IDX < PAD_VALUE
 
             @tkw.conditional(is_not_padding)
             def then():
@@ -1482,8 +1476,8 @@ def test_scatter_gemm_fused(is_debug=False):
                 mapping_dynamic_vals=(tid_offset,),
             )
 
-            tkw.set_symbol(SCATTER_IDX, reordered_idx)
-            is_not_padding = SCATTER_IDX < PAD_VALUE
+            tkw.set_symbol(GATHER_IDX, reordered_idx)
+            is_not_padding = GATHER_IDX < PAD_VALUE
 
             @tkw.conditional(is_not_padding)
             def then():
@@ -1554,8 +1548,7 @@ def test_scatter_gemm_fused(is_debug=False):
     compiled_gemm = wave_compile(options, gemm)
 
     if is_debug:
-        with open("scatter_gemm_fused.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # create reorder_a such that it is a permutation of the rows of a
     reorder_a = torch.randperm(total_elems).to(torch.int32).to(device="cuda")
@@ -1716,8 +1709,7 @@ def test_gemm_conditional_weights(is_debug=False):
     compiled_gemm(a, b, weights, c_no_weights, 0)
 
     if is_debug:
-        with open("conditional_weight_gemm.mlir", "w") as f:
-            f.write(compiled_gemm.asm)
+        print(compiled_gemm.asm)
 
     # Test 2: With weight multiplication (apply_weights=1)
     c_with_weights = torch.zeros(m, n, dtype=torch.float32, device="cuda")
