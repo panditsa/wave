@@ -17,7 +17,7 @@ from utils import parse_args, list_tests, run_test
 M = tkl.sym.M
 N = tkl.sym.N
 K = tkl.sym.K
-B = tkl.sym.B
+I = tkl.sym.I
 BLOCK_M = tkl.sym.BLOCK_M
 BLOCK_N = tkl.sym.BLOCK_N
 BLOCK_K = tkl.sym.BLOCK_K
@@ -36,91 +36,67 @@ def test_iteration_with_condition(is_debug=False):
         tkw.HardwareConstraint(
             threads_per_wave=64,
             waves_per_block=(1, 1, 1),
-            vector_shapes={B: 0, M: 64, LIMIT_VAL: 0},
+            vector_shapes={I: 0, M: 64},
         )
     ]
     constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WaveConstraint(M, BLOCK_M)]
-    # B is iterated over and so we define a tiling constraint on it.
+    # I is iterated over and so we define a tiling constraint on it.
     # However, there is no notion of tile size for the iteration as
     # it is an unstructured loop.
-    constraints += [tkw.TilingConstraint(B)]
-
-    i = tkw.IndexMapping.iterator(0)
-    d0 = tkw.IndexMapping.dynamic_val(0)
-
-    limit_val_map = tkw.IndexMapping(
-        num_iterators=1,
-        inputs={M: d0},
-        outputs={M: i},
-        dynamic_val_mappings={M: i},
-    )
+    constraints += [tkw.TilingConstraint(I)]
 
     @tkw.wave(constraints)
-    def iterated_gemm(
-        a: tkl.Memory[M, ADDRESS_SPACE, tkl.i32],
-        b: tkl.Memory[M, ADDRESS_SPACE, tkl.i32],
-        c: tkl.Memory[M, ADDRESS_SPACE_0, tkl.i32],
+    def wave_kernel(
         init_value: tkl.i32,  # type: ignore
+        c: tkl.Memory[M, ADDRESS_SPACE_0, tkl.i32],
+        limit: tkl.i32,  # type: ignore
     ):
 
-        tid = tkw.scalar(tkw.THREAD_0, tkl.i32)
-        limit_val = tkw.read(
-            a, mapping=limit_val_map, mapping_dynamic_vals=(tid,), elements_per_thread=1
-        )
-        tkw.set_symbol(LIMIT_VAL, limit_val)
-        condition = B < LIMIT_VAL
+        tkw.set_symbol(LIMIT_VAL, limit)
+        condition = I < LIMIT_VAL
 
-        init_val = tkw.read(
-            b, mapping=limit_val_map, mapping_dynamic_vals=(tid,), elements_per_thread=1
-        )
-        ones_b = tkw.Register[B, tkl.i32](1)
-
-        # init_val = tkw.scalar(0, tkl.i32)
-        @tkw.iterate(B, start=init_val, condition=condition, init_args=[])
+        @tkw.iterate(I, start=init_value, condition=condition, init_args=[])
         def body():
             c_reg = tkw.read(c)
-            b_reg = tkw.read(b)
 
-            # c_reg = c_reg + b_reg
-            c_reg = tkw.Register[M, tkl.i32](tkw.THREAD_0)
+            c_reg = c_reg + tkw.Register[M, tkl.i32](1)
             tkw.write(c_reg, c)
 
             # Set the next value for the iteration.
             # In this case, we are using a simple increment operation,
             # but this can be replaced with any other operation.
-            index_b = tkw.self_index(B, tkl.i32)
+            index_b = tkw.self_index(I, tkl.i32)
             next_value = tkw.apply_expr(index_b, lambda x: x + 1)
-            # next_value = index_b + ones_b
-            tkw.set_symbol(B, next_value)
+            tkw.set_symbol(I, next_value)
 
     options = WaveCompileOptions(
         subs={
             M: 64,
-            B: 10,
             BLOCK_M: 64,
-            BLOCK_B: 1,
             LOAD_ELEMS_PER_THREAD: 4,
             STORE_ELEMS_PER_THREAD: 4,
-            ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
+            ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
         },
         canonicalize=True,
         print_ir_after="all" if is_debug else [],
     )
-    iterated_gemm = wave_compile(options, iterated_gemm)
+
+    wave_kernel = wave_compile(options, wave_kernel)
     if is_debug:
-        print(iterated_gemm.asm)
+        print(wave_kernel.asm)
 
-    # generate random input tensors between -1 and 1
-    a = torch.randint(0, 4, (64,), dtype=torch.int32).cuda()
-    b = torch.randint(1, 2, (64,), dtype=torch.int32).cuda()
+    # Setup test parameters
+    init_value = 1  # Starting value for iteration
     c = torch.zeros((64,), dtype=torch.int32).cuda()
+    limit = 4  # Maximum number of iterations
 
-    iterated_gemm(a, b, c, 0)
-    print(a)
-    print(b)
-    print(c)
+    wave_kernel(init_value, c, limit)
+    print("Init value:", init_value)
+    print("Limit:", limit)
+    print("Result c (should be incremented limit-init_value times):", c)
+    print("Expected: each element should be", limit - init_value)
 
 
 if __name__ == "__main__":

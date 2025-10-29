@@ -56,7 +56,7 @@ def test_atomic_add_return_value(is_debug=False):
     )
 
     @tkw.wave(constraints)
-    def iterated_gemm(
+    def wave_kernel(
         a: tkl.Memory[M, ADDRESS_SPACE, tkl.i32],
         c: tkl.Memory[M, ADDRESS_SPACE_0, tkl.i32],
     ):
@@ -79,15 +79,15 @@ def test_atomic_add_return_value(is_debug=False):
         canonicalize=True,
         print_ir_after="all" if is_debug else [],
     )
-    iterated_gemm = wave_compile(options, iterated_gemm)
+    wave_kernel = wave_compile(options, wave_kernel)
     if is_debug:
-        print(iterated_gemm.asm)
+        print(wave_kernel.asm)
 
     # generate random input tensors between -1 and 1
     a = torch.randint(1, 2, (64,), dtype=torch.int32).cuda()
     c = torch.zeros((64,), dtype=torch.int32).cuda()
 
-    iterated_gemm(a, c)
+    wave_kernel(a, c)
     print(a)
     print(c)
 
@@ -124,7 +124,7 @@ def test_read_back_scalar(is_debug=False):
     )
 
     @tkw.wave(constraints)
-    def iterated_gemm(
+    def wave_kernel(
         a: tkl.Memory[M, ADDRESS_SPACE, tkl.i32],
         b: tkl.Memory[M, ADDRESS_SPACE, tkl.i32],
         c: tkl.Memory[ONE, ADDRESS_SPACE, tkl.i32],
@@ -157,16 +157,16 @@ def test_read_back_scalar(is_debug=False):
         print_ir_after="all" if is_debug else [],
         minimize_shared_allocs=False,
     )
-    iterated_gemm = wave_compile(options, iterated_gemm)
+    wave_kernel = wave_compile(options, wave_kernel)
     if is_debug:
-        print(iterated_gemm.asm)
+        print(wave_kernel.asm)
 
     # generate random input tensors between -1 and 1
     a = torch.randint(1, 2, (64,), dtype=torch.int32).cuda()
     b = torch.zeros((64,), dtype=torch.int32).cuda()
     c = torch.zeros((1,), dtype=torch.int32).cuda()
 
-    iterated_gemm(a, b, c)
+    wave_kernel(a, b, c)
     print(a)
     print(b)
     print(c)
