@@ -210,6 +210,7 @@ def apply_pipelined_schedule(
     tiling_constraint = get_tiling_constraint(reduction, constraints)
     max_induction_variable = subs_idxc(tiling_constraint.count)
 
+    breakpoint()
     if max_induction_variable.is_number:
         # We can only do a compile-time check if the induction variable
         # is not dynamic.
