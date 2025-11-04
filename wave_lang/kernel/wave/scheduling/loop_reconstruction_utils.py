@@ -349,6 +349,14 @@ def partition_graph_by_stage(
             if custom.scheduling_parameters["stage"] == stage:
                 cycle = custom.scheduling_parameters["cycle"]
                 partitioned_graph[stage][cycle].append(node)
+
+    # Sort nodes within each cycle by their "order" field to preserve set_stage() ordering
+    for stage_partitions in partitioned_graph:
+        for cycle, nodes in stage_partitions.items():
+            stage_partitions[cycle] = sorted(
+                nodes, key=lambda n: get_custom(n).scheduling_parameters.get("order", 0)
+            )
+
     return partitioned_graph
 
 

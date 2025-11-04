@@ -280,6 +280,7 @@ class PipelinedLoop:
                 result_nodes.append(node_result)
             result_clusters.append(tuple(result_nodes))
 
+        node_order = 0
         for i, cluster in enumerate(result_clusters):
             for nodes in cluster:
                 for node in nodes:
@@ -289,11 +290,13 @@ class PipelinedLoop:
                         "stage": stage,
                         "initiation_interval": self.initiation_interval,
                         "prefetch_stage": None,
+                        "order": node_order,
                     }
                     custom.scheduling_parameters["cycle"] = (
                         custom.scheduling_parameters["absolute_cycle"]
                         % self.initiation_interval
                     )
+                    node_order += 1
 
         self.num_stages += 1
         # During tracing, return a proxy for the set_stage operation
