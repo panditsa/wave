@@ -132,8 +132,8 @@ def add_nodes_by_schedule(
                     else x
                 ),
             )
-            print("CUSTOM NODE", custom_node)
-            breakpoint()
+            # print("CUSTOM NODE", custom_node)
+            # breakpoint()
             if custom_node.scheduling_parameters["prefetch_stage"]:
                 new_node.fx_node.meta["prefetch_stage"] = (
                     custom_node.scheduling_parameters["prefetch_stage"]
