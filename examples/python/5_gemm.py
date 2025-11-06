@@ -39,6 +39,8 @@ from wave_lang.kernel.ops.wave_ops import (
     SetWavePrio,
 )
 
+from wave_lang.kernel.wave.scheduling.loop_reconstruction import PipelineStage
+
 # Define symbolic dimensions for our matrices
 M = sym.M  # Rows of A and C
 N = sym.N  # Rows of B and columns of C
@@ -2037,6 +2039,21 @@ def gemm_schedule_test(is_debug=False):
             region_graph, local_write_rhs, f"local_write_rhs"
         )
 
+        # new cluster API where we first create the clusters and set stage to each op in the cluster
+        # cluster0 = tkw.cluster([
+        # tkw.cycle(global_load_lhs_proxies, iteration=i + 1),
+        # tkw.cycle(barrier_op),
+        # tkw.cycle(sliced_local_load_lhs_proxies[0], iteration=i),
+        # tkw.cycle(sliced_local_load_rhs_proxies[0], iteration=i),
+        # tkw.cycle(global_load_rhs_proxies, iteration=i + 1),
+        # tkw.cycle(sliced_local_load_lhs_proxies[1], iteration=i),
+        # tkw.cycle(sliced_local_load_rhs_proxies[1], iteration=i),
+        # tkw.cycle(global_load_rhs_proxies, iteration=i),
+        # ])
+
+        # pipelining
+        # reorder ops in the main loop
+        # clusters when doing a ping-pong pattern
         breakpoint()
         # Create a pipeline with 2 stages and specify the operations that are overlapping.
         with tkw.pipeline(k_loop) as pipelined_loop:
@@ -2065,36 +2082,56 @@ def gemm_schedule_test(is_debug=False):
                 ],
             )
 
-            # This replaces manual barrier insertion into node lists
+            # This places manual barriers after specific nodes in the pipeline
             pipelined_loop.insert_barrier_after(
-                sliced_local_load_rhs_proxies[0], barrier_type="scheduling"
+                sliced_local_load_rhs_proxies[0],
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                global_load_lhs_proxies, barrier_type="scheduling"
+                global_load_lhs_proxies,
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                sliced_local_load_rhs_proxies[1], barrier_type="scheduling"
+                sliced_local_load_rhs_proxies[1],
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                global_load_rhs_proxies, barrier_type="scheduling"
+                global_load_rhs_proxies,
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                global_load_rhs_proxies, barrier_type="workgroup"
+                global_load_rhs_proxies,
+                barrier_type="workgroup",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                sliced_mma_proxies[0], barrier_type="scheduling"
+                sliced_mma_proxies[0],
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                sliced_mma_proxies[0], barrier_type="shared_memory"
+                sliced_mma_proxies[0],
+                barrier_type="shared_memory",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                local_write_rhs_proxies, barrier_type="scheduling"
+                local_write_rhs_proxies,
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                local_write_rhs_proxies, barrier_type="workgroup"
+                local_write_rhs_proxies,
+                barrier_type="workgroup",
+                pipeline_stage=PipelineStage.KERNEL,
             )
             pipelined_loop.insert_barrier_after(
-                sliced_mma_proxies[1], barrier_type="scheduling"
+                sliced_mma_proxies[1],
+                barrier_type="scheduling",
+                pipeline_stage=PipelineStage.KERNEL,
             )
         # cluster0 = (global_load_rhs_proxies, global_load_lhs_proxies)
         # cluster1 = (sliced_local_load_lhs_proxies[0], sliced_local_load_rhs_proxies[0])
@@ -2231,7 +2268,10 @@ def ref_gemm_prefetch(is_debug=False):
         mma = tkw.get_node_by_tag("mma")
 
         # Create a pipeline with 2 stages and specify the operations that are overlapping.
+        # RAII
         with tkw.pipeline(k_loop) as pipelined_loop:
+            # this helps organize ops in terms of iteration
+            # cluster and reorder (?)
             pipelined_loop.set_stage(
                 [
                     (global_load_a, global_load_b),
@@ -2244,6 +2284,10 @@ def ref_gemm_prefetch(is_debug=False):
                     (mma,),
                 ],
             )
+
+        pipeline_loop.reorder.cycle[0](
+            global_load_a, shared_load_a, global_load_b, shared_load_b  # t 1  # t 0
+        )
 
     # // Ping-pong gemm
     # pipelined_loop.stagger()

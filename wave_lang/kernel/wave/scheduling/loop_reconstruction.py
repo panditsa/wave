@@ -81,6 +81,7 @@ def add_nodes_by_schedule(
     rotating_registers: dict[fx.Node, list[fx.Node]],
     pipelining_stage: PipelineStage = PipelineStage.KERNEL,
     use_scheduling_barriers: bool = False,
+    barrier_insertions: list[dict] = None,
 ):
     """
     Interleave the instructions in the partitioned graph by stage
@@ -101,6 +102,31 @@ def add_nodes_by_schedule(
                 continue
             for node in partitioned_graph[stage][cycle]:
                 interleaved_instructions.append((iteration, stage, node))
+                # Check if we need to insert a barrier after this node
+                if barrier_insertions and node in barrier_insertions:
+                    barrier_insertion = barrier_insertions[node]
+                    barrier_pipeline_stage = barrier_insertion["pipeline_stage"]
+                    # Insert barrier if pipeline_stage is None (all stages) or matches current stage
+                    if (
+                        barrier_pipeline_stage is None
+                        or barrier_pipeline_stage == pipelining_stage
+                    ):
+                        # Get the pre-created barrier op and add it to the graph now
+                        barrier_op = barrier_insertion["barrier_op"]
+                        barrier_node = barrier_op.add_to_graph(
+                            node.graph, loc=barrier_insertion["location"]
+                        )
+                        # Copy scheduling parameters to the newly added barrier node
+                        barrier_custom = get_custom(barrier_node)
+                        barrier_custom.scheduling_parameters = barrier_insertion[
+                            "scheduling_parameters"
+                        ].copy()
+                        interleaved_instructions.append(
+                            (iteration, stage, barrier_node)
+                        )
+                        print(
+                            f"Inserting barrier node: {barrier_node} at pipeline stage: {pipelining_stage} after node: {node}"
+                        )
         interleave_instructions(interleaved_instructions)
 
         instructions = defaultdict(int)
@@ -345,6 +371,7 @@ def construct_prologue(
     new_induction_variables: list[int],
     stages: list[int],
     outer_vars: dict[fx.Node, list[fx.Node]] = {},
+    barrier_insertions: list[dict] = None,
 ):
     """
     Construct the prologue of the pipelined loop.
@@ -395,6 +422,7 @@ def construct_prologue(
                 new_induction_variables,
                 rotating_registers,
                 PipelineStage.PROLOGUE,
+                barrier_insertions=barrier_insertions,
             )
 
     # During the prologue, we may have computed results that need to be passed as init args
@@ -519,6 +547,7 @@ def construct_kernel(
     visualize: bool = False,
     use_scheduling_barriers: bool = False,
     outer_vars: dict[fx.Node, list[fx.Node]] = {},
+    barrier_insertions: list[dict] = None,
 ) -> tuple[Iterate, fx.Graph]:
     print("\n" + "=" * 80)
     print(f"KERNEL CONSTRUCTION (Steady State): {num_stages} stages active")
@@ -601,6 +630,7 @@ def construct_kernel(
             new_rotating_registers,
             PipelineStage.KERNEL,
             use_scheduling_barriers,
+            barrier_insertions=barrier_insertions,
         )
 
         # Create output node (last node in the graph).
@@ -646,6 +676,7 @@ def construct_epilogue(
     num_rotating_registers: dict[fx.Node, int],
     visualize: bool = False,
     outer_vars: dict[fx.Node, list[fx.Node]] = {},
+    barrier_insertions: list[dict] = None,
 ):
     """
     Construct the epilogue of the pipelined loop.
@@ -743,6 +774,7 @@ def construct_epilogue(
                 new_induction_variables,
                 rotating_registers,
                 PipelineStage.EPILOGUE,
+                barrier_insertions=barrier_insertions,
             )
 
         # Replace the existing uses with the new results.
@@ -808,12 +840,12 @@ def construct_pipelined_loop(
     visualize: bool = False,
     use_scheduling_barriers: bool = False,
     multi_buffer_count: Optional[int] = None,
+    barrier_insertions: list[dict] = None,
 ) -> fx.Node:
     """
     Given a graph annotated with scheduling parameters, construct a pipelined loop
     with a prologue, kernel and epilogue.
     """
-    breakpoint()
     induction_variable = get_induction_variable(reduction, constraints)
     num_rotating_registers = liveness_analysis(graph)
     multi_buffer_count = compute_multi_buffer_count(
@@ -857,6 +889,7 @@ def construct_pipelined_loop(
         list(range(num_stages)),
         create_fill_stage_schedule(num_stages),
         outer_vars=outer_vars,
+        barrier_insertions=barrier_insertions,
     )
 
     # Construct kernel.
@@ -872,6 +905,7 @@ def construct_pipelined_loop(
         visualize,
         use_scheduling_barriers,
         outer_vars=outer_vars,
+        barrier_insertions=barrier_insertions,
     )
 
     pipelined_reduction_graph.parent_op = pipelined_reduction
@@ -893,6 +927,7 @@ def construct_pipelined_loop(
         num_rotating_registers,
         visualize,
         outer_vars=outer_vars,
+        barrier_insertions=barrier_insertions,
     )
 
     # Remove the unpipelined reduction and the corresponding subgraph

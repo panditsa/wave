@@ -236,7 +236,7 @@ class PipelinedLoop:
         self.constraints = constraints
         self.initiation_interval = None
         self.num_stages = 0
-        self.barrier_insertions = []
+        self.barrier_insertions = {}
 
     def __enter__(self):
         return self
@@ -261,20 +261,21 @@ class PipelinedLoop:
             self.initiation_interval,
         )
 
-        # Apply barrier insertions before constructing the pipelined loop
-        self._apply_barrier_insertions(subgraph)
+        # Only use scheduling barriers if the user has not provided barrier insertions
+        use_scheduling_barriers = len(self.barrier_insertions) == 0
 
         apply_pipelined_schedule(
             custom_iterate,
             subgraph,
             self.kernel_trace,
             self.constraints,
-            use_scheduling_barriers=True,
+            use_scheduling_barriers=use_scheduling_barriers,
             num_stages=self.num_stages,
             initiation_interval=self.initiation_interval,
             scheduling_type=SchedulingType.MANUAL,
             visualize=False,
             multi_buffer_count=None,
+            barrier_insertions=self.barrier_insertions,
         )
 
     def set_stage(self, nodes: Sequence[fx.Node]):
@@ -316,9 +317,17 @@ class PipelinedLoop:
         # During tracing, return a proxy for the set_stage operation
         return empty_proxy("set_stage")
 
-    def insert_barrier_after(self, proxy, barrier_type="shared_memory"):
+    def insert_barrier_after(
+        self, proxy, barrier_type="shared_memory", pipeline_stage=None
+    ):
         """
         Insert a barrier after the operations in proxy.
+        Creates the barrier nodes immediately and stores them for use during loop reconstruction.
+
+        Args:
+            proxy: Proxy object containing target nodes to insert barriers after
+            barrier_type: Type of barrier ("shared_memory", "workgroup", or "scheduling")
+            pipeline_stage: Which pipeline stage to insert the barrier in (None for all stages)
         """
 
         # assert that barrier type is one of "shared_memory" or "workgroup" or "scheduling"
@@ -327,62 +336,56 @@ class PipelinedLoop:
             "workgroup",
             "scheduling",
         ], "Invalid barrier type"
-        self.barrier_insertions.append(
-            {
-                "proxy": proxy,
-                "barrier_type": barrier_type,
-                "position": "after",
-            }
-        )
+
+        # Get the actual nodes from the proxy
+        target_nodes = get_proxy_result(proxy)
+        if not target_nodes:
+            logger.warning("No target nodes found for barrier insertion")
+            return self
+
+        if not isinstance(target_nodes, (list, tuple)):
+            target_nodes = [target_nodes]
+
+        # Get the subgraph from the iterate
+        result = get_proxy_result(self.iterate)
+        assert (
+            result is not None and len(result) == 1
+        ), "Iterate must have exactly one element"
+        custom_iterate = get_custom(result[0])
+        subgraph = self.kernel_trace.get_subgraph(custom_iterate.subgraph_name)
+
+        # Only create a barrier after the LAST node in the proxy to avoid duplicates
+        last_target_node = target_nodes[-1]
+
+        # Get scheduling parameters and location from the last target node
+        custom = get_custom(last_target_node)
+        if (
+            not hasattr(custom, "scheduling_parameters")
+            or custom.scheduling_parameters is None
+        ):
+            logger.warning(
+                f"Node {last_target_node} has no scheduling parameters, skipping barrier insertion"
+            )
+            return self
+
+        # Create the barrier object (but don't add to graph yet)
+        if barrier_type == "scheduling":
+            barrier = SchedulingBarrier([])
+        elif barrier_type == "workgroup":
+            barrier = WorkgroupBarrier()
+        else:
+            barrier = SharedMemoryBarrier()
+
+        # Store barrier object and metadata keyed by the LAST target node only
+        self.barrier_insertions[last_target_node] = {
+            "barrier_op": barrier,  # The barrier CustomOp object (not yet added to graph)
+            "barrier_type": barrier_type,
+            "pipeline_stage": pipeline_stage,
+            "location": custom.location,  # Store location for later use
+            "scheduling_parameters": custom.scheduling_parameters.copy(),  # Store scheduling params
+        }
+
         return self
-
-    def _apply_barrier_insertions(self, subgraph: fx.Graph):
-        """
-        Apply all queued barrier insertions to the subgraph.
-        """
-
-        for insertion in self.barrier_insertions:
-            # Get the actual nodes from the proxy
-            target_nodes = get_proxy_result(insertion["proxy"])
-            if not target_nodes:
-                continue
-
-            if not isinstance(target_nodes, (list, tuple)):
-                target_nodes = [target_nodes]
-
-            # Find the last node in the list (to insert after)
-            last_node = target_nodes[-1]
-
-            # Get scheduling parameters from the last target node
-            custom = get_custom(last_node)
-            if (
-                not hasattr(custom, "scheduling_parameters")
-                or custom.scheduling_parameters is None
-            ):
-                print(
-                    f"Warning: Node {last_node} has no scheduling parameters, skipping barrier insertion"
-                )
-                continue
-
-            # Insert barrier after the last target node in the graph
-            barrier = None
-            with subgraph.inserting_after(last_node):
-                if insertion["barrier_type"] == "scheduling":
-                    barrier = SchedulingBarrier([]).add_to_graph(
-                        subgraph, loc=custom.location
-                    )
-                elif insertion["barrier_type"] == "workgroup":
-                    barrier = WorkgroupBarrier().add_to_graph(
-                        subgraph, loc=custom.location
-                    )
-                else:
-                    barrier = SharedMemoryBarrier().add_to_graph(
-                        subgraph, loc=custom.location
-                    )
-
-            # Copy scheduling parameters from the target node (for the rest of the passes)
-            barrier_custom = get_custom(barrier)
-            barrier_custom.scheduling_parameters = custom.scheduling_parameters.copy()
 
 
 @dataclass

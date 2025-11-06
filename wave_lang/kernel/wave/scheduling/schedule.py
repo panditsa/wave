@@ -201,6 +201,7 @@ def apply_pipelined_schedule(
     scheduling_type: SchedulingType = SchedulingType.NONE,
     visualize: bool = False,
     multi_buffer_count: Optional[int] = None,
+    barrier_insertions: list[dict] = None,
 ):
 
     # After scheduling has completed, we have enough information to decide
@@ -210,7 +211,6 @@ def apply_pipelined_schedule(
     tiling_constraint = get_tiling_constraint(reduction, constraints)
     max_induction_variable = subs_idxc(tiling_constraint.count)
 
-    breakpoint()
     if max_induction_variable.is_number:
         # We can only do a compile-time check if the induction variable
         # is not dynamic.
@@ -249,6 +249,7 @@ def apply_pipelined_schedule(
         visualize,
         use_scheduling_barriers,
         multi_buffer_count,
+        barrier_insertions,
     )
 
     # Update new reduction count.
