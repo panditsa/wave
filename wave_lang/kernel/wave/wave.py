@@ -904,14 +904,18 @@ class LaunchableWave(Launchable):
                 )
             )
 
+            if options.optimization_level:
+                graph_passes += [
+                    partial(
+                        schedule_reordering,
+                        trace,
+                        self.constraints,
+                        scheduling_type,
+                    ),
+                ]
+
         if options.optimization_level:
             graph_passes += [
-                partial(
-                    schedule_reordering,
-                    trace,
-                    self.constraints,
-                    scheduling_type,
-                ),
                 partial(
                     minimize_shared_allocs,
                     trace,
