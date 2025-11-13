@@ -218,7 +218,7 @@ def apply_pipelined_schedule(
             logger.warning(
                 "Not enough iterations to pipeline the loop. Skipping pipelining."
             )
-            return {}
+            return None
     else:
         # Otherwise, we need to rely on assumptions provided by the author.
         assumptions = get_assumptions(constraints)
@@ -226,7 +226,7 @@ def apply_pipelined_schedule(
             logger.warning(
                 "No assumptions provided to determine if the loop can be pipelined. Skipping pipelining."
             )
-            return {}
+            return None
 
         result = evaluate_with_assumptions(
             constraints, max_induction_variable > num_stages - 1
@@ -235,7 +235,7 @@ def apply_pipelined_schedule(
             logger.warning(
                 "Not enough iterations to pipeline the loop. Skipping pipelining."
             )
-            return {}
+            return None
 
     new_reduction = construct_pipelined_loop(
         trace,
@@ -252,6 +252,8 @@ def apply_pipelined_schedule(
 
     # Update new reduction count.
     new_reduction.count = max_induction_variable - (num_stages - 1)
+
+    return new_reduction
 
 
 def propagate_scheduling_parameters_to_iter_args(
