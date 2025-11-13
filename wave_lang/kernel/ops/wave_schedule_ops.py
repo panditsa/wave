@@ -142,17 +142,55 @@ def getitem(obj: Any, index: int): ...
 def stagger(loop: Any): ...
 
 
-def get_node_by_tag_helper(kernel_trace, tag: str, subgraph_name: str = None):
+@define_schedule_op
+def filter_nodes(nodes: Any, subgraph: Any = None, node_type: Any = None): ...
+
+
+def get_node_by_tag_helper(kernel_trace, tag: str, subgraph_name=None):
     """
-    Get nodes by tag, optionally filtering by subgraph.
+    Get nodes by tag, optionally filtering by subgraph or pipeline stage.
+
+    Args:
+        kernel_trace: The trace to search in
+        tag: The tag to search for
+        subgraph_name: Either a string (normal subgraph name) or a tuple
+                      (stage_name, pipelined_iterate_node) for PROLOGUE/EPILOGUE
     """
     if subgraph_name:
-        logger.info(f"Getting nodes by tag '{tag}' in subgraph '{subgraph_name}'")
-        target_subgraph = kernel_trace.get_subgraph(subgraph_name)
+        # Determine the graph to search and the pipeline stage to filter by
+        if isinstance(subgraph_name, tuple) and len(subgraph_name) == 2:
+            stage_name, pipelined_iterate_node = subgraph_name
+            if stage_name in ("PROLOGUE", "EPILOGUE"):
+                # PROLOGUE/EPILOGUE: search parent graph, filter by metadata
+                graph = pipelined_iterate_node.graph
+                pipeline_stage = stage_name
+                logger.info(f"Getting nodes by tag '{tag}' in {pipeline_stage} stage")
+            else:
+                # Unknown tuple format, fall back to whole trace search
+                logger.warning(
+                    f"Unknown stage name: {stage_name}, searching entire trace"
+                )
+                return kernel_trace.walk(lambda x: get_custom(x).tag == tag)
+        else:
+            # Normal subgraph case (including KERNEL)
+            graph = kernel_trace.get_subgraph(subgraph_name)
+            pipeline_stage = (
+                None  # Don't filter by pipeline_stage for regular subgraphs
+            )
+            logger.info(f"Getting nodes by tag '{tag}' in subgraph '{subgraph_name}'")
+
+        # Unified filtering logic
         nodes = [
             node
-            for node in target_subgraph.nodes
-            if hasattr(get_custom(node), "tag") and get_custom(node).tag == tag
+            for node in graph.nodes
+            if (
+                hasattr(get_custom(node), "tag")
+                and get_custom(node).tag == tag
+                and (
+                    pipeline_stage is None
+                    or node.meta.get("pipeline_stage") == pipeline_stage
+                )
+            )
         ]
     else:
         logger.info(f"Getting nodes by tag '{tag}' across entire trace")
@@ -164,10 +202,34 @@ def get_node_by_tag_helper(kernel_trace, tag: str, subgraph_name: str = None):
 
 def get_subgraph_name_from_proxy(proxy):
     """
-    Extract subgraph name from a proxy result.
+    Extract subgraph name or pipeline stage from a proxy/reference.
+
+    Args:
+        proxy: Either a PipelineStageRef or a proxy object
+
+    Returns:
+        Either a subgraph name (string) or a tuple (stage_name, pipelined_iterate_node)
     """
+    # Check if this is a PipelineStageRef (simplified API)
+    if isinstance(proxy, PipelineStageRef):
+        if proxy.stage_name == "KERNEL":
+            # For KERNEL, return the subgraph name
+            custom_parent = get_custom(proxy.pipelined_iterate_node)
+            return custom_parent.subgraph_name
+        else:
+            # For PROLOGUE/EPILOGUE, return a tuple for the helper to process
+            return (proxy.stage_name, proxy.pipelined_iterate_node)
+
+    # Legacy proxy handling
     subgraph_result = get_proxy_result(proxy.node)
     assert subgraph_result is not None, "Subgraph proxy must have a result"
+
+    # Check if this is a special PROLOGUE or EPILOGUE marker
+    if isinstance(subgraph_result, tuple) and len(subgraph_result) == 2:
+        if subgraph_result[0] in ("__PROLOGUE__", "__EPILOGUE__"):
+            # Return the tuple as-is; it will be handled specially by get_node_by_tag_helper
+            return subgraph_result
+
     assert len(subgraph_result) > 0, "Subgraph proxy must have at least one element"
 
     parent_node = subgraph_result[0]
@@ -201,11 +263,39 @@ def extract_proxy_nodes(item):
     return [item]
 
 
+def get_nodes_from_ref(ref):
+    """
+    Get the actual nodes from a reference (PipelineStageRef or proxy).
+
+    Args:
+        ref: Either a PipelineStageRef or a proxy object
+
+    Returns:
+        The actual node(s)
+    """
+    if isinstance(ref, PipelineStageRef):
+        # For PipelineStageRef, return the pipelined iterate node directly
+        return [ref.pipelined_iterate_node]
+    elif hasattr(ref, "node"):
+        # For proxy objects, get the result
+        return get_proxy_result(ref.node)
+    else:
+        raise ValueError(f"Expected PipelineStageRef or proxy, got {type(ref)}")
+
+
 @dataclass
 class CustomScheduleOp:
     """Base class for custom schedule operations."""
 
     pass
+
+
+@dataclass
+class PipelineStageRef:
+    """Reference to a specific pipeline stage (KERNEL, PROLOGUE, or EPILOGUE)."""
+
+    pipelined_iterate_node: Any
+    stage_name: str  # "KERNEL", "PROLOGUE", or "EPILOGUE"
 
 
 @dataclass
@@ -226,9 +316,9 @@ class GetNodeByTag(CustomScheduleOp):
         # Determine subgraph scope if provided
         subgraph_name = None
         if subgraph is not None:
-            assert hasattr(
+            assert isinstance(subgraph, PipelineStageRef) or hasattr(
                 subgraph, "node"
-            ), f"Expected 'subgraph' to be a proxy object with a 'node' attribute"
+            ), f"Expected 'subgraph' to be a PipelineStageRef or proxy object with a 'node' attribute"
             subgraph_name = get_subgraph_name_from_proxy(subgraph)
 
         # Search for nodes with the given tag
@@ -264,9 +354,9 @@ class GetNodeByTagAndType(CustomScheduleOp):
         # Determine subgraph scope if provided
         subgraph_name = None
         if subgraph is not None:
-            assert hasattr(
+            assert isinstance(subgraph, PipelineStageRef) or hasattr(
                 subgraph, "node"
-            ), f"Expected 'subgraph' to be a proxy object with a 'node' attribute"
+            ), f"Expected 'subgraph' to be a PipelineStageRef or proxy object with a 'node' attribute"
             subgraph_name = get_subgraph_name_from_proxy(subgraph)
 
         # Search for nodes with the given tag, then filter by type
@@ -301,10 +391,10 @@ class PartitionByAddressSpace(CustomScheduleOp):
     ):
         matched, unmatched = [], []
 
-        assert hasattr(
-            nodes, "node"
-        ), f"Expected 'nodes' to be a proxy object with a 'node' attribute, but got type: {type(nodes).__name__}"
-        nodes = get_proxy_result(nodes.node)
+        # Get nodes from proxy (these come from get_node_by_tag results)
+        if hasattr(nodes, "node"):
+            nodes = get_proxy_result(nodes.node)
+        # If it's already a list of nodes, use it directly
         assert nodes is not None, "Nodes must have a result"
         assert len(nodes) > 0, "Nodes must have at least one element"
 
@@ -410,11 +500,8 @@ class ReorderGraph(CustomScheduleOp):
     ):
         from ..wave.schedule_reordering import reorder_graph as reorder_graph_impl
 
-        # Get the iterate node from the proxy
-        assert hasattr(
-            loop, "node"
-        ), f"Expected 'loop' to be a proxy object with a 'node' attribute, but got type: {type(loop).__name__}"
-        loop_result = get_proxy_result(loop.node)
+        # Get the iterate node from the reference (PipelineStageRef or proxy)
+        loop_result = get_nodes_from_ref(loop)
         assert loop_result is not None, "Loop must have a result"
         assert len(loop_result) > 0, "Loop must have at least one element"
 
@@ -491,10 +578,10 @@ class PartitionByDim(CustomScheduleOp):
 
         """
         # Get the actual nodes from the proxy
-        assert hasattr(
-            nodes, "node"
-        ), f"Expected 'nodes' to be a proxy object with a 'node' attribute, but got type: {type(nodes).__name__}"
-        nodes_list = get_proxy_result(nodes.node)
+        if hasattr(nodes, "node"):
+            nodes_list = get_proxy_result(nodes.node)
+        else:
+            nodes_list = nodes  # Already a list of nodes
         assert nodes_list is not None, "Nodes must have a result"
         assert len(nodes_list) > 0, "Nodes must have at least one element"
 
@@ -562,6 +649,17 @@ class PipelinedLoop:
         self.initiation_interval = None
         self.num_stages = 0
 
+        # These will be set after pipelining is applied
+        self._pipelined_iterate_node = None
+        self._KERNEL = None
+        self._PROLOGUE = None
+        self._EPILOGUE = None
+
+        # Track (proxy, original_nodes) tuples used during set_stage to auto-update after pipelining
+        # This allows us to match partitioned proxies (like global_load_a vs shared_load_a)
+        # to their specific mapped nodes after pipelining
+        self._tracked_proxies = []
+
     def __enter__(self):
         return self
 
@@ -586,7 +684,7 @@ class PipelinedLoop:
         )
 
         # Get use_scheduling_barriers from options if available
-        apply_pipelined_schedule(
+        pipelined_iterate_node = apply_pipelined_schedule(
             custom_iterate,
             subgraph,
             self.kernel_trace,
@@ -599,7 +697,137 @@ class PipelinedLoop:
             multi_buffer_count=None,
         )
 
+        # Store the pipelined iterate node and create proxies for the stages
+        if pipelined_iterate_node is not None:
+            self._pipelined_iterate_node = pipelined_iterate_node
+            self._create_stage_proxies()
+            self._update_kernel_node_mapping()
+        else:
+            logger.warning(
+                "Pipelining failed, KERNEL/PROLOGUE/EPILOGUE properties will not be available"
+            )
+
+    def _create_stage_proxies(self):
+        """Create references for KERNEL, PROLOGUE, and EPILOGUE stages."""
+        if self._pipelined_iterate_node is None:
+            return
+
+        # Create simple stage references - no need for complex proxy machinery
+        self._KERNEL = PipelineStageRef(self._pipelined_iterate_node, "KERNEL")
+        self._PROLOGUE = PipelineStageRef(self._pipelined_iterate_node, "PROLOGUE")
+        self._EPILOGUE = PipelineStageRef(self._pipelined_iterate_node, "EPILOGUE")
+
+    @property
+    def KERNEL(self):
+        """Get a proxy for the KERNEL stage (pipelined iterate subgraph)."""
+        return self._KERNEL
+
+    @property
+    def PROLOGUE(self):
+        """Get a proxy for the PROLOGUE stage (nodes before pipelined iterate)."""
+        return self._PROLOGUE
+
+    @property
+    def EPILOGUE(self):
+        """Get a proxy for the EPILOGUE stage (nodes after pipelined iterate)."""
+        return self._EPILOGUE
+
+    def _update_kernel_node_mapping(self):
+        """
+        Auto-update tracked proxies to contain all mapped nodes (prologue, kernel, epilogue).
+
+        Uses node-name based mapping to correctly handle partitioned proxies
+        (e.g., global_load_a vs shared_load_a which share the same tag).
+        """
+        from ..wave.scheduling.loop_reconstruction import (
+            get_original_name_from_mapped_name,
+            is_mapped_name,
+        )
+        from .._support.tracing import ScheduleContext
+
+        ctx = ScheduleContext.current()
+        if ctx is None:
+            logger.warning("No schedule context, cannot update proxy mappings")
+            return
+
+        # Build mapping from original node names to all their mapped versions
+        original_to_mapped = {}
+
+        # Get graphs to scan: parent graph has PROLOGUE/EPILOGUE, kernel subgraph has KERNEL
+        custom_iterate = get_custom(self._pipelined_iterate_node)
+        parent_graph = self._pipelined_iterate_node.graph
+        kernel_subgraph = self.kernel_trace.get_subgraph(custom_iterate.subgraph_name)
+
+        # Scan all nodes in both graphs for mapped nodes
+        for node in list(parent_graph.nodes) + list(kernel_subgraph.nodes):
+            if is_mapped_name(node.name):
+                original_name = get_original_name_from_mapped_name(node.name)
+                if original_name not in original_to_mapped:
+                    original_to_mapped[original_name] = []
+                original_to_mapped[original_name].append(node)
+
+        # Update each tracked proxy with its mapped nodes
+        updated_count = 0
+        for proxy, original_nodes in self._tracked_proxies:
+            # Collect all mapped versions of this proxy's original nodes
+            mapped_nodes = []
+            for orig_node in original_nodes:
+                if orig_node.name in original_to_mapped:
+                    mapped_nodes.extend(original_to_mapped[orig_node.name])
+
+            if mapped_nodes:
+                ctx.proxy_to_results[proxy] = mapped_nodes
+                logger.debug(
+                    f"Updated proxy: {len(original_nodes)} original -> {len(mapped_nodes)} mapped nodes"
+                )
+                updated_count += 1
+
+        logger.info(
+            f"Auto-updated {updated_count}/{len(self._tracked_proxies)} tracked proxies"
+        )
+
+    def get_kernel_nodes(self, tag: str, node_type=None):
+        """
+        Get nodes from KERNEL stage by tag, optionally filtered by type.
+        This is a convenience method to avoid re-querying after pipelining.
+
+        Args:
+            tag: The tag to search for
+            node_type: Optional node type to filter by (e.g., tkw.Read, tkw.Write)
+
+        Returns:
+            A proxy containing the nodes with the specified tag in the KERNEL stage
+        """
+        if not hasattr(self, "_kernel_nodes_by_tag"):
+            logger.warning("Kernel node mapping not available, returning empty proxy")
+            nodes = []
+        else:
+            nodes = self._kernel_nodes_by_tag.get(tag, [])
+
+            if node_type is not None:
+                nodes = [n for n in nodes if isinstance(get_custom(n), node_type)]
+
+        # Create and return a proxy for compatibility with other schedule ops
+        from .._support.tracing import ScheduleContext
+
+        ctx = ScheduleContext.current()
+        if ctx is None:
+            logger.warning("No schedule context, returning raw nodes")
+            return nodes
+
+        type_suffix = f"_{node_type.__name__}" if node_type else ""
+        return create_schedule_proxy(
+            ctx.region_graph, nodes, f"kernel_{tag}{type_suffix}"
+        )
+
     def set_stage(self, nodes: Sequence[fx.Node]):
+        """
+        Set scheduling stage for nodes.
+
+        Tracks (proxy, original_nodes) pairs to enable correct mapping after pipelining.
+        This ensures that partitioned proxies (e.g., global_load_a vs shared_load_a)
+        maintain their distinct identities even though they share the same tag.
+        """
         stage = self.num_stages
         if self.initiation_interval is None:
             self.initiation_interval = len(nodes)
@@ -614,6 +842,18 @@ class PipelinedLoop:
                 node_result = get_proxy_result(node)
                 assert node_result is not None, "Nodes must have a result"
                 result_nodes.append(node_result)
+                already_tracked = False
+                for tracked in self._tracked_proxies:
+                    if isinstance(tracked, tuple) and len(tracked) >= 1:
+                        if id(tracked[0]) == id(node):
+                            already_tracked = True
+                            break
+
+                if not already_tracked:
+                    self._tracked_proxies.append((node, node_result))
+                    logger.debug(
+                        f"Tracking proxy with {len(node_result)} original nodes"
+                    )
             result_clusters.append(tuple(result_nodes))
 
         for i, cluster in enumerate(result_clusters):
@@ -723,11 +963,8 @@ class Stagger(CustomScheduleOp):
         from ..wave.schedule_reordering import add_conditional_barriers_to_loop
         from ..wave.utils.general_utils import get_hardware_constraint
 
-        # Get the iterate node from the proxy
-        assert hasattr(
-            loop, "node"
-        ), f"Expected 'loop' to be a proxy object with a 'node' attribute"
-        loop_result = get_proxy_result(loop.node)
+        # Get the iterate node from the reference (PipelineStageRef or proxy)
+        loop_result = get_nodes_from_ref(loop)
         assert loop_result is not None, "Loop must have a result"
         assert len(loop_result) > 0, "Loop must have at least one element"
 
@@ -765,7 +1002,7 @@ class GetOutputNode(CustomScheduleOp):
         Used with insert_before to insert operations at the end of the loop body.
         """
         # Get the loop's subgraph
-        nodes = get_proxy_result(loop.node)
+        nodes = get_nodes_from_ref(loop)
         custom = get_custom(nodes[0])
         subgraph_name = custom.subgraph_name
         subgraph = kernel_trace.get_subgraph(subgraph_name)
@@ -792,11 +1029,11 @@ class InsertBefore(CustomScheduleOp):
         Inserts an operation before the target node in the graph.
 
         Args:
-            target: The target proxy (e.g., loop from get_node_by_tag)
+            target: The target reference (e.g., pipelined_loop.KERNEL or proxy)
             op: The operation to insert (e.g., SharedMemoryBarrier, SchedulingBarrier)
         """
-        # Get the iterate node from the proxy
-        nodes = get_proxy_result(target.node)
+        # Get the iterate node from the reference
+        nodes = get_nodes_from_ref(target)
         assert nodes is not None, "Nodes must have a result"
         assert len(nodes) > 0, "Nodes must have at least one element"
         custom = get_custom(nodes[0])
@@ -824,14 +1061,83 @@ class InsertAfter(CustomScheduleOp):
         Inserts an operation after the target node in the graph.
 
         Args:
-            target: The target proxy (e.g., loop from get_node_by_tag)
+            target: The target reference (e.g., pipelined_loop.KERNEL or proxy)
             op: The operation to insert (e.g., SharedMemoryBarrier, SchedulingBarrier)
         """
-        # Get the iterate node from the proxy
-        nodes = get_proxy_result(target.node)
+        # Get the iterate node from the reference
+        nodes = get_nodes_from_ref(target)
         custom = get_custom(nodes[0])
 
         # Use the helper function
         add_op_after(op, custom.graph, custom.fx_node, custom.location)
 
         return empty_proxy("insert_after")
+
+
+@dataclass
+class FilterNodes(CustomScheduleOp):
+    schedule_op_name = "filter_nodes"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        nodes: Any,
+        subgraph: Any = None,
+        node_type: Any = None,
+    ):
+        """
+        Filter nodes by pipeline stage and/or node type.
+
+        Args:
+            nodes: The nodes proxy to filter
+            subgraph: Optional PipelineStageRef (e.g., pipelined_loop.KERNEL) to filter by stage
+            node_type: Optional node type (e.g., tkw.Read, tkw.Write) to filter by type
+
+        Returns:
+            A proxy containing the filtered nodes
+        """
+        # Get nodes from the proxy
+        if hasattr(nodes, "node"):
+            # nodes is a Proxy, get its result from the context
+            nodes_list = get_proxy_result(nodes)
+        else:
+            # nodes is already a list of nodes
+            nodes_list = nodes
+
+        if not nodes_list:
+            return create_schedule_proxy(region_graph, [], cls.schedule_op_name)
+
+        filtered_nodes = nodes_list
+
+        # Filter by pipeline stage if specified
+        if subgraph is not None:
+            if isinstance(subgraph, PipelineStageRef):
+                stage_name = subgraph.stage_name
+                filtered_nodes = [
+                    node
+                    for node in filtered_nodes
+                    if node.meta.get("pipeline_stage") == stage_name
+                ]
+                logger.info(
+                    f"Filtered to {len(filtered_nodes)} nodes in {stage_name} stage"
+                )
+            else:
+                logger.warning(
+                    f"Subgraph filter must be a PipelineStageRef, got {type(subgraph)}"
+                )
+
+        # Filter by node type if specified
+        if node_type is not None:
+            filtered_nodes = [
+                node
+                for node in filtered_nodes
+                if isinstance(get_custom(node), node_type)
+            ]
+            logger.info(
+                f"Filtered to {len(filtered_nodes)} nodes of type {node_type.__name__}"
+            )
+
+        return create_schedule_proxy(region_graph, filtered_nodes, cls.schedule_op_name)
