@@ -133,6 +133,8 @@ def add_nodes_by_schedule(
                 # We cannot properly handle write dependencies for mapped nodes
                 # yet, so just drop it for now.
                 new_node.update_arg("_write_dependency", [])
+            # Tag the node with its pipeline stage for later identification
+            new_node.fx_node.meta["pipeline_stage"] = pipelining_stage.name
             instructions[get_custom_operation_type(new_node)] += 1
             # Update the argument context.
             arg_context[(iteration, stage, node)] = new_node.fx_node
