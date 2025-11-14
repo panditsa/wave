@@ -249,6 +249,73 @@ def test_fixed_offset(is_debug=False):
     print(b)
 
 
+def test_3d_to_2d_slice(is_debug=False):
+    """3D to 2D mapping: Read a 2D slice from a 3D tensor using a dynamic index."""
+    constraints: list[tkw.Constraint] = [
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            vector_shapes={M: 16, N: 16},
+        )
+    ]
+    constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
+    constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M)]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N)]
+
+    # Define iterators for the 2D output
+    i = tkw.IndexMapping.iterator(0)
+    j = tkw.IndexMapping.iterator(1)
+    # Dynamic value for batch index
+    batch_idx = tkw.IndexMapping.dynamic_val(0)
+
+    # Mapping: Read from 3D tensor [B, M, N] -> 2D output [M, N]
+    # The batch dimension is selected using the dynamic batch_idx
+    mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={B: batch_idx, M: i, N: j},
+        outputs={M: i, N: j},
+        dynamic_val_mappings={B: batch_idx},
+    )
+
+    @tkw.wave(constraints)
+    def kernel(
+        a: tkl.Memory[B, M, N, ADDRESS_SPACE, tkl.i32],
+        batch_offset: tkl.i32,
+        b: tkl.Memory[M, N, ADDRESS_SPACE, tkl.i32],
+    ):
+        res = tkw.read(
+            a,
+            mapping=mapping,
+            mapping_dynamic_vals=(batch_offset,),
+        )
+        tkw.write(res, b)
+
+    compiled_kernel = wave_compile(
+        get_wave_compile_options(
+            canonicalize=True, additional_symbols={B: 4}, is_debug=is_debug
+        ),
+        kernel,
+    )
+    if is_debug:
+        print(compiled_kernel.asm)
+
+    # Create input tensors: 3D tensor [4, 16, 16]
+    a = torch.randint(0, 100, (4, 16, 16), dtype=torch.int32).cuda()
+    batch_offset = 2
+    b = torch.zeros((16, 16), dtype=torch.int32).cuda()
+
+    compiled_kernel(a, batch_offset, b)
+    print("Input 3D tensor shape:", a.shape)
+    print("Selected batch index:", batch_offset)
+    print("Expected output (a[2]):\n", a[batch_offset])
+    print("Actual output:\n", b)
+
+    assert torch.allclose(
+        b, a[batch_offset].reshape(16, 16)
+    ), "Output does not match expected value"
+    print("Test passed!")
+
+
 if __name__ == "__main__":
     args = parse_args()
     if args.list_tests:
