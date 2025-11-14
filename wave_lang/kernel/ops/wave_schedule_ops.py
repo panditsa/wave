@@ -5,6 +5,7 @@ from ..ops.wave_ops import (
     get_custom,
     Read,
     Write,
+    Placeholder,
 )
 from ..wave.constraints import Constraint
 from .base import define_schedule_op
@@ -890,7 +891,6 @@ class InsertAtStart(CustomScheduleOp):
             subgraph_ref: Reference to a subgraph (e.g., iterate node, conditional, or pipeline stage)
             op: The operation to insert (e.g., SharedMemoryBarrier, SchedulingBarrier)
         """
-        from ..ops.wave_ops import Placeholder
 
         # Get the subgraph from the reference
         nodes = get_nodes_from_ref(subgraph_ref)
