@@ -69,6 +69,19 @@ def update_node_index(
         node.update_arg("dst_index", update_index(dst_idx, subs))
 
 
+def create_name_mapping(node: fx.Node, iteration: int, stage: int) -> str:
+    new_name = f"{node.name}_mapped_{iteration}_{stage}"
+    return new_name
+
+
+def get_original_name_from_mapped_name(mapped_name: str) -> str:
+    return mapped_name.split("_mapped_")[0]
+
+
+def is_mapped_name(name: str) -> bool:
+    return "_mapped_" in name
+
+
 def add_nodes_by_schedule(
     reduction: Iterate,
     reduction_graph: fx.Graph,
@@ -117,7 +130,7 @@ def add_nodes_by_schedule(
                     )
                     continue
             new_node = custom_node.copy(
-                new_name=f"{node.name}_mapped_{iteration}_{stage}",
+                new_name=create_name_mapping(node, iteration, stage),
                 new_graph=reduction_graph,
                 arg_transform=lambda x: (
                     arg_context.get_from_iteration(iteration, x, preferred_stage)
