@@ -201,10 +201,9 @@ def test_gemm_advanced_scheduling(is_debug=False):
             ),
         ]
 
-        # TODO: Insert at the beginning of and insert at the end of APIs
+        # Insert barriers before the for loop and at the end of the for loop
         tkw.insert_before(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
-        output_node = tkw.get_output_node(pipeline_loop.KERNEL)
-        tkw.insert_before(output_node, tkw.SharedMemoryBarrier())
+        tkw.insert_at_end(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
 
         # Apply the cluster-based reordering to the KERNEL stage
         tkw.reorder_graph(pipeline_loop.KERNEL, clusters)

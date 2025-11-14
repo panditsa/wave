@@ -175,10 +175,9 @@ def get_gemm_two_pp_cluster_schedule(
             ),
         ]
 
-        # Insert prefetch barriers before the loop
+        # Insert prefetch barriers before the for loop and at the end of the for loop
         tkw.insert_before(k_loop, tkw.SharedMemoryBarrier())
-        output_node = tkw.get_output_node(k_loop)
-        tkw.insert_before(output_node, tkw.SharedMemoryBarrier())
+        tkw.insert_at_end(k_loop, tkw.SharedMemoryBarrier())
 
         # Apply reordering to the KERNEL stage only
         tkw.reorder_graph(k_loop, clusters)
