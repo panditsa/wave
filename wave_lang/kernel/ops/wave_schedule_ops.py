@@ -123,7 +123,11 @@ def insert_after(target: Any, op: Any): ...
 
 
 @define_schedule_op
-def get_output_node(loop: Any): ...
+def insert_at_start(subgraph_ref: Any, op: Any): ...
+
+
+@define_schedule_op
+def insert_at_end(subgraph_ref: Any, op: Any): ...
 
 
 @define_schedule_op
@@ -867,8 +871,8 @@ class Stagger(CustomScheduleOp):
 
 
 @dataclass
-class GetOutputNode(CustomScheduleOp):
-    schedule_op_name = "get_output_node"
+class InsertAtStart(CustomScheduleOp):
+    schedule_op_name = "insert_at_start"
 
     @classmethod
     def handle(
@@ -876,23 +880,90 @@ class GetOutputNode(CustomScheduleOp):
         region_graph,
         kernel_trace,
         constraints: list[Constraint],
-        loop: Any,
+        subgraph_ref: Any,
+        op: Any,
     ):
         """
-        Returns a proxy to the output node of a loop's subgraph.
-        Used with insert_before to insert operations at the end of the loop body.
+        Inserts an operation at the beginning of a subgraph (after placeholders).
+
+        Args:
+            subgraph_ref: Reference to a subgraph (e.g., iterate node, conditional, or pipeline stage)
+            op: The operation to insert (e.g., SharedMemoryBarrier, SchedulingBarrier)
         """
-        # Get the loop's subgraph
-        nodes = get_nodes_from_ref(loop)
-        assert nodes is not None, "Nodes must have a result"
-        assert len(nodes) > 0, "Nodes must have at least one element"
+        from ..ops.wave_ops import Placeholder
+
+        # Get the subgraph from the reference
+        nodes = get_nodes_from_ref(subgraph_ref)
+        assert nodes is not None, "Subgraph reference must have a result"
+        assert len(nodes) > 0, "Subgraph reference must have at least one element"
         custom = get_custom(nodes[0])
-        subgraph_name = custom.subgraph_name
-        subgraph = kernel_trace.get_subgraph(subgraph_name)
-        output_fx_node = subgraph.output_node()
-        return create_schedule_proxy(
-            region_graph, [output_fx_node], cls.schedule_op_name
-        )
+
+        # Get the subgraph
+        assert hasattr(
+            custom, "subgraph_name"
+        ), f"Node must have a subgraph (got {custom.__class__.__name__})"
+        subgraph = kernel_trace.get_subgraph(custom.subgraph_name)
+
+        # Find the first non-placeholder node
+        first_node = None
+        for node in subgraph.nodes:
+            node_custom = get_custom(node)
+            if not isinstance(node_custom, Placeholder):
+                first_node = node
+                break
+
+        assert (
+            first_node is not None
+        ), "Could not find first non-placeholder node in subgraph"
+
+        # Insert before the first non-placeholder node
+        add_op_before(op, subgraph, first_node, custom.location)
+
+        logger.info(f"Inserted {op.__class__.__name__} at start of subgraph")
+        return empty_proxy("insert_at_start")
+
+
+@dataclass
+class InsertAtEnd(CustomScheduleOp):
+    schedule_op_name = "insert_at_end"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        subgraph_ref: Any,
+        op: Any,
+    ):
+        """
+        Inserts an operation at the end of a subgraph (before the output node).
+
+        Args:
+            subgraph_ref: Reference to a subgraph (e.g., iterate node, conditional, or pipeline stage)
+            op: The operation to insert (e.g., SharedMemoryBarrier, SchedulingBarrier)
+        """
+        # Get the subgraph from the reference
+        nodes = get_nodes_from_ref(subgraph_ref)
+        assert nodes is not None, "Subgraph reference must have a result"
+        assert len(nodes) > 0, "Subgraph reference must have at least one element"
+        custom = get_custom(nodes[0])
+
+        # Get the subgraph
+        assert hasattr(
+            custom, "subgraph_name"
+        ), f"Node must have a subgraph (got {custom.__class__.__name__})"
+        subgraph = kernel_trace.get_subgraph(custom.subgraph_name)
+
+        # Get the output node
+        output_node = subgraph.output_node()
+        assert output_node is not None, "Subgraph must have an output node"
+
+        # Insert before the output node
+        add_op_before(op, subgraph, output_node, custom.location)
+
+        logger.info(f"Inserted {op.__class__.__name__} at end of subgraph")
+        return empty_proxy("insert_at_end")
 
 
 @dataclass
