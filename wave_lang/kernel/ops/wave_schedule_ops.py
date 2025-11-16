@@ -277,10 +277,10 @@ class PartitionByAddressSpace(CustomScheduleOp):
     ):
         matched, unmatched = [], []
 
-        # Get nodes from proxy (these come from get_node_by_tag results)
-        if hasattr(nodes, "node"):
-            nodes = get_proxy_result(nodes.node)
-        # If it's already a list of nodes, use it directly
+        assert hasattr(
+            nodes, "node"
+        ), f"Expected 'nodes' to be a proxy object with a 'node' attribute, but got type: {type(nodes).__name__}"
+        nodes = get_proxy_result(nodes.node)
         assert nodes is not None, "Nodes must have a result"
         assert len(nodes) > 0, "Nodes must have at least one element"
 
@@ -464,10 +464,10 @@ class PartitionByDim(CustomScheduleOp):
 
         """
         # Get the actual nodes from the proxy
-        if hasattr(nodes, "node"):
-            nodes_list = get_proxy_result(nodes.node)
-        else:
-            nodes_list = nodes  # Already a list of nodes
+        assert hasattr(
+            nodes, "node"
+        ), f"Expected 'nodes' to be a proxy object with a 'node' attribute, but got type: {type(nodes).__name__}"
+        nodes_list = get_proxy_result(nodes.node)
         assert nodes_list is not None, "Nodes must have a result"
         assert len(nodes_list) > 0, "Nodes must have at least one element"
 
@@ -541,10 +541,10 @@ class PipelinedLoop:
         self._PROLOGUE = None
         self._EPILOGUE = None
 
-        # Track (proxy, original_nodes) tuples used during set_stage to auto-update after pipelining
+        # Track proxies used during set_stage to auto-update after pipelining
         # This allows us to match partitioned proxies (like global_load_a vs shared_load_a)
         # to their specific mapped nodes after pipelining
-        self._tracked_proxies = []
+        self._tracked_proxies = {}
 
     def __enter__(self):
         return self
@@ -654,7 +654,7 @@ class PipelinedLoop:
 
         # Update each tracked proxy with its mapped nodes
         updated_count = 0
-        for proxy, original_nodes in self._tracked_proxies:
+        for proxy_id, (proxy, original_nodes) in self._tracked_proxies.items():
             # Collect all mapped versions of this proxy's original nodes
             mapped_nodes = []
             for orig_node in original_nodes:
@@ -728,15 +728,11 @@ class PipelinedLoop:
                 node_result = get_proxy_result(node)
                 assert node_result is not None, "Nodes must have a result"
                 result_nodes.append(node_result)
-                already_tracked = False
-                for tracked in self._tracked_proxies:
-                    if isinstance(tracked, tuple) and len(tracked) >= 1:
-                        if id(tracked[0]) == id(node):
-                            already_tracked = True
-                            break
 
-                if not already_tracked:
-                    self._tracked_proxies.append((node, node_result))
+                # Track this proxy if not already tracked
+                node_id = id(node)
+                if node_id not in self._tracked_proxies:
+                    self._tracked_proxies[node_id] = (node, node_result)
                     logger.debug(
                         f"Tracking proxy with {len(node_result)} original nodes"
                     )
@@ -1053,13 +1049,13 @@ class FilterNodes(CustomScheduleOp):
         Returns:
             A proxy containing the filtered nodes
         """
-        # Get nodes from the proxy
-        if hasattr(nodes, "node"):
-            # nodes is a Proxy, get its result from the context
-            nodes_list = get_proxy_result(nodes)
-        else:
-            # nodes is already a list of nodes
-            nodes_list = nodes
+
+        assert hasattr(
+            nodes, "node"
+        ), f"Expected 'nodes' to be a proxy object with a 'node' attribute, but got type: {type(nodes).__name__}"
+        nodes_list = get_proxy_result(nodes)
+        assert nodes_list is not None, "Nodes must have a result"
+        assert len(nodes_list) > 0, "FilterNodes: Nodes must have at least one element"
 
         if not nodes_list:
             return create_schedule_proxy(region_graph, [], cls.schedule_op_name)
