@@ -76,7 +76,7 @@ def test_gemm_prefetch_reorder_stagger():
     gemm = wave_compile(options, gemm, schedule)
     print(gemm.asm)
 
-    # CHECK-LABEL:    func.func @gemm_prefetch_reorder
+    # CHECK-LABEL:    func.func @gemm
     # CHECK-DAG:       %[[C0:.+]] = arith.constant 0 : index
     # CHECK-DAG:       %[[C34816:.+]] = arith.constant 34816 : index
     # CHECK:           %[[VIEW_0:.*]] = memref.view %alloc[%[[C0]]][] : memref<52224xi8, #gpu.address_space<workgroup>> to memref<256x68xf16, #gpu.address_space<workgroup>>
