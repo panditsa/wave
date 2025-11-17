@@ -128,8 +128,6 @@ def test_gemm_advanced_scheduling(is_debug=False):
                 ],
             )
 
-        breakpoint()
-
         # Now apply advanced scheduling to the KERNEL stage
         global_load_a = tkw.filter_nodes(global_load_a, subgraph=pipeline_loop.KERNEL)
         shared_load_a = tkw.filter_nodes(shared_load_a, subgraph=pipeline_loop.KERNEL)
@@ -139,7 +137,6 @@ def test_gemm_advanced_scheduling(is_debug=False):
         shared_write_b = tkw.filter_nodes(shared_write_b, subgraph=pipeline_loop.KERNEL)
         mma = tkw.filter_nodes(mma, subgraph=pipeline_loop.KERNEL)
 
-        breakpoint()
         # Partition MMA operations by K dimension into 2 groups
         # This allows us to interleave the first half of MMA with prefetch for next iteration
         mma_0, mma_1 = tkw.partition_by_dim(mma, dim=K, num_partitions=2)
