@@ -546,6 +546,9 @@ class PipelinedLoop:
         # to their specific mapped nodes after pipelining
         self._tracked_proxies = {}
 
+        # Direct mapping from original nodes to their pipelined copies
+        self._node_mapping = None
+
     def __enter__(self):
         return self
 
@@ -570,7 +573,7 @@ class PipelinedLoop:
         )
 
         # Get use_scheduling_barriers from options if available
-        pipelined_iterate_node = apply_pipelined_schedule(
+        pipelining_result = apply_pipelined_schedule(
             custom_iterate,
             subgraph,
             self.kernel_trace,
@@ -583,9 +586,18 @@ class PipelinedLoop:
             multi_buffer_count=None,
         )
 
-        # Store the pipelined iterate node and create proxies for the stages
-        if pipelined_iterate_node is not None:
+        # Store the pipelined iterate node and node mapping, then create proxies for the stages
+        if pipelining_result is not None:
+            assert (
+                len(pipelining_result) == 2
+            ), "Pipelining result must be a tuple of length 2"
+            pipelined_iterate_node, node_mapping = pipelining_result
+            assert isinstance(
+                pipelined_iterate_node, fx.Node
+            ), "Pipelined iterate node must be a fx.Node"
+            assert isinstance(node_mapping, dict), "Node mapping must be a dictionary"
             self._pipelined_iterate_node = pipelined_iterate_node
+            self._node_mapping = node_mapping
             self._create_stage_proxies()
             self._update_kernel_node_mapping()
         else:
@@ -622,13 +634,9 @@ class PipelinedLoop:
         """
         Auto-update tracked proxies to contain all mapped nodes (prologue, kernel, epilogue).
 
-        Uses node-name based mapping to correctly handle partitioned proxies
+        Uses direct node mapping dictionary to correctly handle partitioned proxies
         (e.g., global_load_a vs shared_load_a which share the same tag).
         """
-        from ..wave.scheduling.loop_reconstruction import (
-            get_original_name_from_mapped_name,
-            is_mapped_name,
-        )
         from .._support.tracing import ScheduleContext
 
         ctx = ScheduleContext.current()
@@ -636,30 +644,18 @@ class PipelinedLoop:
             logger.warning("No schedule context, cannot update proxy mappings")
             return
 
-        # Build mapping from original node names to all their mapped versions
-        original_to_mapped = {}
-
-        # Get graphs to scan: parent graph has PROLOGUE/EPILOGUE, kernel subgraph has KERNEL
-        custom_iterate = get_custom(self._pipelined_iterate_node)
-        parent_graph = self._pipelined_iterate_node.graph
-        kernel_subgraph = self.kernel_trace.get_subgraph(custom_iterate.subgraph_name)
-
-        # Scan all nodes in both graphs for mapped nodes
-        for node in list(parent_graph.nodes) + list(kernel_subgraph.nodes):
-            if is_mapped_name(node.name):
-                original_name = get_original_name_from_mapped_name(node.name)
-                if original_name not in original_to_mapped:
-                    original_to_mapped[original_name] = []
-                original_to_mapped[original_name].append(node)
+        if self._node_mapping is None:
+            logger.warning("No node mapping available, cannot update proxy mappings")
+            return
 
         # Update each tracked proxy with its mapped nodes
         updated_count = 0
         for proxy_id, (proxy, original_nodes) in self._tracked_proxies.items():
-            # Collect all mapped versions of this proxy's original nodes
+            # Collect all mapped versions of this proxy's original nodes using direct mapping
             mapped_nodes = []
             for orig_node in original_nodes:
-                if orig_node.name in original_to_mapped:
-                    mapped_nodes.extend(original_to_mapped[orig_node.name])
+                if orig_node in self._node_mapping:
+                    mapped_nodes.extend(self._node_mapping[orig_node])
 
             if mapped_nodes:
                 ctx.proxy_to_results[proxy] = mapped_nodes
