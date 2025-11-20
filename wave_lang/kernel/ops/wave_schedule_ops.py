@@ -195,7 +195,7 @@ class PipelineStageRef:
     """Reference to a specific pipeline stage (KERNEL, PROLOGUE, or EPILOGUE)."""
 
     pipelined_iterate_node: Any
-    stage_name: str  # "KERNEL", "PROLOGUE", or "EPILOGUE"
+    stage: Any
 
 
 def get_node_by_tag_helper(kernel_trace, tag: str):
@@ -610,10 +610,19 @@ class PipelinedLoop:
         if self._pipelined_iterate_node is None:
             return
 
+        # Import locally to avoid circular import
+        from ..wave.scheduling.loop_reconstruction import PipelineStage
+
         # Create simple stage references - no need for complex proxy machinery
-        self._KERNEL = PipelineStageRef(self._pipelined_iterate_node, "KERNEL")
-        self._PROLOGUE = PipelineStageRef(self._pipelined_iterate_node, "PROLOGUE")
-        self._EPILOGUE = PipelineStageRef(self._pipelined_iterate_node, "EPILOGUE")
+        self._KERNEL = PipelineStageRef(
+            self._pipelined_iterate_node, PipelineStage.KERNEL
+        )
+        self._PROLOGUE = PipelineStageRef(
+            self._pipelined_iterate_node, PipelineStage.PROLOGUE
+        )
+        self._EPILOGUE = PipelineStageRef(
+            self._pipelined_iterate_node, PipelineStage.EPILOGUE
+        )
 
     @property
     def KERNEL(self):
@@ -1061,14 +1070,13 @@ class FilterNodes(CustomScheduleOp):
         # Filter by pipeline stage if specified
         if subgraph is not None:
             if isinstance(subgraph, PipelineStageRef):
-                stage_name = subgraph.stage_name
                 filtered_nodes = [
                     node
                     for node in filtered_nodes
-                    if node.meta.get("pipeline_stage") == stage_name
+                    if node.meta.get("pipeline_stage") == subgraph.stage
                 ]
                 logger.info(
-                    f"Filtered to {len(filtered_nodes)} nodes in {stage_name} stage"
+                    f"Filtered to {len(filtered_nodes)} nodes in {subgraph.stage.name} stage"
                 )
             else:
                 logger.warning(
