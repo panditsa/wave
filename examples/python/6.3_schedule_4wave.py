@@ -76,51 +76,51 @@ def test_gemm_4wave_scheduling(is_debug=False):
 
         tkw.write(repeat, c)
 
-    # # Define the schedule - simpler than the 8-wave version
-    # @wave_schedule.wave_schedule()
-    # def compact_schedule():
-    #     """
-    #     Compact 4-wave scheduling without staggering.
+    # Define the schedule - simpler than the 8-wave version
+    @wave_schedule.wave_schedule()
+    def compact_schedule():
+        """
+        Compact 4-wave scheduling without staggering.
         
-    #     This schedule:
-    #     1. Uses simple 2-stage pipelining
-    #     2. Partitions MMA by K dimension for better instruction interleaving
-    #     3. Uses wave priorities strategically but minimally
-    #     4. NO staggering - all waves execute the same schedule
-    #     """
-    #     # Get nodes
-    #     k_loop = tkw.get_node_by_tag("k_loop")
-    #     load_a = tkw.get_node_by_tag_and_type("read_a", tkw.Read)
-    #     global_load_a, shared_load_a = tkw.partition_by_address_space(
-    #         load_a, GLOBAL_ADDRESS_SPACE
-    #     )
-    #     shared_write_a = tkw.get_node_by_tag_and_type("read_a", tkw.Write)
-    #     load_b = tkw.get_node_by_tag_and_type("read_b", tkw.Read)
-    #     global_load_b, shared_load_b = tkw.partition_by_address_space(
-    #         load_b, GLOBAL_ADDRESS_SPACE
-    #     )
-    #     shared_write_b = tkw.get_node_by_tag_and_type("read_b", tkw.Write)
-    #     mma = tkw.get_node_by_tag("mma")
+        This schedule:
+        1. Uses simple 2-stage pipelining
+        2. Partitions MMA by K dimension for better instruction interleaving
+        3. Uses wave priorities strategically but minimally
+        4. NO staggering - all waves execute the same schedule
+        """
+        # Get nodes
+        k_loop = tkw.get_node_by_tag("k_loop")
+        load_a = tkw.get_node_by_tag_and_type("read_a", tkw.Read)
+        global_load_a, shared_load_a = tkw.partition_by_address_space(
+            load_a, GLOBAL_ADDRESS_SPACE
+        )
+        shared_write_a = tkw.get_node_by_tag_and_type("read_a", tkw.Write)
+        load_b = tkw.get_node_by_tag_and_type("read_b", tkw.Read)
+        global_load_b, shared_load_b = tkw.partition_by_address_space(
+            load_b, GLOBAL_ADDRESS_SPACE
+        )
+        shared_write_b = tkw.get_node_by_tag_and_type("read_b", tkw.Write)
+        mma = tkw.get_node_by_tag("mma")
 
-    #     # Create pipeline
-    #     pipeline_loop = tkw.pipeline(k_loop)
-    #     with pipeline_loop as pl:
-    #         # Stage 0: Load from global memory and write to shared
-    #         pl.set_stage(
-    #             [
-    #                 (global_load_a, global_load_b),
-    #                 (shared_write_a, shared_write_b),
-    #             ],
-    #         )
-    #         # Stage 1: Load from shared and compute
-    #         pl.set_stage(
-    #             [
-    #                 (shared_load_a, shared_load_b),
-    #                 (mma,),
-    #             ],
-    #         )
+        # Create pipeline
+        pipeline_loop = tkw.pipeline(k_loop)
+        with pipeline_loop as pl:
+            # Stage 0: Load from global memory and write to shared
+            pl.set_stage(
+                [
+                    (global_load_a, global_load_b),
+                    (shared_write_a, shared_write_b),
+                ],
+            )
+            # Stage 1: Load from shared and compute
+            pl.set_stage(
+                [
+                    (shared_load_a, shared_load_b),
+                    (mma,),
+                ],
+            )
 
-        # # Apply compact scheduling to KERNEL stage
+        # # Now apply advanced scheduling to the KERNEL stage
         # global_load_a = tkw.filter_nodes(global_load_a, subgraph=pipeline_loop.KERNEL)
         # shared_load_a = tkw.filter_nodes(shared_load_a, subgraph=pipeline_loop.KERNEL)
         # shared_write_a = tkw.filter_nodes(shared_write_a, subgraph=pipeline_loop.KERNEL)
@@ -128,44 +128,81 @@ def test_gemm_4wave_scheduling(is_debug=False):
         # shared_load_b = tkw.filter_nodes(shared_load_b, subgraph=pipeline_loop.KERNEL)
         # shared_write_b = tkw.filter_nodes(shared_write_b, subgraph=pipeline_loop.KERNEL)
         # mma = tkw.filter_nodes(mma, subgraph=pipeline_loop.KERNEL)
+        
+        # # Partition MMA operations by K dimension into 2 groups
+        # # This allows us to interleave the first half of MMA with prefetch for next iteration
+        # mma_0, mma_1, mma_2, mma_3 = tkw.partition_by_dim(mma, dim=K, num_partitions=4)
 
-        # # Partition MMA operations by K dimension
-        # # With K=32 MFMA and BLOCK_K=128, we get fewer MMA ops per iteration
-        # # Partition into 2 groups for better interleaving
-        # mma_0, mma_1 = tkw.partition_by_dim(mma, dim=K, num_partitions=2)
+        # # Similarly partition the shared memory loads
+        # shared_load_a_0, shared_load_a_1, shared_load_a_2, shared_load_a_3 = tkw.partition_by_dim(
+        #     shared_load_a, dim=K, num_partitions=4
+        # )
+        # shared_load_b_0, shared_load_b_1, shared_load_b_2, shared_load_b_3 = tkw.partition_by_dim(
+        #     shared_load_b, dim=K, num_partitions=4
+        # )
 
-        # # Create a compact cluster ordering
-        # # The goal is to interleave loads with compute tightly
+        # # Create instruction clusters that define the execution order
+        # # Each cluster groups instructions that should execute together
         # clusters = [
-        #     # Cluster 1: Initial loads + first half of compute
+        #     # Cluster 1: First half of loads + prefetch for next iteration
         #     tkw.cluster(
         #         [
-        #             shared_load_a,
-        #             shared_load_b,
-        #             tkw.SharedMemoryBarrier(),
-        #             tkw.SetWavePrio(1),
-        #             mma_0,
+        #             shared_load_a_0,  # Load first half of A from shared memory
+        #             shared_load_b_0,  # Load first half of B from shared memory
+        #             tkw.SchedulingBarrier([]),  # Barrier for scheduling control
+        #             global_load_a,  # Prefetch A for next iteration (overlapped!)
+        #             tkw.SchedulingBarrier([]),
+        #             shared_load_a_1,  # Load second half of A
+        #             shared_load_b_1,  # Load second half of B
+        #             tkw.SchedulingBarrier([]),
+        #             global_load_b,  # Prefetch B for next iteration (overlapped!)
+        #             tkw.WorkgroupBarrier(),  # Ensure all waves complete loads
+        #             tkw.SchedulingBarrier([]),
         #         ],
         #     ),
-        #     # Cluster 2: Prefetch for next iteration + second half of compute
+        #     # Cluster 2: First half of MMA operations with high priority
         #     tkw.cluster(
         #         [
+        #             tkw.SetWavePrio(1),  # Increase priority for compute
+        #             mma_0,  # Execute first half of MMA operations
+        #             tkw.SetWavePrio(0),  # Reset priority
+        #             shared_load_a_2,
+        #             shared_load_b_2,
         #             mma_1,
-        #             tkw.SetWavePrio(0),
-        #             tkw.SharedMemoryBarrier(),
-        #             global_load_a,
-        #             global_load_b,
-        #             tkw.WorkgroupBarrier(),
-        #             shared_write_a,
-        #             shared_write_b,
-        #             tkw.WorkgroupBarrier(),
+        #             shared_load_a_3,
+        #             shared_load_b_3,
+        #             tkw.SharedMemoryBarrier(),  # Sync shared memory
+        #             tkw.SchedulingBarrier([]),
+        #         ],
+        #     ),
+        #     # Cluster 3: Write prefetched data to shared memory
+        #     tkw.cluster(
+        #         [
+        #             shared_write_a,  # Write prefetched A to shared memory
+        #             shared_write_b,  # Write prefetched B to shared memory
+        #             mma_2,
+        #             tkw.WorkgroupBarrier(),  # Ensure writes complete
+        #             tkw.SchedulingBarrier([]),
+        #         ],
+        #     ),
+        #     # Cluster 4: Second half of MMA operations
+        #     tkw.cluster(
+        #         [
+        #             tkw.SetWavePrio(1),  # Increase priority for compute
+        #             mma_3,  # Execute second half of MMA operations
+        #             tkw.SetWavePrio(0),  # Reset priority
+        #             tkw.SchedulingBarrier([]),
         #         ],
         #     ),
         # ]
 
-        # # Apply the ordering
+        # # Insert barriers before the for loop and at the end of the for loop
+        # tkw.insert_before(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+        # tkw.insert_at_end(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+
+        # # Apply the cluster-based reordering to the KERNEL stage
         # tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
-        
+
     # Compile options
     M_val, N_val, K_val = shape
     options = WaveCompileOptions(
@@ -174,8 +211,8 @@ def test_gemm_4wave_scheduling(is_debug=False):
             N: N_val,
             K: K_val,
             BLOCK_M: 128,
-            BLOCK_N: 128,  # Square blocks for 4 waves
-            BLOCK_K: 128,  # Larger K tile since K=32 per MFMA
+            BLOCK_N: 256,  # Square blocks for 4 waves
+            BLOCK_K: 64,  # Larger K tile since K=32 per MFMA
             ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
             READ_SHARED_DELAY: 1,
@@ -193,7 +230,6 @@ def test_gemm_4wave_scheduling(is_debug=False):
         },
         canonicalize=True,
         print_ir_after="all" if is_debug else [],
-        dump_binaries="binaries/6.3_schedule_4wave",
     )
 
     options = set_default_run_config(options)
@@ -218,6 +254,9 @@ def test_gemm_4wave_scheduling(is_debug=False):
         print(f"K tile: 128 (4 MFMA instructions per K-tile)")
         print("=" * 80)
         print(gemm_4wave.asm)
+        # write to a file
+        with open("6.3_schedule_4wave.asm", "w") as f:
+            f.write(gemm_4wave.asm)
 
     expected = torch.matmul(a, b.t()).to(torch.float32)
     assert torch.allclose(c, expected, rtol=1e-2, atol=1e-2)
@@ -373,8 +412,8 @@ def test_gemm_4wave_simple(is_debug=False):
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
-    constraints += [tkw.WaveConstraint(M, BLOCK_M / 2)]
-    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M/2)]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N/2)]
     constraints += [
         tkw.HardwareConstraint(
             threads_per_wave=64,
@@ -414,9 +453,7 @@ def test_gemm_4wave_simple(is_debug=False):
             ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
         },
         canonicalize=True,
-        schedule=SchedulingType.MANUAL,
         print_ir_after="all" if is_debug else [],
-        dump_binaries="binaries/6.3_schedule_4wave_minimal",
     )
 
     options = set_default_run_config(options)
