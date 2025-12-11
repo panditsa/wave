@@ -63,10 +63,20 @@ def update_node_index(
     if node.index:
         node.index = update_index(node.index, subs)
 
+    # GatherToLDS indices
     if src_idx := getattr(node, "src_index", None):
         node.update_arg("src_index", update_index(src_idx, subs))
     if dst_idx := getattr(node, "dst_index", None):
         node.update_arg("dst_index", update_index(dst_idx, subs))
+    
+    # TensorLoadToLDS indices
+    if global_tile_idx := getattr(node, "global_tile_index", None):
+        node.update_arg("global_tile_index", update_index(global_tile_idx, subs))
+    if shared_tile_idx := getattr(node, "shared_tile_index", None):
+        node.update_arg("shared_tile_index", update_index(shared_tile_idx, subs))
+    if bounds := getattr(node, "bounds", None):
+        if isinstance(bounds, dict):
+            node.update_arg("bounds", {k: v.subs(subs) for k, v in bounds.items()})
 
 
 def add_nodes_by_schedule(
