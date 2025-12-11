@@ -497,7 +497,9 @@ def get_shared_memory_operand(node: fx.Node) -> Optional[fx.Node]:
     if isinstance(custom, GatherToLDS):
         return custom.dst
     if isinstance(custom, TensorLoadToLDS):
-        return custom.dst
+        # TensorLoadToLDS.dst is a list, return the first element
+        # (for multi-buffering, we only track one allocation)
+        return custom.dst[0] if custom.dst else None
 
     return None
 
