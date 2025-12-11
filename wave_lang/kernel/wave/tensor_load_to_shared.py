@@ -226,13 +226,17 @@ def emit_tensor_load_to_shared(
 
     tensor_writes = defaultdict(list)
 
+    tensor_write = None
     with write.graph.inserting_before(write.fx_node):
         tensor_write = TensorLoadToLDS(
             [read.memory], [write.memory], *config
         ).add_to_graph(write.graph, loc=write.location)
 
     tensor_write.pre_expansion_id = id(tensor_write)
-
+    
+    if hasattr(read, "tag") and read.tag:
+        tensor_write.tag = read.tag
+    
     tensor_writes[write.memory].append(tensor_write)
 
     return tensor_writes

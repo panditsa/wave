@@ -405,6 +405,13 @@ def fuse_tensor_loads(
         if hasattr(load1_node, "pre_expansion_id"):
             fused_load.pre_expansion_id = load1_node.pre_expansion_id
 
+        # Propagate tags from original loads to the fused load
+        # Use load1's tag if available, otherwise use load2's tag
+        if hasattr(load1_node, "tag") and load1_node.tag:
+            fused_load.tag = load1_node.tag
+        elif hasattr(load2_node, "tag") and load2_node.tag:
+            fused_load.tag = load2_node.tag
+
         logger.debug(f"Created fused load: {fused_load.name}")
 
         load1_node.replace_all_uses_with(fused_load)
