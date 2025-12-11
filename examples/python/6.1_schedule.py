@@ -33,6 +33,9 @@ def test_default_gemm_prefetch(is_debug=False):
     software pipeline that overlaps memory operations with computation.
     """
 
+    mfma_variant = tkw.MMAType.GFX1250_F32_16x16x32_F16
+    threads_per_wave = 32
+
     # Symbol definitions
     M = tkl.sym.M
     N = tkl.sym.N
@@ -52,8 +55,8 @@ def test_default_gemm_prefetch(is_debug=False):
         tkw.WaveConstraint(M, BLOCK_M / 4),
         tkw.WaveConstraint(N, BLOCK_N / 2),
         tkw.HardwareConstraint(
-            threads_per_wave=64,
-            mma_type=tkw.MMAType.F32_16x16x16_F16,
+            threads_per_wave=threads_per_wave,
+            mma_type=mfma_variant,
         ),
     ]
 
@@ -119,6 +122,7 @@ def test_default_gemm_prefetch(is_debug=False):
         subs=hyperparams,
         schedule=SchedulingType.PREFETCH,  # Automatic pipelining!
         print_ir_after="all" if is_debug else [],
+        use_global_to_shared=True,
     )
     options = set_default_run_config(options)
     compiled_gemm = wave_compile(options, wave_kernel)

@@ -99,6 +99,7 @@ def test_gemm_advanced_scheduling(is_debug=False):
         4. Carefully places barriers to ensure correctness while maximizing parallelism
         """
         # Get nodes to be manipulated in the schedule.
+        breakpoint()
         k_loop = tkw.get_node_by_tag("k_loop")
         load_a = tkw.get_node_by_tag_and_type("read_a", tkw.Read)
         global_load_a, shared_load_a = tkw.partition_by_address_space(
@@ -114,6 +115,24 @@ def test_gemm_advanced_scheduling(is_debug=False):
 
         pipeline_loop = tkw.pipeline(k_loop)
         # First, create the basic 2-stage pipeline
+
+        # global_load_a[0]
+        # global_load_b[0]
+        # shared_write_a[0]
+        # shared_write_b[0]
+
+        # for i in range(0, K/BLOCK_K - 1):
+        #     global_load_a[i+1]
+        #     global_load_b[i+1]
+        #     shared_load_a[i]
+        #     shared_load_b[i]
+
+        #     shared_write_a[i+1]
+        #     shared_write_b[i+1]
+        #     mma[i]
+
+        # mma[K/BLOCK_K]
+        
         with pipeline_loop as pl:
             pl.set_stage(
                 [
@@ -127,7 +146,7 @@ def test_gemm_advanced_scheduling(is_debug=False):
                     (mma,),
                 ],
             )
-
+        breakpoint()
         # Now apply advanced scheduling to the KERNEL stage
         global_load_a = tkw.filter_nodes(global_load_a, subgraph=pipeline_loop.KERNEL)
         shared_load_a = tkw.filter_nodes(shared_load_a, subgraph=pipeline_loop.KERNEL)
