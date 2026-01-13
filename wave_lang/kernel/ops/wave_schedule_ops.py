@@ -6,6 +6,7 @@ from ..ops.wave_ops import (
     Read,
     Write,
     Placeholder,
+    Iterate,
 )
 from ..wave.constraints import Constraint
 from .base import define_schedule_op
@@ -72,6 +73,14 @@ def stagger(loop: Any): ...
 
 @define_schedule_op
 def filter_nodes(nodes: Any, subgraph: Any = None, node_type: Any = None): ...
+
+
+@define_schedule_op
+def get_node_by_tag_and_iteration(tag: str, iteration: int): ...
+
+
+@define_schedule_op
+def unroll(loop: Any, factor: int): ...
 
 
 def add_op_before(op, subgraph: fx.Graph, anchor: fx.Node, location=None):
@@ -175,6 +184,65 @@ class GetNodeByTagAndType(CustomScheduleOp):
         logger.info(f"Found {len(nodes)} nodes by tag: {tag} and type: {node_type}")
 
         # Return nodes directly instead of wrapping in proxy
+        return nodes
+
+
+@dataclass
+class GetNodeByTagAndIteration(CustomScheduleOp):
+    """
+    Get nodes with a specific tag that belong to a specific unrolled iteration.
+
+    After unrolling by factor N, each iteration's nodes can be accessed via the
+    `unroll_iteration` attribute that is set on nodes during unrolling:
+    - iteration=0: Original nodes (unroll_iteration=0)
+    - iteration=1: First unrolled copy (unroll_iteration=1)
+    - iteration=2: Second unrolled copy (unroll_iteration=2)
+    - ...
+    - iteration=N-1: Last unrolled copy (unroll_iteration=N-1)
+
+    Usage in a schedule:
+        # After unrolling by 2
+        reads_iter0 = tkw.get_node_by_tag_and_iteration("read_a", iteration=0)
+        reads_iter1 = tkw.get_node_by_tag_and_iteration("read_a", iteration=1)
+
+    Args:
+        tag: The tag to filter nodes by
+        iteration: The unroll iteration index (0-based)
+
+    Returns:
+        List of nodes matching the tag that belong to the specified iteration
+    """
+
+    tag: str
+    iteration: int
+    schedule_op_name = "get_node_by_tag_and_iteration"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        tag: str,
+        iteration: int,
+    ):
+        assert constraints is not None, "Constraints are required"
+        assert iteration >= 0, "Iteration must be non-negative"
+
+        # Get all nodes with this tag
+        all_nodes = get_node_by_tag_helper(kernel_trace, tag)
+
+        # Filter nodes by their unroll_iteration attribute
+        nodes = [
+            node
+            for node in all_nodes
+            if getattr(node, "unroll_iteration", None) == iteration
+        ]
+
+        logger.info(
+            f"Found {len(nodes)} nodes by tag '{tag}' for iteration {iteration}"
+        )
+
         return nodes
 
 
@@ -1031,3 +1099,83 @@ class FilterNodes(CustomScheduleOp):
 
         # Return list directly
         return filtered_nodes
+
+
+@dataclass
+class Unroll(CustomScheduleOp):
+    """
+    Unroll a tagged iterate node by the specified factor.
+
+    This schedule op allows unrolling an iterate loop from within a manual schedule.
+    The unroll factor must divide the iteration count evenly, and the iterate must
+    not have a condition (i.e., it must lower to scf.for, not scf.while).
+
+    Usage in a schedule:
+        k_loop = tkw.get_node_by_tag("k_loop")
+        tkw.unroll(k_loop, factor=2)
+
+    Args:
+        loop: A list/tuple of fx.Node (as returned by get_node_by_tag) or a PipelineStageRef
+        factor: The unroll factor (must be > 1 and divide the iteration count evenly)
+
+    Raises:
+        ValueError: If the loop reference doesn't resolve to exactly one Iterate node
+        ValueError: If factor <= 1
+        ValueError: If the iterate has a condition (while-style loop)
+        ValueError: If factor doesn't divide the iteration count evenly
+        ValueError: If factor is too large for the iteration count
+    """
+
+    loop: Any
+    factor: int
+    schedule_op_name = "unroll"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        loop: Any,
+        factor: int,
+    ):
+        from ..wave.unrolling import unroll as unroll_impl
+
+        # Get the iterate node from the reference (PipelineStageRef or list)
+        loop_nodes = get_nodes_from_ref(loop)
+
+        if loop_nodes is None or len(loop_nodes) == 0:
+            raise ValueError("Unroll: loop reference must resolve to at least one node")
+
+        if len(loop_nodes) != 1:
+            raise ValueError(
+                f"Unroll: expected exactly one iterate node, got {len(loop_nodes)} nodes. "
+                "Use get_node_by_tag with a unique tag for the iterate you want to unroll."
+            )
+
+        iterate_node = loop_nodes[0]
+        custom_iterate = get_custom(iterate_node)
+
+        if not isinstance(custom_iterate, Iterate):
+            raise ValueError(
+                f"Unroll: expected an Iterate node, got {type(custom_iterate).__name__}. "
+                "Make sure the tag references an @tkw.iterate decorated loop."
+            )
+
+        if factor <= 1:
+            raise ValueError(
+                f"Unroll: factor must be > 1, got {factor}. "
+                "Use a factor of 2 or greater to unroll the loop."
+            )
+
+        # Call the core unroll implementation which handles:
+        # - Validation that factor divides iteration count
+        # - Validation that iterate has no condition
+        # - Cloning the loop body and updating step/count
+        unroll_impl(custom_iterate, factor, kernel_trace, constraints)
+
+        logger.info(
+            f"Unrolled iterate '{custom_iterate.tag or 'unnamed'}' by factor {factor}"
+        )
+
+        return None

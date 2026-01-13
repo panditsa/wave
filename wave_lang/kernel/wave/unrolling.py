@@ -56,7 +56,14 @@ def unroll(
     if iterate.condition is not None:
         raise ValueError("Unrolling is not supported for iterates with conditions.")
 
-    iterate.count = iterate.count // unroll_factor
+    # Only update the step, not the count. The scf.for loop uses:
+    #   scf.for %i = 0 to count step step_val
+    # With unrolling, we process `unroll_factor` iterations worth of work per
+    # loop iteration. To maintain the correct number of total iterations:
+    # - Original: count iterations with step=1
+    # - After unroll: count iterations with step=unroll_factor
+    #   This gives count/unroll_factor actual loop iterations, each doing
+    #   unroll_factor iterations worth of work.
     iterate.update_arg("step", iterate.step * unroll_factor)
 
     graph = trace.get_subgraph(iterate.subgraph_name)
@@ -91,6 +98,13 @@ def unroll(
     reduction_axis = iterate.axis
     induction_var = get_induction_symbol(reduction_axis)
     original_body_nodes = list(graph.nodes)
+
+    # Mark original nodes as iteration 0 (excluding placeholders)
+    for node in original_body_nodes:
+        original = get_custom(node)
+        if not isinstance(original, Placeholder):
+            original.unroll_iteration = 0
+
     for unroll_idx in range(0, unroll_factor - 1):
         for node in original_body_nodes:
             original = get_custom(node)
@@ -101,6 +115,10 @@ def unroll(
                 arg_transform=value_mapper,
                 anchor=list(graph.nodes)[-2],
             )
+            # Mark this copy with its unroll iteration index
+            # unroll_idx=0 means this is the 2nd iteration (iteration 1), etc.
+            copy.unroll_iteration = unroll_idx + 1
+
             # update nodes using the induction_var for indexing
             if copy.index:
                 updated_index = {}
