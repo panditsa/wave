@@ -81,6 +81,9 @@ class ScaledMMAType(Enum):
     F32_16x16x128_F8F6F4 = 0x1340
     F32_32x32x64_F8F6F4 = 0x1341
 
+    # Intrinsics introduced in GFX1250
+    GFX1250_F32_16x16x128_F8F6F4 = 0x1940
+
 
 class MMAOperand(Enum):
     M = 0
@@ -291,6 +294,8 @@ class HardwareConstraint(Constraint):
                 return (16, 16, 128)
             case ScaledMMAType.F32_32x32x64_F8F6F4:
                 return (32, 32, 64)
+            case ScaledMMAType.GFX1250_F32_16x16x128_F8F6F4:
+                return (16, 16, 128)
             case _:
                 raise ValueError(f"Unsupported MMA type: {mma_type}")
 
@@ -443,6 +448,26 @@ class HardwareConstraint(Constraint):
                     ),  # M
                     lane % 32,  # N
                     32 * floor(lane / 32),  # K
+                ]
+            case ScaledMMAType.GFX1250_F32_16x16x128_F8F6F4:
+                offset = [
+                    Piecewise(
+                        (lane % 16, ~MMA_ACC),
+                        (8 * floor(lane / 16), MMA_ACC),
+                    ),  # M
+                    lane % 16,  # N
+                    Piecewise(
+                        (
+                            64 * floor(GPR_NUM / 16)
+                            + (GPR_NUM % 16) * 2
+                            + 32 * floor(lane / 16),
+                            ~(MMA_LHS_SCALE | MMA_RHS_SCALE),
+                        ),
+                        (
+                            0,  #  Each thread loads 4xi8 where each i8 element directly corresponds to K[X..X + 31] block
+                            (MMA_LHS_SCALE | MMA_RHS_SCALE),
+                        ),
+                    ),  # K
                 ]
             case _:
                 raise ValueError("Unsupported MMA type")
@@ -622,6 +647,24 @@ class HardwareConstraint(Constraint):
                 ]
                 stride = [
                     Piecewise((1, ~MMA_ACC), (32, MMA_ACC)),  # M
+                    1,  # N
+                    1,  # K
+                ]
+            case ScaledMMAType.GFX1250_F32_16x16x128_F8F6F4:
+                # K size: For FP4, WMMA expects vector<64xf4> per wave.
+                # Scales need 128 in original K space (becomes 128/32=4 after scaling).
+                # The op expects vector<4xf8E8M0FNU> for scales.
+                size = [
+                    Piecewise((1, ~MMA_ACC), (8, MMA_ACC)),  # M
+                    1,  # N
+                    Piecewise(
+                        (128, MMA_LHS_SCALE | MMA_RHS_SCALE),
+                        (64, MMA_SCALE_FP4),  # FP4 data
+                        (32, True),  # F8 data
+                    ),  # K
+                ]
+                stride = [
+                    Piecewise((1, ~MMA_ACC), (16, MMA_ACC)),  # M
                     1,  # N
                     1,  # K
                 ]
