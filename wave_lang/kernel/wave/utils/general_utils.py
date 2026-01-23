@@ -142,10 +142,12 @@ def get_hardware_vector_size(
     Given a hardware constraint, return the vector sizes for the given dimension.
     This could be a hardware specific vector size or a user specified vector size.
     """
+    # Normalize scaled dimensions (like K/2) to base dimensions (like K) for lookup
+    base_dim = infer_dim(dim)
     if mma_indices:
-        vector_size = hardware_constraint.mma_matrix_shapes[mma_indices[dim]]
+        vector_size = hardware_constraint.mma_matrix_shapes[mma_indices.get(base_dim, mma_indices.get(dim))]
     else:
-        vector_size = hardware_constraint.vector_shapes[dim]
+        vector_size = hardware_constraint.vector_shapes[base_dim]
     return vector_size
 
 
