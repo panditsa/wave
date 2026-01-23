@@ -164,6 +164,9 @@ def shared_memory_barrier_wait(barId: int = 0): ...
 def memory_counter_wait(load=None, store=None, ds=None, exp=None): ...
 
 
+def memory_counter_wait_barrier(load=None, store=None, ds=None, exp=None): ...
+
+
 def workgroup_barrier(): ...
 
 
@@ -1654,6 +1657,30 @@ class MemoryCounterWait(CustomOp):
     """
     Wait for the specified counters to be less-than or equal-to
     the provided values before continuing.
+
+    Emits: amdgpu.memory_counter_wait with specified counters
+    """
+
+    load: Optional[int] = None
+    store: Optional[int] = None
+    ds: Optional[int] = None
+    exp: Optional[int] = None
+
+    @property
+    def has_side_effects(self) -> bool:
+        return True
+
+
+@define_op("memory_counter_wait_barrier")
+@dataclass
+class MemoryCounterWaitBarrier(CustomOp):
+    """
+    Wait for the specified counters to be less-than or equal-to
+    the provided values before continuing, then perform a workgroup barrier.
+
+    Emits:
+    - amdgpu.memory_counter_wait with specified counters
+    - rocdl.s.barrier for workgroup synchronization
     """
 
     load: Optional[int] = None

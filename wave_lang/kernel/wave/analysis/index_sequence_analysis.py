@@ -34,6 +34,7 @@ from ...ops.wave_ops import (
     MMA,
     MMABase,
     MemoryCounterWait,
+    MemoryCounterWaitBarrier,
     NestedRegionOp,
     Output,
     Placeholder,
@@ -227,6 +228,7 @@ def verify_nodes(trace: CapturedTrace, constraints: list[Constraint]):
             custom,
             (
                 MemoryCounterWait,
+                MemoryCounterWaitBarrier,
                 SharedMemoryBarrier,
                 SharedMemoryBarrierSignal,
                 SharedMemoryBarrierWait,

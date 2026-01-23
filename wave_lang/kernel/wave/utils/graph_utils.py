@@ -28,6 +28,7 @@ from ...ops.wave_ops import (
     TopkOp,
     SharedMemoryBarrierSignal,
     SharedMemoryBarrierWait,
+    MemoryCounterWaitBarrier,
     Write,
     get_custom,
 )
@@ -471,15 +472,25 @@ def is_barrier_between_same_graph(
     next_node = src.next
     if barrier_check is None:
         barrier_check = set()
+
     while next_node != dst and next_node.next.op != "root":
         custom_next_node = get_custom(next_node)
+
+        # Check for SharedMemoryBarrier (amdgpu.lds_barrier)
         if isinstance(custom_next_node, SharedMemoryBarrier):
             return next_node
+
+        # Check for split barriers (signal/wait)
         if isinstance(custom_next_node, SharedMemoryBarrierSignal):
             barrier_check.add(custom_next_node.barId)
         if isinstance(custom_next_node, SharedMemoryBarrierWait):
             if custom_next_node.barId == barId and barId in barrier_check:
                 return next_node
+
+        # Check for MemoryCounterWaitBarrier (amdgpu.memory_counter_wait + rocdl.s.barrier)
+        if isinstance(custom_next_node, MemoryCounterWaitBarrier):
+            return next_node
+
         next_node = next_node.next
 
     return None
