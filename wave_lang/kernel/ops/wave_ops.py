@@ -1557,8 +1557,13 @@ class Allocate(CustomOp):
 
     @property
     def unpadded_shape(self) -> tuple[IndexExpr]:
+        from ..wave.utils.general_utils import infer_dim, is_scaled_dim
+
         unpadded_dims = self.unpadded_dims
-        return tuple(unpadded_dims[s] for s in self.shape)
+        # Normalize scaled dimensions (like K/2) to base dimensions (like K) for lookup
+        return tuple(
+            unpadded_dims[infer_dim(s) if is_scaled_dim(s) else s] for s in self.shape
+        )
 
     def infer_type(self, *args):
         type_expr = Memory[(*self.shape, self.address_space, self.dtype)]

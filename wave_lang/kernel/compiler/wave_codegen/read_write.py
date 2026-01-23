@@ -60,7 +60,7 @@ from ...ops.wave_ops import (
     read_meets_hw_transpose_requirements,
     MemoryAccessFlags,
 )
-from ...wave.utils.general_utils import get_fastest_index, linearize_index
+from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
 from ...wave.utils.mapping_utils import transform_index_on_mapping
 from ...wave.utils.symbol_utils import safe_subs
 from .emitter import (
@@ -875,7 +875,9 @@ def handle_tensor_load_to_lds(emitter: WaveEmitter, node: fx.Node):
 
     for i, (src, dst) in enumerate(zip(sources, destinations)):
         symbolic_shape = _get_symbolic_shape(src)
-        global_tile_index_current = {k: global_tile_index[k] for k in symbolic_shape}
+        # Normalize keys: global_tile_index may have base keys (K) while symbolic_shape has scaled keys (K/2)
+        base_to_global_index = {infer_dim(k): v for k, v in global_tile_index.items()}
+        global_tile_index_current = {k: base_to_global_index[infer_dim(k)] for k in symbolic_shape}
         global_tile_index_current = _subs_index_dict(
             global_tile_index_current, {INPUT_SELECTOR: i}
         )

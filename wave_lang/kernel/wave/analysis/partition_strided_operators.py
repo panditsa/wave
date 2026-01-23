@@ -32,6 +32,7 @@ from ..utils.general_utils import (
     all_equal,
     get_fastest_index,
     get_largest_index_and_size,
+    infer_dim,
 )
 from ..utils.mma_utils import (
     simplify_index,
@@ -47,8 +48,9 @@ def get_vector_shape(
     vector_shapes: dict[IndexSymbol, int],
     symbolic_shape: list[IndexSymbol],
 ) -> list[int]:
-    vector_shapes = [max(vector_shapes[dim], 1) for dim in symbolic_shape]
-    return vector_shapes
+    # Normalize scaled dimensions (like K/2) to base dimensions (like K) for lookup
+    result = [max(vector_shapes.get(infer_dim(dim), 1), 1) for dim in symbolic_shape]
+    return result
 
 
 def _get_symbolic_shape_and_vector_shapes(
