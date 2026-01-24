@@ -219,18 +219,29 @@ bool wave::IterateOp::areTypesCompatible(mlir::Type lhs, mlir::Type rhs) {
 }
 
 OperandRange wave::IterateOp::getEntrySuccessorOperands(RegionSuccessor) {
-  return getOperands().drop_back(getNumOperands());
+  // Return iter_args as the entry operands (values that flow into the region).
+  return getIterArgs();
 }
 
 void wave::IterateOp::getSuccessorRegions(
     RegionBranchPoint point,
     ::llvm::SmallVectorImpl<::RegionSuccessor> &regions) {
   // May branch into the region or bypass it regardless of the source.
-  regions.emplace_back(
-      RegionSuccessor(getOperation(), getResults().drop_back(getNumResults())));
-  regions.emplace_back(
-      RegionSuccessor(&getBody(), getLoopBody()->getArguments().drop_back(
-                                      getLoopBody()->getNumArguments())));
+  // Exit to parent with loop results.
+  regions.emplace_back(RegionSuccessor::parent());
+  // Branch into the loop body with iter_args mapped to block arguments.
+  // Note: captures are also block arguments but come after iter_args.
+  regions.emplace_back(RegionSuccessor(&getBody()));
+}
+
+ValueRange wave::IterateOp::getSuccessorInputs(RegionSuccessor successor) {
+  // When branching to the parent (exiting the loop), the successor inputs are
+  // the op results.
+  if (successor.isParent())
+    return getResults();
+  // When branching to the region, the successor inputs are the block arguments
+  // corresponding to iter_args (not captures).
+  return getLoopBody()->getArguments().drop_back(getCaptures().size());
 }
 
 llvm::FailureOr<ChangeResult> wave::IterateOp::propagateIndexExprsForward(
@@ -1784,8 +1795,8 @@ llvm::LogicalResult wave::WriteOp::setIndexFromLattices(
 
 MutableOperandRange
 wave::YieldOp::getMutableSuccessorOperands(RegionSuccessor) {
-  // Create an empty mutable operand range (it has no default constructor).
-  return getValuesMutable().slice(/*subStart=*/0, /*subLen=*/0);
+  // Return all yielded values - these flow back to the parent IterateOp.
+  return getValuesMutable();
 }
 
 //-----------------------------------------------------------------------------
