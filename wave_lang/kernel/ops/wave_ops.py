@@ -2797,6 +2797,10 @@ class Write(CustomOp):
         custom = get_custom(self.register_)
         return custom.index
 
+    @property
+    def has_side_effects(self) -> bool:
+        return True
+
     def transform_index_backwards(
         self, index: dict[IndexSymbol, IndexSequence], arg: fx.Node
     ) -> dict[IndexSymbol, IndexSequence]:
