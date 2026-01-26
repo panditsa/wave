@@ -385,6 +385,9 @@ def partition_ops_with_gpr_offsets(trace: CapturedTrace, constraints: list[Const
                 reshape.expanded_dims = custom.expanded_dims
                 reshape.vector_shapes = custom.vector_shapes
                 propagate_tag(custom.fx_node, reshape)
+                # Also propagate tag to the underlying Read nodes
+                for op in ops_to_combine:
+                    propagate_tag(custom.fx_node, op)
 
                 # Save the original index on the reshape op so later we can
                 # detect if op was part of `gpr_offset` partition.
@@ -503,6 +506,9 @@ def partition_gather_like_ops(
                 reshape.expanded_dims = custom.expanded_dims
                 reshape.vector_shapes = custom.vector_shapes
                 propagate_tag(custom.fx_node, reshape)
+                # Also propagate tag to the underlying Read nodes
+                for op in ops_to_combine:
+                    propagate_tag(custom.fx_node, op)
 
                 reshape.index = index
                 custom.replace_all_uses_with(reshape)
