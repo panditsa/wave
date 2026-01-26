@@ -217,6 +217,9 @@ def rewrite_node(
         custom_node.graph, loc=custom_node.location
     )
     propagate_tag(custom_node, concat)
+    # Also propagate tag to the underlying Read nodes
+    for op in read_ops:
+        propagate_tag(custom_node, op)
     custom_node.replace_all_uses_with(concat)
 
 
