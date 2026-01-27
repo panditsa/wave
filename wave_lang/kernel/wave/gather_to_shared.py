@@ -627,9 +627,31 @@ def gather_to_shared_swizzling(
         col_dim = infer_dim(shape[-1])
         row_dim = infer_dim(shape[-2])
 
-        max_phase = 8
+        # Compute max_phase based on the number of column chunks.
+        # The XOR swizzle `xor(row % max_phase, col_chunk)` can produce values
+        # from 0 to max_phase-1. We need to ensure these values are valid column
+        # chunk indices, otherwise we get out-of-bounds access.
+        mem_custom = get_custom(mem)
+        distributed_shape = mem_custom.distributed_shape
+        col_size = subs_idxc(distributed_shape[-1])
+        num_col_chunks = col_size // elements_per_thread
+        max_phase = min(8, num_col_chunks)
+        logger.info(
+            f"distributed_shape={distributed_shape}, col_size={col_size}, "
+            f"num_col_chunks={num_col_chunks}, max_phase={max_phase}"
+        )
 
-        # Check row phase inconsistency between reads and gathers.
+        if max_phase < 2:
+            logger.info(
+                f"max_phase={max_phase} is too small for effective swizzling, skipping"
+            )
+            continue
+
+        # Check row phase consistency between reads and gathers.
+        # For swizzling to work correctly, both gather (write to LDS) and read
+        # (read from LDS) must use the same row value modulo max_phase in the
+        # XOR swizzle formula. If they differ, data will be written to one
+        # column but read from a different column, causing incorrect results.
         gather_local_index = remove_global_indexing(gather.src_index, constraints)
         read_local_index = remove_global_indexing(read.index, constraints)
         gather_row_expr = sympy.simplify(
@@ -638,9 +660,13 @@ def gather_to_shared_swizzling(
         read_row_expr = sympy.simplify(
             subs_idxc(read_local_index[row_dim].start) % max_phase
         )
-        if gather_row_expr != read_row_expr:
+        # The ASM backend requires matching row expressions for correct swizzling.
+        # The default LLVM backend handles mismatched expressions correctly.
+        if options.backend == "asm" and gather_row_expr != read_row_expr:
             logger.info(
-                f"row phase inconsistency between reads and gathers: {gather_row_expr} != {read_row_expr}. Skipping swizzling as it is not supported."
+                f"row phase inconsistency between reads and gathers: "
+                f"{gather_row_expr} != {read_row_expr}. "
+                f"Skipping swizzling for ASM backend."
             )
             continue
 
