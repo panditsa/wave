@@ -1,14 +1,23 @@
+import hashlib
+import math
 from dataclasses import dataclass
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Optional, Sequence, TYPE_CHECKING
 import torch.fx as fx
+import sympy
 from ..ops.wave_ops import (
     get_custom,
+    Conditional,
     Read,
     Write,
     Placeholder,
     Iterate,
+    WorkgroupBarrier,
+    NewScalar,
+    Ge,
+    Lt,
 )
-from ..wave.constraints import Constraint
+import wave_lang.kernel.lang as tkl
+from ..wave.constraints import Constraint, HardwareConstraint
 from .base import define_schedule_op
 import logging
 
@@ -16,6 +25,120 @@ if TYPE_CHECKING:
     from .._support.tracing import CapturedTrace
 
 logger = logging.getLogger(__name__)
+
+
+##############################################################
+# Helper functions
+##############################################################
+
+
+def _get_hardware_constraint(
+    constraints: list[Constraint],
+) -> Optional[HardwareConstraint]:
+    """Get the HardwareConstraint from the constraints list."""
+    for c in constraints:
+        if isinstance(c, HardwareConstraint):
+            return c
+    return None
+
+
+def _get_graph_node(custom, graph: fx.Graph, location) -> fx.Node:
+    """Add a CustomOp to the graph and return its fx.Node."""
+    custom.add_to_graph(graph)
+    custom.location = location
+    return custom.fx_node
+
+
+def _insert_cond_barrier_at(
+    condition: Any,  # sympy.Basic or fx.Node
+    target: Any,
+    kernel_trace: "CapturedTrace",
+    insert_after: bool = False,
+) -> None:
+    """
+    Insert a conditional barrier before or after a target node.
+
+    Args:
+        condition: The condition for the barrier (sympy expression or fx.Node).
+            Example: hw.wave_id >= mid_wave
+        target: The target node (PipelineStageRef, fx.Node, or list)
+        kernel_trace: The kernel trace for adding subgraphs
+        insert_after: If True, insert barrier after target; otherwise before
+    """
+    # Get the target nodes
+    target_nodes = get_nodes_from_ref(target)
+    assert (
+        target_nodes is not None and len(target_nodes) > 0
+    ), "Target must have at least one node"
+
+    # Use first node for 'before', last node for 'after'
+    target_node = target_nodes[-1] if insert_after else target_nodes[0]
+    custom = get_custom(target_node)
+    graph = custom.graph
+    location = custom.location
+
+    # Validate condition type
+    if not isinstance(condition, (sympy.Basic, fx.Node)):
+        raise ValueError(
+            f"Condition must be sympy expression or fx.Node, "
+            f"got {type(condition).__name__}"
+        )
+
+    if insert_after:
+        with graph.inserting_after(target_node):
+            _insert_cond_barrier(condition, kernel_trace, graph, location)
+    else:
+        with graph.inserting_before(target_node):
+            _insert_cond_barrier(condition, kernel_trace, graph, location)
+
+
+def _insert_cond_barrier(
+    condition: Any,  # fx.Node or sympy.Basic
+    trace: "CapturedTrace",
+    graph: fx.Graph,
+    location=None,
+) -> fx.Node:
+    """
+    Insert a conditional workgroup barrier.
+
+    Args:
+        condition: The condition that controls barrier execution.
+            Can be an fx.Node or a sympy expression (IndexExpr).
+            Sympy expressions are passed directly to Conditional.
+        trace: The kernel trace for adding subgraphs
+        graph: The graph to insert the conditional into
+        location: Optional location for debugging
+
+    Returns:
+        The conditional barrier node
+    """
+    barrier_graph = fx.Graph()
+
+    # Generate unique name for the barrier subgraph
+    if isinstance(condition, fx.Node):
+        barrier_graph_name = f"barrier_graph_{condition.name}"
+    else:
+        # For sympy expressions, use a sanitized string representation
+        cond_hash = hashlib.md5(str(condition).encode()).hexdigest()[:8]
+        barrier_graph_name = f"barrier_graph_expr_{cond_hash}"
+
+    # Add barrier inside the conditional subgraph
+    barrier_node = WorkgroupBarrier().add_to_graph(barrier_graph)
+    barrier_node.location = location
+
+    # Create the conditional that wraps the barrier
+    # Conditional accepts both fx.Proxy/fx.Node and IndexExpr (sympy)
+    cond_barrier = Conditional(
+        condition,
+        subgraph_name=barrier_graph_name,
+        implicit_captures=[],
+    ).add_to_graph(graph)
+    cond_barrier.location = location
+
+    barrier_graph.parent_op = cond_barrier
+    trace.add_subgraph(barrier_graph_name, barrier_graph)
+
+    return cond_barrier
 
 
 # Stubs to enable type checking of the custom schedule ops - decorated with @define_op for dispatch
@@ -72,6 +195,14 @@ def stagger(loop: Any): ...
 
 
 @define_schedule_op
+def insert_cond_barrier_before(condition: Any, target: Any): ...
+
+
+@define_schedule_op
+def insert_cond_barrier_after(condition: Any, target: Any): ...
+
+
+@define_schedule_op
 def filter_nodes(nodes: Any, subgraph: Any = None, node_type: Any = None): ...
 
 
@@ -81,6 +212,10 @@ def get_node_by_tag_and_iteration(tag: str, iteration: int): ...
 
 @define_schedule_op
 def unroll(loop: Any, factor: int): ...
+
+
+@define_schedule_op
+def get_hardware_constraint(): ...
 
 
 def add_op_before(op, subgraph: fx.Graph, anchor: fx.Node, location=None):
@@ -112,16 +247,19 @@ def extract_nodes(item):
 
 def get_nodes_from_ref(ref):
     """
-    Get the actual nodes from a reference (PipelineStageRef or list).
+    Get the actual nodes from a reference (PipelineStageRef, list, or fx.Node).
     """
     if isinstance(ref, PipelineStageRef):
         # For PipelineStageRef, return the pipelined iterate node directly
         return [ref.pipelined_iterate_node]
+    elif isinstance(ref, fx.Node):
+        # Direct fx.Node - wrap in list
+        return [ref]
     elif isinstance(ref, (list, tuple)):
         # Direct list of nodes
         return list(ref)
     else:
-        raise ValueError(f"Expected PipelineStageRef or list, got {type(ref)}")
+        raise ValueError(f"Expected PipelineStageRef, fx.Node or list, got {type(ref)}")
 
 
 @dataclass
@@ -821,7 +959,87 @@ class Pipeline(CustomScheduleOp):
 
 @dataclass
 class Stagger(CustomScheduleOp):
+    """
+    Simple stagger scheduling that inserts wave barriers around a loop.
+
+    This places:
+    - wave_hi barrier BEFORE the loop (blocks high waves so low waves start first)
+    - wave_lo barrier AFTER the loop (blocks low waves so high waves catch up)
+
+    For finer control, use insert_cond_barrier_before/after with your own conditions.
+
+    Example creating custom conditions:
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        wave_hi = hw.wave_id >= mid_wave
+        wave_lo = hw.wave_id < mid_wave
+        tkw.insert_cond_barrier_before(wave_hi, loop)
+        tkw.insert_cond_barrier_after(wave_lo, loop)
+    """
+
     schedule_op_name = "stagger"
+
+    @classmethod
+    def handle(
+        cls, region_graph, kernel_trace, constraints: list[Constraint], loop: Any
+    ):
+        # Get hardware constraint to compute wave conditions
+        hw = _get_hardware_constraint(constraints)
+        if hw is None:
+            raise ValueError("Stagger requires HardwareConstraint")
+
+        # Compute mid-wave for 2-way stagger
+        flat_wave_count = math.prod(hw.waves_per_block)
+        assert flat_wave_count % 2 == 0, f"Wave count {flat_wave_count} must be even"
+        mid_wave = flat_wave_count // 2
+
+        # Create conditions using sympy expressions (just like kernel code!)
+
+        # Compute wave_id from hardware constraint
+        flat_id = hw.linearized_thread_id
+        wave_id = flat_id // hw.threads_per_wave
+
+        # Get the target node to access graph and location
+        target_nodes = get_nodes_from_ref(loop)
+        assert target_nodes is not None and len(target_nodes) > 0
+        target_node = target_nodes[0]
+        custom = get_custom(target_node)
+        graph = custom.graph
+        location = custom.location
+
+        # Create typed scalar nodes for i32 comparison
+        with graph.inserting_before(target_node):
+            mid_wave_reg = _get_graph_node(
+                NewScalar(mid_wave, tkl.i32), graph, location
+            )
+            wave_id_reg = _get_graph_node(NewScalar(wave_id, tkl.i32), graph, location)
+            is_wave_hi = _get_graph_node(Ge(wave_id_reg, mid_wave_reg), graph, location)
+            is_wave_lo = _get_graph_node(Lt(wave_id_reg, mid_wave_reg), graph, location)
+
+        # Insert conditional barriers using the typed fx.Node conditions
+        with graph.inserting_before(target_node):
+            _insert_cond_barrier(is_wave_hi, kernel_trace, graph, location)
+        with graph.inserting_after(target_nodes[-1]):
+            _insert_cond_barrier(is_wave_lo, kernel_trace, graph, location)
+
+        logger.info("Applied 2-way stagger scheduling to loop")
+        return None
+
+
+@dataclass
+class InsertConditionalBarrierBefore(CustomScheduleOp):
+    """
+    Insert a conditional barrier before a target node.
+
+    Usage:
+        # Get hardware constraint and create condition
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        condition = hw.wave_id >= mid_wave
+        tkw.insert_cond_barrier_before(condition, loop)
+    """
+
+    schedule_op_name = "insert_cond_barrier_before"
 
     @classmethod
     def handle(
@@ -829,47 +1047,48 @@ class Stagger(CustomScheduleOp):
         region_graph,
         kernel_trace,
         constraints: list[Constraint],
-        loop: Any,
+        condition: Any,
+        target: Any,
     ):
-        """
-        Implements stagger scheduling by adding conditional barriers around a loop that blocks waves such that
-        waves execute clusters in a staggered manner for better overlap of computation and memory access.
+        if not isinstance(condition, (sympy.Basic, fx.Node)):
+            raise ValueError(
+                f"condition must be sympy expression or fx.Node, "
+                f"got {type(condition).__name__}"
+            )
+        _insert_cond_barrier_at(condition, target, kernel_trace, insert_after=False)
+        return None
 
-        For 2 waves (default):
-        at T0:
-           wave 0 runs cluster 0
-           wave 1 blocked
-        at T1:
-           wave 0 runs cluster 1
-           wave 1 runs cluster 0
-        at T2:
-           wave 0 runs cluster 2
-           wave 1 runs cluster 1
 
-        This pattern continues, allowing N waves to execute clusters in parallel with a stagger offset.
-        """
-        from ..wave.schedule_reordering import add_conditional_barriers_to_loop
-        from ..wave.utils.general_utils import get_hardware_constraint
+@dataclass
+class InsertConditionalBarrierAfter(CustomScheduleOp):
+    """
+    Insert a conditional barrier after a target node.
 
-        # Get the iterate node from the reference (PipelineStageRef or list)
-        loop_result = get_nodes_from_ref(loop)
-        assert loop_result is not None, "Loop must have a result"
-        assert len(loop_result) > 0, "Loop must have at least one element"
+    Usage:
+        # Get hardware constraint and create condition
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        condition = hw.wave_id < mid_wave
+        tkw.insert_cond_barrier_after(condition, loop)
+    """
 
-        iterate_node = loop_result[0]
-        custom_iterate = get_custom(iterate_node)
+    schedule_op_name = "insert_cond_barrier_after"
 
-        # Get hardware constraints
-        hardware_constraint = get_hardware_constraint(constraints)
-        if hardware_constraint is None:
-            raise ValueError("Stagger requires HardwareConstraint")
-
-        add_conditional_barriers_to_loop(
-            custom_iterate, kernel_trace, hardware_constraint
-        )
-
-        logger.info(f"Applied 2-way stagger scheduling to loop")
-
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        condition: Any,
+        target: Any,
+    ):
+        if not isinstance(condition, (sympy.Basic, fx.Node)):
+            raise ValueError(
+                f"condition must be sympy expression or fx.Node, "
+                f"got {type(condition).__name__}"
+            )
+        _insert_cond_barrier_at(condition, target, kernel_trace, insert_after=True)
         return None
 
 
@@ -1179,3 +1398,48 @@ class Unroll(CustomScheduleOp):
         )
 
         return None
+
+
+@dataclass
+class GetHardwareConstraint(CustomScheduleOp):
+    """
+    Get the HardwareConstraint from the kernel constraints.
+
+    This allows creating custom wave conditions in schedules, consistent with
+    how conditions work in kernel code.
+
+    Usage in a schedule:
+        hw = tkw.get_hardware_constraint()
+
+        # Create wave stagger conditions
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        wave_hi = hw.wave_id >= mid_wave
+        wave_lo = hw.wave_id < mid_wave
+
+        tkw.insert_cond_barrier_before(wave_hi, loop)
+        tkw.insert_cond_barrier_after(wave_lo, loop)
+
+    Returns:
+        The HardwareConstraint object which provides:
+        - wave_id: sympy expression for the current wave ID
+        - waves_per_block: tuple of wave counts per dimension
+        - threads_per_wave: number of threads per wave
+        - And other hardware-specific information
+    """
+
+    schedule_op_name = "get_hardware_constraint"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+    ):
+        hw = _get_hardware_constraint(constraints)
+        if hw is None:
+            raise ValueError(
+                "No HardwareConstraint found in constraints. "
+                "Make sure your kernel has a HardwareConstraint defined."
+            )
+        return hw
