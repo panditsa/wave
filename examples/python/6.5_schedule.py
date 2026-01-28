@@ -205,13 +205,35 @@ def test_gfx1250_mxfp_gemm(is_debug=False):
         bitcast_b = tkw.get_node_by_tag("bitcast_b")
         bitcast_b_scale = tkw.get_node_by_tag("bitcast_b_scale")
 
-        # Combine all global-to-shared operations (only those that exist)
+        # Check for fused TensorLoadToLDS nodes
+        # For MXFP4, fusion pairs ADJACENT loads, so we may get:
+        #   Pattern 1: "read_a,read_a_scale" and "read_b,read_b_scale" (data+scale fused)
+        #   Pattern 2: "read_a,read_b" and "read_a_scale,read_b_scale" (data+data, scale+scale fused)
+        #   Pattern 3: No fusion (all 4 separate TensorLoadToLDS nodes)
+        
+        # Try pattern 1 first (adjacent fusion: data+scale)
+        global_to_shared_fused_a = tkw.get_node_by_tag("read_a,read_a_scale")
+        global_to_shared_fused_b = tkw.get_node_by_tag("read_b,read_b_scale")
+        
+        # Try pattern 2 (data+data, scale+scale fusion)
+        global_to_shared_data_fused = tkw.get_node_by_tag("read_a,read_b")
+        global_to_shared_scale_fused = tkw.get_node_by_tag("read_a_scale,read_b_scale")
+        # Combine all global-to-shared operations based on what fusion pattern occurred
         all_global_to_shared = []
-        all_global_to_shared.extend(global_to_shared_a)
-        all_global_to_shared.extend(global_to_shared_b)
-        if len(global_to_shared_a_scale) > 0:
+        
+        if len(global_to_shared_fused_a) > 0 or len(global_to_shared_fused_b) > 0:
+            # Pattern 1: Adjacent fusion (data+scale)
+            all_global_to_shared.extend(global_to_shared_fused_a)
+            all_global_to_shared.extend(global_to_shared_fused_b)
+        elif len(global_to_shared_data_fused) > 0 or len(global_to_shared_scale_fused) > 0:
+            # Pattern 2: Data+data, scale+scale fusion
+            all_global_to_shared.extend(global_to_shared_data_fused)
+            all_global_to_shared.extend(global_to_shared_scale_fused)
+        else:
+            # Pattern 3: No fusion - use individual unfused nodes
+            all_global_to_shared.extend(global_to_shared_a)
             all_global_to_shared.extend(global_to_shared_a_scale)
-        if len(global_to_shared_b_scale) > 0:
+            all_global_to_shared.extend(global_to_shared_b)
             all_global_to_shared.extend(global_to_shared_b_scale)
 
         # Combine all shared memory loads
