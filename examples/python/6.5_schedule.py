@@ -106,10 +106,16 @@ def test_gfx1250_mxfp_gemm(is_debug=False):
     the GFX1250-specific scaled WMMA instruction for MXFP4 inputs.
     
     Key configuration:
-    - 128x128 blocks with 256 K tile
+    - 128x256 blocks with 256 K tile (64 WMMAs per wave)
     - Wave32 (GFX1250 uses 32 threads per wave)
     - MXFP4 (f4e2m1fn) data with f8e8m0fnu scales
     - Simple prefetch pipelining to overlap memory and compute
+    
+    WMMA Math:
+    - wave_M = 64 → 64/16 = 4 WMMAs in M
+    - wave_N = 128 → 128/16 = 8 WMMAs in N
+    - BLOCK_K = 256 → 256/128 = 2 K sub-tiles
+    - Total: 4 × 8 × 2 = 64 WMMAs per wave
     """
     shape: tuple[int, int, int] = (1024, 1024, 8192) 
     mfma_variant = ScaledMMAType.GFX1250_F32_16x16x128_F8F6F4
@@ -124,11 +130,12 @@ def test_gfx1250_mxfp_gemm(is_debug=False):
     ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
 
     # Constraints - GFX1250 uses wave32
+    # 64 WMMAs per wave: (64/16) × (128/16) × (256/128) = 4 × 8 × 2 = 64
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
-    constraints += [tkw.WaveConstraint(M, BLOCK_M / 4)]
-    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M / 2)]  # 64 per wave → 4 M-tiles
+    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]  # 128 per wave → 8 N-tiles
 
     # GFX1250 uses wave32
     constraints += [
@@ -295,7 +302,7 @@ def test_gfx1250_mxfp_gemm(is_debug=False):
     hyperparams = {
         ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
         BLOCK_M: 128,
-        BLOCK_N: 128,
+        BLOCK_N: 256,  # Increased for 64 WMMAs per wave (128 N per wave × 2 waves)
         BLOCK_K: 256,
         M: shape[0],
         N: shape[1],
