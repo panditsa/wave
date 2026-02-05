@@ -675,7 +675,7 @@ def propagate_placeholders(n: fx.Node | tuple | None) -> fx.Node | tuple | None:
     if n is None:
         return None
     if isinstance(n, tuple):
-        return (propagate_placeholders(elem) for elem in n)
+        return tuple(propagate_placeholders(elem) for elem in n)
     c = get_custom(n)
     if isinstance(c, Placeholder):
         p = c.get_captured_fx_node()
