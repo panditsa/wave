@@ -107,7 +107,7 @@ def test_gfx1250_tbuf_gemm(is_debug=False):
         global_to_shared_b = tkw.filter_nodes(all_read_b, node_type=tkw.TensorLoadToLDS)
         shared_load_b = tkw.filter_nodes(all_read_b, node_type=tkw.Read)
 
-        global_to_shared_fused = tkw.get_node_by_tag("read_a,read_b")
+        global_to_shared_fused = tkw.get_node_by_tag({"read_a", "read_b"})
 
         if len(global_to_shared_fused) == 0:
             global_to_shared_fused.extend(global_to_shared_a)
