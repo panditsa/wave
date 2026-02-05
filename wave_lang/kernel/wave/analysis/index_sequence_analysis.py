@@ -481,12 +481,23 @@ def set_thread_independent_index(
             if isinstance(constraint, TilingConstraint):
                 if not hasattr(custom.graph, "parent_op"):
                     continue
-                # Check if we're inside an iterate for this specific tiled dimension
-                parent_iterate = get_custom(custom.graph.parent_op)
-                if (
-                    not isinstance(parent_iterate, Iterate)
-                    or parent_iterate.axis != constraint.dim
-                ):
+                # Check if we're inside an iterate for this specific tiled dimension.
+                # Walk up the parent chain to handle nested iterates.
+                current_graph = custom.graph
+                found_iterate = False
+                while hasattr(current_graph, "parent_op"):
+                    parent_iterate = get_custom(current_graph.parent_op)
+                    if (
+                        isinstance(parent_iterate, Iterate)
+                        and parent_iterate.axis == constraint.dim
+                    ):
+                        found_iterate = True
+                        break
+                    if hasattr(parent_iterate, "graph"):
+                        current_graph = parent_iterate.graph
+                    else:
+                        break
+                if not found_iterate:
                     continue
 
             if isinstance(constraint, WorkgroupConstraint) and has_grid_constraint:
