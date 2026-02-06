@@ -793,3 +793,30 @@ func.func @reduction_init_and_result_contain_axis(%input: !wave.tensor<any of f3
   %result = wave.max_element %input init(%init) along @K <warp> : (!wave.tensor<any of f32>, !wave.tensor<[@K] of f32>) -> !wave.tensor<[@K] of f32>
   return %result : !wave.tensor<[@K] of f32>
 }
+
+// -----
+
+func.func @broadcast_source_dim_not_in_result(%arg0: !wave.tensor<[@M, @N] of f32, <register>>) {
+  // Source has [@M, @N], result has [@M, @P, @K] - N is missing (replaced by P).
+  // expected-error @below {{source dimension 'N' not found in result shape}}
+  wave.broadcast %arg0 : (!wave.tensor<[@M, @N] of f32, <register>>) -> !wave.tensor<[@M, @P, @K] of f32, <register>>
+  return
+}
+
+// -----
+
+func.func @broadcast_explicit_dims_with_fully_specified_types(%arg0: !wave.tensor<[@M, @N] of f32, <register>>) {
+  // When both source and result types are fully specified, explicit dims are not expected.
+  // expected-error @below {{does not expect explicit dims when source and result types are fully specified}}
+  wave.broadcast %arg0 dims [@K] : (!wave.tensor<[@M, @N] of f32, <register>>) -> !wave.tensor<[@M, @N, @K] of f32, <register>>
+  return
+}
+
+// -----
+
+func.func @broadcast_element_type_mismatch(%arg0: !wave.tensor<[@M, @N] of f32, <register>>) {
+  // Source and result must have matching element types.
+  // expected-error @below {{expected source and result elemental types to match, got 'f32', 'f16'}}
+  wave.broadcast %arg0 : (!wave.tensor<[@M, @N] of f32, <register>>) -> !wave.tensor<[@M, @N, @K] of f16, <register>>
+  return
+}

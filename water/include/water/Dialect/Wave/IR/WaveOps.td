@@ -562,4 +562,46 @@ def CastOp : WaveOp<"cast", [
   let hasVerifier = 1;
 }
 
+def BroadcastOp : WaveOp<"broadcast", [
+    DeclareOpInterfaceMethods<WaveInferTypeOpInterface>,
+    DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>,
+    WaveInferIndexExprsOpInterface, IdentityIndexExprsOpTrait]> {
+  let summary = "Broadcast a tensor to a larger shape by replicating values";
+  let description = [{
+    Broadcasts the source tensor to the result shape by replicating values
+    along the broadcast dimensions, which must be the trailing dimensions
+    of the result shape.
+
+    When either operand or result are underspecified, the broadcast dimension
+    must be explicitly provided. Otherwise, it is inferred from the difference
+    between their respective symbolic shapes.
+
+    Developer remark: unless one of the dimensions introduced by broadcasting
+    is indexed by a symbol that is mapped to thread X, this operation does not
+    change elements-per-thread.
+  }];
+
+  let arguments = !con((ins
+    Arg<WaveTensorInRegister, "Source tensor to broadcast">:$source,
+    Arg<OptionalAttr<WaveSymbolArrayAttr>, "Dimensions being broadcast">:$broadcast_dims
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Broadcasted result">:$result
+  );
+
+  let assemblyFormat =
+    "$source (`dims` custom<SymbolArray>($broadcast_dims)^)?" #
+    commonArgumentsSyntax # "attr-dict `:`"
+    "functional-type(operands, results)";
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    // Infer broadcast dimensions from types. Expects both source and result
+    // types to be fully specified tensor types.
+    ::llvm::SmallVector<::wave::WaveSymbolAttr> inferBroadcastDims();
+  }];
+}
+
 #endif // WATER_DIALECT_WAVE_WAVEOPS

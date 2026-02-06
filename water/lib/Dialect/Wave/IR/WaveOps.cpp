@@ -23,6 +23,7 @@
 #include "water/Dialect/Wave/IR/WaveInterfaces.h"
 #include "water/Dialect/Wave/IR/WaveTypes.h"
 #include "water/Dialect/Wave/IR/WaveUtils.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -90,6 +91,37 @@ static ParseResult parseSingleSymbol(OpAsmParser &parser,
 static void printSingleSymbol(OpAsmPrinter &printer, Operation *,
                               wave::WaveSymbolAttr symbolAttr) {
   printer.printSymbolName(symbolAttr.getName());
+}
+
+// Parse an array of wave symbols like [@M, @N, @K].
+// Custom parsing is required because MLIR's default parser creates
+// SymbolRefAttr for @Name syntax, but Wave requires WaveSymbolAttr for type
+// system consistency.
+static ParseResult parseSymbolArray(OpAsmParser &parser,
+                                    ArrayAttr &symbolArrayAttr) {
+  SmallVector<Attribute> symbols;
+  if (parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Square, [&]() {
+        StringAttr strAttr;
+        if (failed(parser.parseSymbolName(strAttr)))
+          return failure();
+        symbols.push_back(
+            wave::WaveSymbolAttr::get(parser.getContext(), strAttr.getValue()));
+        return success();
+      }))
+    return failure();
+  symbolArrayAttr = parser.getBuilder().getArrayAttr(symbols);
+  return success();
+}
+
+// Print an array of wave symbols like [@M, @N, @K].
+static void printSymbolArray(OpAsmPrinter &printer, Operation *,
+                             ArrayAttr symbolArrayAttr) {
+  printer << "[";
+  llvm::interleaveComma(symbolArrayAttr, printer, [&](Attribute attr) {
+    auto sym = llvm::cast<wave::WaveSymbolAttr>(attr);
+    printer.printSymbolName(sym.getName());
+  });
+  printer << "]";
 }
 
 #define GET_OP_CLASSES
@@ -1886,4 +1918,130 @@ LogicalResult wave::ReciprocalOp::verify() {
     return emitOpError("requires float element type, but got ") << elementType;
 
   return success();
+}
+//-----------------------------------------------------------------------------
+// BroadcastOp
+//-----------------------------------------------------------------------------
+
+llvm::SmallVector<WaveSymbolAttr> wave::BroadcastOp::inferBroadcastDims() {
+  if (auto dims = getBroadcastDims())
+    return llvm::to_vector(dims->getAsRange<WaveSymbolAttr>());
+
+  WaveTensorType sourceType = llvm::cast<WaveTensorType>(getSource().getType());
+  WaveTensorType resultType = llvm::cast<WaveTensorType>(getResult().getType());
+  assert(sourceType.getFullySpecified() && resultType.getFullySpecified() &&
+         "expected source and result types to be fully specified");
+
+  llvm::DenseSet<WaveSymbolAttr> sourceSymbols;
+  for (WaveSymbolAttr sym : sourceType.getShape())
+    sourceSymbols.insert(sym);
+
+  llvm::SmallVector<WaveSymbolAttr> broadcastDims;
+  for (WaveSymbolAttr sym : resultType.getShape()) {
+    if (!sourceSymbols.contains(sym))
+      broadcastDims.push_back(sym);
+  }
+  return broadcastDims;
+}
+
+LogicalResult wave::BroadcastOp::verify() {
+  if (failed(detail::verifyElementTypesMatch(getLoc(), "source",
+                                             getSource().getType(), "result",
+                                             getResult().getType())))
+    return failure();
+
+  auto sourceType = llvm::dyn_cast<WaveTensorType>(getSource().getType());
+  auto resultType = llvm::dyn_cast<WaveTensorType>(getResult().getType());
+
+  if (!sourceType || !resultType)
+    return success();
+
+  if (!sourceType.getFullySpecified() || !resultType.getFullySpecified())
+    return success();
+
+  if (getBroadcastDims()) {
+    return emitOpError("does not expect explicit dims when source and result "
+                       "types are fully specified");
+  }
+
+  // Check all source symbols are in result.
+  for (WaveSymbolAttr sym : sourceType.getShape()) {
+    if (!llvm::is_contained(resultType.getShape(), sym))
+      return emitOpError("source dimension '")
+             << sym.getName() << "' not found in result shape";
+  }
+
+  return success();
+}
+
+llvm::FailureOr<ChangeResult> wave::BroadcastOp::propagateForward(
+    llvm::ArrayRef<WaveTensorType> operandTypes,
+    llvm::MutableArrayRef<WaveTensorType> resultTypes,
+    llvm::raw_ostream &errs) {
+  if (!getBroadcastDims())
+    return ChangeResult::NoChange;
+
+  unsigned operandNo = getSourceMutable().getOperandNumber();
+  WaveTensorType operandType = operandTypes[operandNo];
+  SmallVector<WaveSymbolAttr> broadcastDims =
+      llvm::to_vector(getBroadcastDims()->getAsRange<WaveSymbolAttr>());
+  return detail::propagateShapeAddTrailingDims(
+      operandType, resultTypes[0], "operand", "result", broadcastDims, errs);
+}
+
+llvm::FailureOr<ChangeResult> wave::BroadcastOp::propagateBackward(
+    llvm::MutableArrayRef<WaveTensorType> operandTypes,
+    llvm::ArrayRef<WaveTensorType> resultTypes, llvm::raw_ostream &errs) {
+  if (!getBroadcastDims())
+    return ChangeResult::NoChange;
+
+  WaveTensorType resultType = resultTypes[0];
+  unsigned operandNo = getSourceMutable().getOperandNumber();
+  return detail::propagateShapeDropTrailingDims(
+      resultType, operandTypes[operandNo], "result", "operand",
+      getBroadcastDims()->size(), errs);
+}
+
+LogicalResult wave::BroadcastOp::finalizeTypeInference() {
+  if (cast<WaveTensorType>(getOperand().getType()).getFullySpecified() &&
+      cast<WaveTensorType>(getResult().getType()).getFullySpecified())
+    removeBroadcastDimsAttr();
+  return success();
+}
+
+// Check if the broadcast operation is broadcasting along the thread X
+// dimension. Returns true if types are fully specified and one of the
+// broadcast dims matches the thread X dimension, meaning EPT propagation
+// should be blocked.
+static bool isBroadcastingAlongThreadX(wave::BroadcastOp op,
+                                       const ElementsPerThreadInit &init) {
+  auto sourceType = llvm::cast<WaveTensorType>(op.getSource().getType());
+  auto resultType = llvm::cast<WaveTensorType>(op.getResult().getType());
+  assert(sourceType.getFullySpecified() && resultType.getFullySpecified() &&
+         "expected source and result types to be fully specified");
+
+  SmallVector<WaveSymbolAttr> broadcastDims = op.inferBroadcastDims();
+  return llvm::any_of(broadcastDims, llvm::equal_to(init.threadXDimension));
+}
+
+llvm::FailureOr<ChangeResult>
+wave::BroadcastOp::propagateElementsPerThreadForward(
+    llvm::ArrayRef<ElementsPerThreadLatticeValue> operandElements,
+    llvm::MutableArrayRef<ElementsPerThreadLatticeValue> resultElements,
+    llvm::raw_ostream &errs, const ElementsPerThreadInit &init) {
+  if (isBroadcastingAlongThreadX(*this, init))
+    return ChangeResult::NoChange;
+  return detail::identityElementsPerThreadPropagate(
+      operandElements, resultElements, "operands", "results", errs);
+}
+
+llvm::FailureOr<ChangeResult>
+wave::BroadcastOp::propagateElementsPerThreadBackward(
+    llvm::MutableArrayRef<ElementsPerThreadLatticeValue> operandElements,
+    llvm::ArrayRef<ElementsPerThreadLatticeValue> resultElements,
+    llvm::raw_ostream &errs, const ElementsPerThreadInit &init) {
+  if (isBroadcastingAlongThreadX(*this, init))
+    return ChangeResult::NoChange;
+  return detail::identityElementsPerThreadPropagate(
+      resultElements, operandElements, "results", "operands", errs);
 }
