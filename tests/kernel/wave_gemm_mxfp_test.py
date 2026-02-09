@@ -26,6 +26,7 @@ from wave_lang.kernel.wave.utils.general_utils import (
 from wave_lang.kernel.wave.constraints import (
     ScaledMMAType,
 )
+from wave_lang.kernel.wave.schedules import get_tagged_mxfp4_gemm, get_mxfp4_dbuf_schedule
 
 from .common.utils import (
     extract_kernel_metadata,
@@ -675,6 +676,52 @@ def testBroadcastedScaleGemmMXFP4(
         compacted_x_scales.view(-1, 1).repeat(1, x_scales.shape[-1]).contiguous()
     )
     torch_out = torchScaledGemmMXFP4(x, w, broadcasted_compacted_x_scales, w_scales)
+
+    torch.testing.assert_close(torch_out, out, check_dtype=False)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape",
+    [(1024, 1024, 8192)],
+)
+@pytest.mark.parametrize(
+    "block_shape",
+    [(256, 256, 256)],
+)
+@pytest.mark.parametrize(
+    "mfma_variant",
+    [ScaledMMAType.F32_16x16x128_F8F6F4],
+)
+@pytest.mark.parametrize(
+    "num_waves,use_stagger",
+    [
+        (4, False),
+        (8, True),
+    ],
+)
+def testScaledGemmMXFP4ManualDoubleBuf(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    mfma_variant: ScaledMMAType,
+    num_waves: int,
+    use_stagger: bool,
+):
+    """End-to-end test for CDNA4 MXFP4 scaled GEMM with manual double-buffer schedule."""
+    gemm, options = get_tagged_mxfp4_gemm(
+        shape, block_shape, mfma_variant, num_waves
+    )
+    schedule = get_mxfp4_dbuf_schedule(use_stagger=use_stagger)
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    out = device_zeros(x.shape[0], w.shape[1], dtype=torch.float32)
+
+    w_t = w.T.contiguous()
+    gemm(x, x_scales, w_t, w_scales, out)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
 
     torch.testing.assert_close(torch_out, out, check_dtype=False)
 
