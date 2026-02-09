@@ -7,36 +7,15 @@
 """
 MXFP4 Scaled GEMM Double Buffer Schedule for CDNA4 (GFX950)
 
-This module provides a reusable double-buffering schedule for MXFP4 scaled GEMM
-kernels on GFX950 (MI350/CDNA4). It handles the MXFP4-specific complexity of
-4 input tensors (A data, A scale, B data, B scale) with bitcast operations.
+Reusable 2-stage pipeline schedule for MXFP4 scaled GEMM on GFX950.
+Handles 4 input tensors (A data, A scale, B data, B scale) with bitcasts.
 
-Schedule structure:
-- 2-stage pipeline (double buffering / ping-pong)
-- Stage 0: GatherToLDS for async global-to-shared prefetch (no fusion on GFX950)
-- Stage 1: Shared memory loads + bitcasts + scaled_mma compute
-- K-dimension partitioning to interleave memory and compute operations
-- Wave priority manipulation for compute-priority scheduling
-- Optional wave staggering for multi-wave overlap
+Stage 0: GatherToLDS async prefetch | Stage 1: shared loads + bitcasts + MMA
+K-dimension partitioned into 2 halves for memory/compute interleaving.
 
-Cluster ordering (4 clusters):
-- Cluster 0: First K-partition shared loads + bitcasts, then async GatherToLDS
-- Cluster 1: First K-partition scaled_mma (high priority) + memory counter wait
-- Cluster 2: Second K-partition shared loads + bitcasts + memory counter wait
-- Cluster 3: Second K-partition scaled_mma (high priority)
-
-This schedule expects a kernel with the following tags:
-- "k_loop": The reduction loop to pipeline
-- "read_a": A data reads (GatherToLDS global->shared + Read shared load)
-- "read_a_scale": A scale reads (GatherToLDS + Read)
-- "read_b": B data reads (GatherToLDS + Read)
-- "read_b_scale": B scale reads (GatherToLDS + Read)
-- "bitcast_a", "bitcast_a_scale", "bitcast_b", "bitcast_b_scale": Bitcast ops
-- "scaled_mma": Scaled MMA operations
-
-Requires:
-- use_global_to_shared=True in WaveCompileOptions
-- threads_per_wave=64 (GFX950 wave64)
+Required kernel tags: k_loop, read_a, read_a_scale, read_b, read_b_scale,
+bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale, scaled_mma.
+Requires use_global_to_shared=True and threads_per_wave=64.
 """
 
 import wave_lang.kernel.lang as tkl
@@ -55,25 +34,18 @@ def get_tagged_mxfp4_gemm(
     mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
     num_waves: int = 8,
 ):
-    """
-    Returns a tagged MXFP4 scaled GEMM kernel with compile options for CDNA4.
+    """Return a tagged MXFP4 scaled GEMM kernel + compile options for CDNA4.
 
-    The kernel includes tags on all operations needed by MXFP4 schedules:
-    - "k_loop": The main reduction loop
-    - "read_a", "read_a_scale": A data and scale reads
-    - "read_b", "read_b_scale": B data and scale reads
-    - "bitcast_a", "bitcast_a_scale": A bitcast operations
-    - "bitcast_b", "bitcast_b_scale": B bitcast operations
-    - "scaled_mma": Scaled MMA operations
+    All ops are tagged for use with MXFP4 schedule functions.
 
     Args:
-        shape: (M, N, K) dimensions for the GEMM
-        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes
-        mfma_variant: The scaled MMA type to use
-        num_waves: Number of waves per workgroup (4 or 8)
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        mfma_variant: Scaled MMA instruction type.
+        num_waves: Waves per workgroup (4 or 8).
 
     Returns:
-        Tuple of (kernel_function, compile_options)
+        (kernel_function, WaveCompileOptions)
     """
     M = tkl.sym.M
     N = tkl.sym.N
@@ -149,17 +121,11 @@ def get_tagged_mxfp4_gemm(
 
 
 def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
-    """
-    Returns a schedule function implementing double-buffered MXFP4 scaled GEMM.
+    """Return a double-buffered MXFP4 schedule for wave_compile().
 
     Args:
-        use_stagger: If True, enables wave staggering and adds a WorkgroupBarrier
-            after the GatherToLDS operations in cluster 0. Recommended for 8-wave
-            configurations. Set to False for 4-wave configurations where staggering
-            may not be beneficial.
-
-    Returns:
-        A wave_schedule decorated function suitable for passing to wave_compile().
+        use_stagger: Enable wave staggering + WorkgroupBarrier in cluster 0.
+            Recommended for 8-wave configs; disable for 4-wave.
     """
     K = tkl.sym.K
 
