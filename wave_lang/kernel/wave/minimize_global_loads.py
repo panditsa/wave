@@ -104,9 +104,7 @@ def materialize_shape(
                     materialized_shape.append(subs_idxc(dim))
                 else:
                     materialized_shape.append(
-                        subs_idxc(
-                            sympy.ceiling(dim / vec_shape) * vec_shape
-                        )
+                        subs_idxc(sympy.ceiling(dim / vec_shape) * vec_shape)
                     )
 
     return materialized_shape

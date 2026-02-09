@@ -151,7 +151,9 @@ def get_global_element_index(
     base_to_thread_index = {infer_dim(k): v for k, v in thread_index.items()}
 
     return {
-        key: IndexSequence(index[key].start + base_to_thread_index[infer_dim(key)], 1, 1)
+        key: IndexSequence(
+            index[key].start + base_to_thread_index[infer_dim(key)], 1, 1
+        )
         for key in index.keys()
     }
 

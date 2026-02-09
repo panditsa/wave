@@ -45,8 +45,12 @@ def generate_gemm_afp4wfp4_inputs(
     # w is transposed here (matches original test)
     w = w.T
     # Scales are created transposed then transposed back
-    x_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device=device)
-    w_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device=device)
+    x_scales = torch.randint(
+        124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device=device
+    )
+    w_scales = torch.randint(
+        124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device=device
+    )
     x_scales = x_scales.T.contiguous()
     w_scales = w_scales.T.contiguous()
     return x, w, x_scales, w_scales
@@ -58,8 +62,22 @@ def mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
     x[:, ::2] = x[:, ::2] & 0xF
     x[:, 1::2] = x[:, 1::2] >> 4
     mxfp4_list = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
     return mxfp4_in_f32[x.long()]
@@ -88,7 +106,9 @@ def torchScaledGemmMXFP4(
     return torch.mm(x_f32, w_f32)
 
 
-def test_basic_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)):
+def test_basic_mxfp_gemm(
+    is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
+):
     """
     Basic MXFP4 scaled GEMM on GFX950 - no manual schedule.
 
@@ -105,7 +125,9 @@ def test_basic_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(256, 2
     M, N, K = shape
     BLOCK_M, BLOCK_N, BLOCK_K = block
 
-    print(f"M: {M}, N: {N}, K: {K}, BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
+    print(
+        f"M: {M}, N: {N}, K: {K}, BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}"
+    )
 
     # Symbol definitions
     M = tkl.sym.M
@@ -216,5 +238,7 @@ if __name__ == "__main__":
         print("Use --list_tests to see available tests")
         exit(1)
 
-    success = run_test(args.test, globals(), args.debug, args.repeat, args.shape, args.block)
+    success = run_test(
+        args.test, globals(), args.debug, args.repeat, args.shape, args.block
+    )
     exit(0 if success else 1)

@@ -877,7 +877,9 @@ def handle_tensor_load_to_lds(emitter: WaveEmitter, node: fx.Node):
         symbolic_shape = _get_symbolic_shape(src)
         # Normalize keys: global_tile_index may have base keys (K) while symbolic_shape has scaled keys (K/2)
         base_to_global_index = {infer_dim(k): v for k, v in global_tile_index.items()}
-        global_tile_index_current = {k: base_to_global_index[infer_dim(k)] for k in symbolic_shape}
+        global_tile_index_current = {
+            k: base_to_global_index[infer_dim(k)] for k in symbolic_shape
+        }
         global_tile_index_current = _subs_index_dict(
             global_tile_index_current, {INPUT_SELECTOR: i}
         )

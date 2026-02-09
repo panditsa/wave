@@ -24,16 +24,19 @@ def parse_args():
     )
     # block size of the test
     parser.add_argument(
-        "--block", type=str, default=None, help="Block size of the test, e.g. 256,256,256"
+        "--block",
+        type=str,
+        default=None,
+        help="Block size of the test, e.g. 256,256,256",
     )
 
     args = parser.parse_args()
 
     # Convert shape and block arguments to tuples of ints
     if isinstance(args.shape, str):
-        args.shape = tuple(map(int, args.shape.split(',')))
+        args.shape = tuple(map(int, args.shape.split(",")))
     if isinstance(args.block, str):
-        args.block = tuple(map(int, args.block.split(',')))
+        args.block = tuple(map(int, args.block.split(",")))
 
     return args
 

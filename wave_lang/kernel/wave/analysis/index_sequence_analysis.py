@@ -431,7 +431,9 @@ def compute_stride(
         base_dim = infer_dim(dim)
         if base_dim == target_base_dim:
             break
-        assert base_dim in vector_shapes, f"Dimension {dim} (base: {base_dim}) not found in vector shapes"
+        assert (
+            base_dim in vector_shapes
+        ), f"Dimension {dim} (base: {base_dim}) not found in vector shapes"
         # Sanity Check to ensure that the stride is never less than 1.
         stride *= max(1, vector_shapes[base_dim])
 

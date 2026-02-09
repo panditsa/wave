@@ -96,9 +96,7 @@ def get_tagged_mxfp4_gemm(
         constraints += [tkw.WaveConstraint(M, BLOCK_M / 2)]
         constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]
 
-    constraints += [
-        tkw.HardwareConstraint(threads_per_wave=64, mma_type=mfma_variant)
-    ]
+    constraints += [tkw.HardwareConstraint(threads_per_wave=64, mma_type=mfma_variant)]
 
     @tkw.wave(constraints)
     def gemm(
@@ -117,15 +115,11 @@ def get_tagged_mxfp4_gemm(
             a_reg = tkw.read(a, tag="read_a")
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
             a_scale_reg = tkw.read(a_scale, tag="read_a_scale")
-            a_scale_reg = tkw.bitcast(
-                a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale"
-            )
+            a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
             b_reg = tkw.read(b, tag="read_b")
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
             b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
-            b_scale_reg = tkw.bitcast(
-                b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale"
-            )
+            b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
             acc = tkw.scaled_mma(
                 a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
             )
@@ -186,9 +180,7 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         global_to_shared_a_scale = tkw.filter_nodes(
             all_read_a_scale, node_type=tkw.GatherToLDS
         )
-        shared_load_a_scale = tkw.filter_nodes(
-            all_read_a_scale, node_type=tkw.Read
-        )
+        shared_load_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
 
         # Matrix B data
         all_read_b = tkw.get_node_by_tag("read_b")
@@ -200,9 +192,7 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         global_to_shared_b_scale = tkw.filter_nodes(
             all_read_b_scale, node_type=tkw.GatherToLDS
         )
-        shared_load_b_scale = tkw.filter_nodes(
-            all_read_b_scale, node_type=tkw.Read
-        )
+        shared_load_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.Read)
 
         # Bitcast operations (needed alongside compute)
         bitcast_a = tkw.get_node_by_tag("bitcast_a")
@@ -253,13 +243,9 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         # Filter nodes for KERNEL stage
         loop_global_to_shared = (
             tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL)
-            + tkw.filter_nodes(
-                global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL
-            )
+            + tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL)
             + tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL)
-            + tkw.filter_nodes(
-                global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL
-            )
+            + tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
         )
 
         loop_shared_load_a = tkw.filter_nodes(
@@ -275,21 +261,15 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
             shared_load_b_scale, subgraph=pipeline_loop.KERNEL
         )
 
-        loop_bitcast_a = tkw.filter_nodes(
-            bitcast_a, subgraph=pipeline_loop.KERNEL
-        )
+        loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
         loop_bitcast_a_scale = tkw.filter_nodes(
             bitcast_a_scale, subgraph=pipeline_loop.KERNEL
         )
-        loop_bitcast_b = tkw.filter_nodes(
-            bitcast_b, subgraph=pipeline_loop.KERNEL
-        )
+        loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
         loop_bitcast_b_scale = tkw.filter_nodes(
             bitcast_b_scale, subgraph=pipeline_loop.KERNEL
         )
-        loop_scaled_mma = tkw.filter_nodes(
-            scaled_mma, subgraph=pipeline_loop.KERNEL
-        )
+        loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
 
         # Partition by K dimension for interleaving compute with memory ops.
         # NOTE: Bitcasts MUST also be partitioned by K to match their producer
@@ -305,15 +285,11 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         loop_shared_load_b_0, loop_shared_load_b_1 = tkw.partition_by_dim(
             loop_shared_load_b, dim=K, num_partitions=2
         )
-        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = (
-            tkw.partition_by_dim(
-                loop_shared_load_a_scale, dim=K, num_partitions=2
-            )
+        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_a_scale, dim=K, num_partitions=2
         )
-        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = (
-            tkw.partition_by_dim(
-                loop_shared_load_b_scale, dim=K, num_partitions=2
-            )
+        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_b_scale, dim=K, num_partitions=2
         )
         loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
             loop_bitcast_a, dim=K, num_partitions=2

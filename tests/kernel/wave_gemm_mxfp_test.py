@@ -26,7 +26,10 @@ from wave_lang.kernel.wave.utils.general_utils import (
 from wave_lang.kernel.wave.constraints import (
     ScaledMMAType,
 )
-from wave_lang.kernel.wave.schedules import get_tagged_mxfp4_gemm, get_mxfp4_dbuf_schedule
+from wave_lang.kernel.wave.schedules import (
+    get_tagged_mxfp4_gemm,
+    get_mxfp4_dbuf_schedule,
+)
 
 from .common.utils import (
     extract_kernel_metadata,
@@ -709,9 +712,7 @@ def testScaledGemmMXFP4ManualDoubleBuf(
     use_stagger: bool,
 ):
     """End-to-end test for CDNA4 MXFP4 scaled GEMM with manual double-buffer schedule."""
-    gemm, options = get_tagged_mxfp4_gemm(
-        shape, block_shape, mfma_variant, num_waves
-    )
+    gemm, options = get_tagged_mxfp4_gemm(shape, block_shape, mfma_variant, num_waves)
     schedule = get_mxfp4_dbuf_schedule(use_stagger=use_stagger)
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)

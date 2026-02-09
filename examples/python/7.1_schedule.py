@@ -8,7 +8,7 @@ Two buffering strategies are demonstrated:
 1. Triple buffering (3-stage pipeline) - test_gfx950_mxfp_gemm
    - Prefetches 2 iterations ahead for maximum memory/compute overlap
    - Uses more shared memory but provides better latency hiding
-   
+
 2. Double buffering (2-stage pipeline) - test_gfx950_mxfp_gemm_double_buffering
    - Prefetches 1 iteration ahead (ping-pong buffering)
    - Uses less shared memory with simpler synchronization
@@ -45,7 +45,7 @@ def generate_gemm_afp4wfp4_inputs(
     shape: tuple[int, int, int], device: torch.device = torch.device("cpu")
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate MXFP4 inputs for scaled GEMM.
-    
+
     Matches the original wave_gemm_mxfp_test.py implementation exactly.
     """
     M, N, K = shape
@@ -60,8 +60,12 @@ def generate_gemm_afp4wfp4_inputs(
     # IMPORTANT: w is transposed here (matches original test)
     w = w.T
     # Scales are created transposed then transposed back (matches original test)
-    x_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device=device)
-    w_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device=device)
+    x_scales = torch.randint(
+        124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device=device
+    )
+    w_scales = torch.randint(
+        124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device=device
+    )
     x_scales = x_scales.T.contiguous()
     w_scales = w_scales.T.contiguous()
     return x, w, x_scales, w_scales
@@ -69,7 +73,7 @@ def generate_gemm_afp4wfp4_inputs(
 
 def mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
     """Convert packed MXFP4 (e2m1) values to f32.
-    
+
     Matches the original wave_gemm_mxfp_test.py implementation.
     """
     # 2 because we pack fp4 in uint8
@@ -77,8 +81,22 @@ def mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
     x[:, ::2] = x[:, ::2] & 0xF
     x[:, 1::2] = x[:, 1::2] >> 4
     mxfp4_list = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
     return mxfp4_in_f32[x.long()]
@@ -86,7 +104,7 @@ def mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
 
 def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
     """Convert e8m0 scale values to f32.
-    
+
     Matches the original wave_gemm_mxfp_test.py implementation.
     """
     x_f32 = 2 ** ((x - 127).to(torch.float32))
@@ -98,7 +116,7 @@ def torchScaledGemmMXFP4(
     x: torch.Tensor, w: torch.Tensor, x_scales: torch.Tensor, w_scales: torch.Tensor
 ) -> torch.Tensor:
     """Reference implementation for scaled MXFP4 GEMM.
-    
+
     Matches the original wave_gemm_mxfp_test.py implementation.
     """
     # First convert the x and w inputs to f32
@@ -115,13 +133,15 @@ def torchScaledGemmMXFP4(
     return torch.mm(x_f32, w_f32)
 
 
-def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)):
+def test_dbuf_4wave_mxfp_gemm(
+    is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
+):
     """
     GFX950 (MI350) scaled MMA GEMM with MXFP4 data type and double buffering (2-stage pipeline).
-    
+
     This test uses ScaledMMAType.F32_16x16x128_F8F6F4 which is
     the CDNA4 (GFX950) scaled MMA instruction for MXFP4 inputs.
-    
+
     Key configuration:
     - 4 waves
     - 256x256 blocks with 256 K tile (64 MMAs per wave)
@@ -150,7 +170,9 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
     constraints += [tkw.WaveConstraint(M, BLOCK_M / 2)]  # 128 per wave → 2 M-tiles
-    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]  # 128 per wave → 2 N-tiles (total 8 waves)
+    constraints += [
+        tkw.WaveConstraint(N, BLOCK_N / 2)
+    ]  # 128 per wave → 2 N-tiles (total 8 waves)
     constraints += [tkw.IteratorBindings({m_iter: M, n_iter: N})]
     # GFX950 uses wave64
     constraints += [
@@ -180,7 +202,9 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
             b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
-            acc = tkw.scaled_mma(a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma")
+            acc = tkw.scaled_mma(
+                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+            )
             return acc
 
         tkw.write(repeat, c)
@@ -190,9 +214,9 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
     def mxfp_double_buf_schedule():
         """
         2-stage double-buffering pipeline for MXFP4 scaled GEMM on GFX950.
-        
+
         Uses GatherToLDS for async global-to-shared transfers (no fusion on GFX950).
-        
+
         - Prologue: Prefetch 1 iteration worth of data (handled by pipeline)
         - Main loop:
           * Partitioned by K dimension to interleave compute with memory ops
@@ -209,7 +233,9 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
 
         # Get all nodes for matrix A scale
         all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
-        global_to_shared_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.GatherToLDS)
+        global_to_shared_a_scale = tkw.filter_nodes(
+            all_read_a_scale, node_type=tkw.GatherToLDS
+        )
         shared_load_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
 
         # Get all nodes for matrix B data
@@ -219,7 +245,9 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
 
         # Get all nodes for matrix B scale
         all_read_b_scale = tkw.get_node_by_tag("read_b_scale")
-        global_to_shared_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.GatherToLDS)
+        global_to_shared_b_scale = tkw.filter_nodes(
+            all_read_b_scale, node_type=tkw.GatherToLDS
+        )
         shared_load_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.Read)
 
         # Get all bitcast operations (needed with compute)
@@ -238,8 +266,12 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             # Stage 0: Global-to-shared prefetch (GatherToLDS, no fusion)
             pl.set_stage(
                 [
-                    (global_to_shared_a, global_to_shared_a_scale,
-                     global_to_shared_b, global_to_shared_b_scale),
+                    (
+                        global_to_shared_a,
+                        global_to_shared_a_scale,
+                        global_to_shared_b,
+                        global_to_shared_b_scale,
+                    ),
                     (),
                     (),
                 ],
@@ -247,7 +279,12 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             # Stage 1: Shared memory loads + bitcasts + compute
             pl.set_stage(
                 [
-                    (shared_load_a, shared_load_b, shared_load_a_scale, shared_load_b_scale),
+                    (
+                        shared_load_a,
+                        shared_load_b,
+                        shared_load_a_scale,
+                        shared_load_b_scale,
+                    ),
                     (bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale),
                     (scaled_mma,),
                 ],
@@ -255,39 +292,69 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
         # =====================================================================
         # KERNEL: Main loop body with custom cluster ordering
         # =====================================================================
-        
+
         # Filter nodes for KERNEL stage
         # Combine all global-to-shared operations
         loop_global_to_shared = (
-            tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
+            tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
         )
 
         # Combine all loop shared loads
-        loop_shared_load_a = tkw.filter_nodes(shared_load_a, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_b = tkw.filter_nodes(shared_load_b, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_a_scale = tkw.filter_nodes(shared_load_a_scale, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_b_scale = tkw.filter_nodes(shared_load_b_scale, subgraph=pipeline_loop.KERNEL)
+        loop_shared_load_a = tkw.filter_nodes(
+            shared_load_a, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b = tkw.filter_nodes(
+            shared_load_b, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_a_scale = tkw.filter_nodes(
+            shared_load_a_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b_scale = tkw.filter_nodes(
+            shared_load_b_scale, subgraph=pipeline_loop.KERNEL
+        )
 
         # Combine all loop bitcasts
         loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_a_scale = tkw.filter_nodes(bitcast_a_scale, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_a_scale = tkw.filter_nodes(
+            bitcast_a_scale, subgraph=pipeline_loop.KERNEL
+        )
         loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_b_scale = tkw.filter_nodes(bitcast_b_scale, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_b_scale = tkw.filter_nodes(
+            bitcast_b_scale, subgraph=pipeline_loop.KERNEL
+        )
         loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
 
         # Partition MMAs, shared loads, and bitcasts by K dimension for interleaving
-        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(loop_scaled_mma, dim=K, num_partitions=2)
-        loop_shared_load_a_0, loop_shared_load_a_1 = tkw.partition_by_dim(loop_shared_load_a, dim=K, num_partitions=2)
-        loop_shared_load_b_0, loop_shared_load_b_1 = tkw.partition_by_dim(loop_shared_load_b, dim=K, num_partitions=2)
-        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = tkw.partition_by_dim(loop_shared_load_a_scale, dim=K, num_partitions=2)
-        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = tkw.partition_by_dim(loop_shared_load_b_scale, dim=K, num_partitions=2)
-        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(loop_bitcast_a, dim=K, num_partitions=2)
-        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(loop_bitcast_a_scale, dim=K, num_partitions=2)
-        loop_bitcast_b_0, loop_bitcast_b_1 = tkw.partition_by_dim(loop_bitcast_b, dim=K, num_partitions=2)
-        loop_bitcast_b_scale_0, loop_bitcast_b_scale_1 = tkw.partition_by_dim(loop_bitcast_b_scale, dim=K, num_partitions=2)
+        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(
+            loop_scaled_mma, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_0, loop_shared_load_a_1 = tkw.partition_by_dim(
+            loop_shared_load_a, dim=K, num_partitions=2
+        )
+        loop_shared_load_b_0, loop_shared_load_b_1 = tkw.partition_by_dim(
+            loop_shared_load_b, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_a_scale, dim=K, num_partitions=2
+        )
+        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_b_scale, dim=K, num_partitions=2
+        )
+        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
+            loop_bitcast_a, dim=K, num_partitions=2
+        )
+        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_0, loop_bitcast_b_1 = tkw.partition_by_dim(
+            loop_bitcast_b, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_scale_0, loop_bitcast_b_scale_1 = tkw.partition_by_dim(
+            loop_bitcast_b_scale, dim=K, num_partitions=2
+        )
 
         independent_global_count = len(loop_global_to_shared)
 
@@ -412,13 +479,16 @@ def test_dbuf_4wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
 
     print("GFX950 MXFP GEMM double buffering 4-wave test passed!")
 
-def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)):
+
+def test_dbuf_8wave_mxfp_gemm(
+    is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
+):
     """
     GFX950 (MI350) scaled MMA GEMM with MXFP4 data type and double buffering (2-stage pipeline).
-    
+
     This test uses ScaledMMAType.F32_16x16x128_F8F6F4 which is
     the CDNA4 (GFX950) scaled MMA instruction for MXFP4 inputs.
-    
+
     Key configuration:
     - 8 waves
     - 256x256 blocks with 256 K tile (64 MMAs per wave)
@@ -447,7 +517,9 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
     constraints += [tkw.WaveConstraint(M, BLOCK_M / 4)]  # 64 per wave → 4 M-tiles
-    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]  # 128 per wave → 2 N-tiles (total 8 waves)
+    constraints += [
+        tkw.WaveConstraint(N, BLOCK_N / 2)
+    ]  # 128 per wave → 2 N-tiles (total 8 waves)
     constraints += [tkw.IteratorBindings({m_iter: M, n_iter: N})]
     # GFX950 uses wave64
     constraints += [
@@ -477,7 +549,9 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
             b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
-            acc = tkw.scaled_mma(a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma")
+            acc = tkw.scaled_mma(
+                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+            )
             return acc
 
         tkw.write(repeat, c)
@@ -487,9 +561,9 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
     def mxfp_double_buf_schedule():
         """
         2-stage double-buffering pipeline for MXFP4 scaled GEMM on GFX950.
-        
+
         Uses GatherToLDS for async global-to-shared transfers (no fusion on GFX950).
-        
+
         - Prologue: Prefetch 1 iteration worth of data (handled by pipeline)
         - Main loop:
           * Partitioned by K dimension to interleave compute with memory ops
@@ -506,7 +580,9 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
 
         # Get all nodes for matrix A scale
         all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
-        global_to_shared_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.GatherToLDS)
+        global_to_shared_a_scale = tkw.filter_nodes(
+            all_read_a_scale, node_type=tkw.GatherToLDS
+        )
         shared_load_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
 
         # Get all nodes for matrix B data
@@ -516,7 +592,9 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
 
         # Get all nodes for matrix B scale
         all_read_b_scale = tkw.get_node_by_tag("read_b_scale")
-        global_to_shared_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.GatherToLDS)
+        global_to_shared_b_scale = tkw.filter_nodes(
+            all_read_b_scale, node_type=tkw.GatherToLDS
+        )
         shared_load_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.Read)
 
         # Get all bitcast operations (needed with compute)
@@ -535,8 +613,12 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             # Stage 0: Global-to-shared prefetch (GatherToLDS, no fusion)
             pl.set_stage(
                 [
-                    (global_to_shared_a, global_to_shared_a_scale,
-                     global_to_shared_b, global_to_shared_b_scale),
+                    (
+                        global_to_shared_a,
+                        global_to_shared_a_scale,
+                        global_to_shared_b,
+                        global_to_shared_b_scale,
+                    ),
                     (),
                     (),
                 ],
@@ -544,7 +626,12 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
             # Stage 1: Shared memory loads + bitcasts + compute
             pl.set_stage(
                 [
-                    (shared_load_a, shared_load_b, shared_load_a_scale, shared_load_b_scale),
+                    (
+                        shared_load_a,
+                        shared_load_b,
+                        shared_load_a_scale,
+                        shared_load_b_scale,
+                    ),
                     (bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale),
                     (scaled_mma,),
                 ],
@@ -552,39 +639,69 @@ def test_dbuf_8wave_mxfp_gemm(is_debug=False, shape=(1024, 1024, 8192), block=(2
         # =====================================================================
         # KERNEL: Main loop body with custom cluster ordering
         # =====================================================================
-        
+
         # Filter nodes for KERNEL stage
         # Combine all global-to-shared operations
         loop_global_to_shared = (
-            tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL) +
-            tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
+            tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
         )
 
         # Combine all loop shared loads
-        loop_shared_load_a = tkw.filter_nodes(shared_load_a, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_b = tkw.filter_nodes(shared_load_b, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_a_scale = tkw.filter_nodes(shared_load_a_scale, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_b_scale = tkw.filter_nodes(shared_load_b_scale, subgraph=pipeline_loop.KERNEL)
+        loop_shared_load_a = tkw.filter_nodes(
+            shared_load_a, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b = tkw.filter_nodes(
+            shared_load_b, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_a_scale = tkw.filter_nodes(
+            shared_load_a_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b_scale = tkw.filter_nodes(
+            shared_load_b_scale, subgraph=pipeline_loop.KERNEL
+        )
 
         # Combine all loop bitcasts
         loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_a_scale = tkw.filter_nodes(bitcast_a_scale, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_a_scale = tkw.filter_nodes(
+            bitcast_a_scale, subgraph=pipeline_loop.KERNEL
+        )
         loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_b_scale = tkw.filter_nodes(bitcast_b_scale, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_b_scale = tkw.filter_nodes(
+            bitcast_b_scale, subgraph=pipeline_loop.KERNEL
+        )
         loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
 
         # Partition MMAs, shared loads, and bitcasts by K dimension for interleaving
-        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(loop_scaled_mma, dim=K, num_partitions=2)
-        loop_shared_load_a_0, loop_shared_load_a_1 = tkw.partition_by_dim(loop_shared_load_a, dim=K, num_partitions=2)
-        loop_shared_load_b_0, loop_shared_load_b_1 = tkw.partition_by_dim(loop_shared_load_b, dim=K, num_partitions=2)
-        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = tkw.partition_by_dim(loop_shared_load_a_scale, dim=K, num_partitions=2)
-        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = tkw.partition_by_dim(loop_shared_load_b_scale, dim=K, num_partitions=2)
-        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(loop_bitcast_a, dim=K, num_partitions=2)
-        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(loop_bitcast_a_scale, dim=K, num_partitions=2)
-        loop_bitcast_b_0, loop_bitcast_b_1 = tkw.partition_by_dim(loop_bitcast_b, dim=K, num_partitions=2)
-        loop_bitcast_b_scale_0, loop_bitcast_b_scale_1 = tkw.partition_by_dim(loop_bitcast_b_scale, dim=K, num_partitions=2)
+        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(
+            loop_scaled_mma, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_0, loop_shared_load_a_1 = tkw.partition_by_dim(
+            loop_shared_load_a, dim=K, num_partitions=2
+        )
+        loop_shared_load_b_0, loop_shared_load_b_1 = tkw.partition_by_dim(
+            loop_shared_load_b, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_scale_0, loop_shared_load_a_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_a_scale, dim=K, num_partitions=2
+        )
+        loop_shared_load_b_scale_0, loop_shared_load_b_scale_1 = tkw.partition_by_dim(
+            loop_shared_load_b_scale, dim=K, num_partitions=2
+        )
+        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
+            loop_bitcast_a, dim=K, num_partitions=2
+        )
+        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_0, loop_bitcast_b_1 = tkw.partition_by_dim(
+            loop_bitcast_b, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_scale_0, loop_bitcast_b_scale_1 = tkw.partition_by_dim(
+            loop_bitcast_b_scale, dim=K, num_partitions=2
+        )
 
         independent_global_count = len(loop_global_to_shared)
 
@@ -725,5 +842,7 @@ if __name__ == "__main__":
         print("Use --list_tests to see available tests")
         exit(1)
 
-    success = run_test(args.test, globals(), args.debug, args.repeat, args.shape, args.block)
+    success = run_test(
+        args.test, globals(), args.debug, args.repeat, args.shape, args.block
+    )
     exit(0 if success else 1)
