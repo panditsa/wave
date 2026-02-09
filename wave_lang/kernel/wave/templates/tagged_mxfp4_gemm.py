@@ -109,6 +109,7 @@ def get_tagged_mxfp4_gemm(
         canonicalize=True,
         schedule=SchedulingType.MANUAL,
         use_global_to_shared=True,
+        minimize_shared_allocs=False,
     )
 
     return gemm, options
