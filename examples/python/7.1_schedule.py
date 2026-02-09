@@ -2,8 +2,7 @@
 MXFP4 Scaled GEMM Scheduling for GFX950 (MI350)
 
 Double-buffered MXFP4 GEMM with 4-wave and 8-wave configurations.
-Reuses get_tagged_mxfp4_gemm and get_mxfp4_dbuf_schedule from
-wave_lang.kernel.wave.schedules.
+Uses get_tagged_mxfp4_gemm (templates) + get_mxfp4_dbuf_schedule (schedules).
 
 """
 
@@ -11,10 +10,8 @@ import torch
 
 from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
-from wave_lang.kernel.wave.schedules import (
-    get_tagged_mxfp4_gemm,
-    get_mxfp4_dbuf_schedule,
-)
+from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
+from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
 
 from utils import parse_args, list_tests, run_test
 

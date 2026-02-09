@@ -26,10 +26,8 @@ from wave_lang.kernel.wave.utils.general_utils import (
 from wave_lang.kernel.wave.constraints import (
     ScaledMMAType,
 )
-from wave_lang.kernel.wave.schedules import (
-    get_tagged_mxfp4_gemm,
-    get_mxfp4_dbuf_schedule,
-)
+from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
+from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
 
 from .common.utils import (
     extract_kernel_metadata,

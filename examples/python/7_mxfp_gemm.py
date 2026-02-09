@@ -12,7 +12,7 @@ import torch
 
 from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
-from wave_lang.kernel.wave.schedules import get_tagged_mxfp4_gemm
+from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
 
 from utils import parse_args, list_tests, run_test
 
