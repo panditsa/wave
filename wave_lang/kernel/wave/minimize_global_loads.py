@@ -98,14 +98,11 @@ def materialize_shape(
             if vector_shapes is None:
                 materialized_shape.append(subs_idxc(dim))
             else:
-                # Look up vector_shapes using the original dim_expr first, then fall back to base dim
-                vec_shape = vector_shapes.get(dim_expr, vector_shapes.get(dim))
-                if vec_shape is None:
-                    materialized_shape.append(subs_idxc(dim))
-                else:
-                    materialized_shape.append(
-                        subs_idxc(sympy.ceiling(dim / vec_shape) * vec_shape)
+                materialized_shape.append(
+                    subs_idxc(
+                        sympy.ceiling(dim / vector_shapes[dim]) * vector_shapes[dim]
                     )
+                )
 
     return materialized_shape
 
