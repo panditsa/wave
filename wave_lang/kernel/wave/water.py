@@ -6,6 +6,8 @@
 
 import tempfile
 import json
+import re
+from collections import defaultdict
 from pathlib import Path
 import linecache
 import os
@@ -370,9 +372,106 @@ def water_leak_in_bounds_check(module: Module, override_ir: str = ""):
         print("[info] No out-of-bounds accesses detected.")
 
 
+def coalesce_scale_loads(mlir_asm: str) -> str:
+    """Coalesce pairs of vector.load<4xi8> from scale memrefs into vector.load<8xi8>.
+
+    Scale tensors in LDS use memref<Nx8xi8, workgroup> layout (no padding).
+    The compiler emits two vector.load<4xi8> per row at columns 0 and 4
+    (one per WMMA in the K-unroll). The LLVM backend fuses these into
+    ds_load_2addr_b32 (dual-address 32-bit loads).
+
+    This function replaces each pair with a single vector.load<8xi8> from
+    column 0, plus two vector.extract_strided_slice ops to split the result.
+    After memref decomposition, the wide load becomes a single llvm.load i64
+    which maps to ds_load_b64 (consecutive 64-bit load) -- avoiding the
+    scattered ds_load_2addr_b32 instruction.
+    """
+    lines = mlir_asm.split("\n")
+
+    # Match: %NAME = vector.load %MEM[%ROW, %COL] : memref<NxMxi8, ...workgroup...>, vector<4xi8>
+    # where M >= 8 (covers both padded stride-24 and unpadded stride-8 layouts).
+    load_re = re.compile(
+        r"^(\s+)"  # 1: indent
+        r"(%\S+) = vector\.load "  # 2: result SSA
+        r"(%\S+)"  # 3: memref SSA
+        r"\[(%\S+), (%\S+)\]"  # 4: row index, 5: col index
+        r" : (memref<\d+x\d+xi8, #gpu\.address_space<workgroup>>)"  # 6: type
+        r", vector<4xi8>"
+        r"\s*$"
+    )
+
+    # Collect all matching loads: (line_idx, indent, result, memref, row, col, memref_type)
+    load_info = []
+    for i, line in enumerate(lines):
+        m = load_re.match(line)
+        if m:
+            load_info.append(
+                (i, m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))
+            )
+
+    # Group by (memref, row_index) to find pairs at columns %c0 and %c4
+    groups = defaultdict(list)
+    for info in load_info:
+        key = (info[3], info[4])  # (memref SSA, row SSA)
+        groups[key].append(info)
+
+    replacements = {}  # line_idx -> list of replacement lines
+    coalesce_id = 0
+
+    for _key, loads in groups.items():
+        col0_loads = [l for l in loads if l[5] == "%c0"]
+        col4_loads = [l for l in loads if l[5] == "%c4"]
+
+        if not col0_loads or not col4_loads:
+            continue
+
+        for c0, c4 in zip(col0_loads, col4_loads):
+            # The wide load must be defined before the second extract uses it.
+            # Ensure col-0 load (where we place the wide load) comes first.
+            if c0[0] > c4[0]:
+                continue  # Skip if ordering is unexpected
+
+            wide_name = f"%_coalesced_scale_{coalesce_id}"
+            coalesce_id += 1
+            indent = c0[1]
+
+            # Replace the col-0 load with a wide load + extract of low half
+            replacements[c0[0]] = [
+                f"{indent}{wide_name} = vector.load {c0[3]}[{c0[4]}, {c0[5]}]"
+                f" : {c0[6]}, vector<8xi8>",
+                f"{indent}{c0[2]} = vector.extract_strided_slice {wide_name}"
+                f" {{offsets = [0], sizes = [4], strides = [1]}}"
+                f" : vector<8xi8> to vector<4xi8>",
+            ]
+
+            # Replace the col-4 load with an extract of high half
+            replacements[c4[0]] = [
+                f"{indent}{c4[2]} = vector.extract_strided_slice {wide_name}"
+                f" {{offsets = [4], sizes = [4], strides = [1]}}"
+                f" : vector<8xi8> to vector<4xi8>",
+            ]
+
+    if not replacements:
+        return mlir_asm
+
+    new_lines = []
+    for i, line in enumerate(lines):
+        if i in replacements:
+            new_lines.extend(replacements[i])
+        else:
+            new_lines.append(line)
+
+    return "\n".join(new_lines)
+
+
 def water_lowering_pipeline(module: Module, options: WaveCompileOptions) -> Module:
     binary = get_water_opt()
     mlir_asm = module.operation.get_asm()
+
+    # Coalesce adjacent scale loads (vector.load<4xi8> pairs at columns 0,4)
+    # into single vector.load<8xi8> + extract ops to get ds_load_b64.
+    mlir_asm = coalesce_scale_loads(mlir_asm)
+
     target_chip = options.target
 
     def add_opt(pipeline):
