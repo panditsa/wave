@@ -2265,6 +2265,10 @@ class NestedRegionOp(CustomOp):
         subgraphs = self.get_root_graph().subgraphs
         subgraph = subgraphs[self.subgraph_name]
         for node in list(subgraph.nodes)[::-1]:
+            # Skip nodes that still have external users (e.g. constant
+            # registers referenced by ops in a pipelined stage).
+            if node.users:
+                continue
             get_custom(node).erase()
 
         del subgraphs[self.subgraph_name]

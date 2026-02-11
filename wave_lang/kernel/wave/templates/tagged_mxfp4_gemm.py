@@ -67,9 +67,7 @@ def get_tagged_mxfp4_gemm(
     @tkw.wave(constraints)
     def gemm(
         a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
-        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
@@ -78,14 +76,12 @@ def get_tagged_mxfp4_gemm(
         def repeat(
             acc: tkl.Register[M, N, tkl.f32],
         ) -> tkl.Register[M, N, tkl.f32]:
+            a_scale_reg = tkl.Register[M, K / 32, tkl.f8e8m0fnu](1.0)
+            b_scale_reg = tkl.Register[N, K / 32, tkl.f8e8m0fnu](1.0)
             a_reg = tkw.read(a, tag="read_a")
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
-            a_scale_reg = tkw.read(a_scale, tag="read_a_scale")
-            a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
             b_reg = tkw.read(b, tag="read_b")
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
-            b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
-            b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
             acc = tkw.scaled_mma(
                 a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
             )
@@ -110,6 +106,8 @@ def get_tagged_mxfp4_gemm(
         schedule=SchedulingType.MANUAL,
         use_global_to_shared=True,
         minimize_shared_allocs=False,
+        print_mlir=True,
+        print_mlir_file="gemm_mxfp4_dbuf_8wave.mlir",
     )
 
     return gemm, options

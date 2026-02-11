@@ -182,6 +182,8 @@ def resolve_scaled_indices(trace):
                 continue
             dim, scale_type, scale_factor = get_scale_from_dim(dim_expr)
             if scale_type == ScalingType.DIVIDE:
+                if dim not in source.index:
+                    continue
                 # Index can be shared between multiple users, so we copy before modifying.
                 dim_index = deepcopy(source.index[dim])
                 assert (

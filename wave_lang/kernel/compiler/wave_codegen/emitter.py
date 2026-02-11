@@ -503,7 +503,14 @@ class WaveEmitter:
         assert NDEBUG or isinstance(node, fx.Node)
         values = self._node_values.get(node)
         if values is None:
-            raise CodegenError(f"Node {node} has no IR Value")
+            # If this is an unemitted node that has a handler (e.g. a constant
+            # register from a different subgraph), emit it on the fly.
+            target_op = getattr(node, "tkw_op_name", None)
+            if target_op and target_op in self.OP_HANDLERS:
+                self.OP_HANDLERS[target_op](self, node)
+                values = self._node_values.get(node)
+            if values is None:
+                raise CodegenError(f"Node {node} has no IR Value")
 
         values = [v.ir_value if isinstance(v, IRProxyValue) else v for v in values]
         return values

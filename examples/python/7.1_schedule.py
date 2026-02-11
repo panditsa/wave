@@ -34,7 +34,8 @@ def _run_mxfp_gemm(gemm, shape):
     x_scales, w_scales = x_scales.cuda(), w_scales.cuda()
     out = torch.zeros(x.shape[0], w.shape[1], dtype=torch.float32).cuda()
 
-    gemm(x, x_scales, w.T.contiguous(), w_scales, out)
+    # emm(x, x_scales, w.T.contiguous(), w_scales, out)
+    gemm(x, w.T.contiguous(), out)
     torch.testing.assert_close(
         torch_out, out.cpu(), check_dtype=False, check_device=False
     )
