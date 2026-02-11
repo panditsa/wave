@@ -87,8 +87,6 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm(
     options.dump_binaries = "build/binaries"
     options.dump_intermediates = "build/intermediates"
     options.minimize_shared_allocs = True
-    # options.print_mlir_after_water = True
-    # options.mlir_print_ir_after_all = True
     options.use_water_backend = True
     schedule = get_mxfp4_dbuf_hipblaslt_schedule()
 
