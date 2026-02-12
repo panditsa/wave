@@ -518,6 +518,12 @@ public:
   /// Get the total LDS size requirement
   int64_t getTotalLDSSize() const { return totalLDSSize; }
 
+  /// Get the current LDS allocation byte offset (for typed allocs)
+  int64_t getLDSAllocOffset() const { return ldsAllocOffset; }
+
+  /// Advance the LDS allocation offset by the given number of bytes
+  void advanceLDSAllocOffset(int64_t size) { ldsAllocOffset += size; }
+
   //===--------------------------------------------------------------------===//
   // System Register Usage Tracking (for kernel descriptor metadata)
   //===--------------------------------------------------------------------===//
@@ -642,7 +648,8 @@ private:
       -1; // Will be computed lazily, starts after user+system SGPRs
   int64_t nextSwizzleSRDIndex =
       -1; // Will be computed in emitSRDPrologue(), after all regular SRDs
-  int64_t totalLDSSize = 0; // Total LDS allocation size in bytes
+  int64_t totalLDSSize = 0;    // Total LDS allocation size in bytes
+  int64_t ldsAllocOffset = 0;  // Running byte offset for LDS allocations
   bool srdPrologueEmitted = false;
   // System register usage tracking
   bool usesWorkgroupIdX = false;

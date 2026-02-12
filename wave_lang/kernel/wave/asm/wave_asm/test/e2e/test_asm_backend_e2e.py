@@ -1436,9 +1436,9 @@ def _dbuf_mxfp4_helper(
 
 
 @pytest.mark.xfail(
-    reason="C++ backend MLIR translator does not yet support double-buffer "
-    "LDS iter_args (memref iter_arg base offset tracking) and scaled "
-    "MFMA operand mapping in pipelined schedules",
+    reason="C++ backend linear scan register allocator exceeds VGPR limit "
+    "(~898 VGPRs needed vs 256 limit) for the full MXFP4 double-buffered "
+    "kernel with 64 accumulator iter_args + 8 memref iter_args",
     strict=True,
 )
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
@@ -1462,9 +1462,9 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
 
 
 @pytest.mark.xfail(
-    reason="C++ backend MLIR translator does not yet support double-buffer "
-    "LDS iter_args (memref iter_arg base offset tracking) and scaled "
-    "MFMA operand mapping in pipelined schedules",
+    reason="C++ backend linear scan register allocator exceeds VGPR limit "
+    "(~898 VGPRs needed vs 256 limit) for the full MXFP4 double-buffered "
+    "kernel with 64 accumulator iter_args + 8 memref iter_args",
     strict=True,
 )
 def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
