@@ -1107,6 +1107,21 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         if (opName.starts_with("waveasm.")) {
           mnemonic = opName.drop_front(8);
         }
+
+        // V_CMP operations: set VCC implicitly (no destination register in
+        // IR).  Always use _e64 (VOP3) encoding since VOPC encoding requires
+        // src0 to be an SGPR or inline constant.  VOP3 encoding requires an
+        // explicit destination register (vcc), so we prepend it.
+        if (mnemonic.starts_with("v_cmp_")) {
+          std::string mnem64 = (mnemonic + "_e64").str();
+          llvm::SmallVector<std::string> operands;
+          operands.push_back("vcc");  // Explicit VCC destination for VOP3
+          for (Value operand : defaultOp->getOperands()) {
+            operands.push_back(resolveValue(operand));
+          }
+          return formatter.format(mnem64, operands);
+        }
+
         return emitDefaultFormat(defaultOp, mnemonic);
       });
 }
@@ -1123,16 +1138,26 @@ std::string KernelGenerator::generateRaw(RawOp rawOp) {
   return formatter.formatRaw(rawOp.getText());
 }
 
-// Check if an instruction is a VOP3 that doesn't support literal operands
-static bool isVOP3NoLiteral(llvm::StringRef mnemonic) {
-  // VOP3 instructions that don't support literal operands
-  // This includes most v_* integer instructions when not in VOP2/VOP1 form
-  return mnemonic.starts_with("v_mul_lo") || mnemonic.starts_with("v_mul_hi") ||
-         mnemonic.starts_with("v_mad") || mnemonic.starts_with("v_fma") ||
-         mnemonic.starts_with("v_lshl") || mnemonic.starts_with("v_lshr") ||
-         mnemonic.starts_with("v_ashr") || mnemonic.starts_with("v_bfe") ||
-         mnemonic.starts_with("v_bfi") || mnemonic.starts_with("v_alignbit") ||
-         mnemonic.starts_with("v_alignbyte");
+// Check if a VALU instruction needs literal materialization (v_mov_b32 +
+// scratch VGPR) for immediate operands outside the inline constant range.
+//
+// On AMDGCN, VOP2 instructions (v_add_u32, v_sub_u32, v_and_b32, etc.) and
+// VOP3 instructions (v_mul_lo_u32, v_mad_*, v_lshl_or_b32, etc.) cannot
+// accept literal constants outside the inline range [-16, 64] without
+// special encoding.  Rather than tracking which encoding each instruction
+// uses, we conservatively apply literal materialization to all v_*
+// instructions except v_mov_b32 (which natively supports 32-bit literals as
+// VOP1).
+static bool needsLiteralMaterialization(llvm::StringRef mnemonic) {
+  if (!mnemonic.starts_with("v_"))
+    return false;
+  // v_mov_b32 is VOP1 and supports 32-bit literal operands natively
+  if (mnemonic == "v_mov_b32")
+    return false;
+  // v_cmp_* are emitted with _e64 suffix (VOP3) which supports literals
+  if (mnemonic.starts_with("v_cmp_"))
+    return false;
+  return true;
 }
 
 llvm::SmallVector<std::string>
@@ -1146,9 +1171,9 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
     mnemonic = opName.drop_front(8);
   }
 
-  // Check if this is a VOP3 that doesn't support literals
-  if (!isVOP3NoLiteral(mnemonic)) {
-    // Use normal generation
+  // Check if this is a VALU instruction that needs literal materialization
+  if (!needsLiteralMaterialization(mnemonic)) {
+    // Non-VALU or v_mov_b32: use normal generation (supports inline literals)
     if (auto line = generateOp(op)) {
       lines.push_back(*line);
     }
@@ -1268,7 +1293,7 @@ llvm::SmallVector<std::string> KernelGenerator::generate() {
       continue;
     }
 
-    // Generate instruction (with literal handling for VOP3 ops)
+    // Generate instruction (with literal handling for VALU ops)
     auto instrLines = generateOpWithLiteralHandling(&op);
     lines.append(instrLines.begin(), instrLines.end());
   }
