@@ -8,10 +8,12 @@
 #include "mlir/CAPI/AffineMap.h"
 #include "mlir/CAPI/Registration.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/TypeID.h"
 
 #include "water/Dialect/Wave/IR/WaveAttrs.h"
 #include "water/Dialect/Wave/IR/WaveDialect.h"
+#include "water/Dialect/Wave/IR/WaveOps.h"
 #include "water/Dialect/Wave/IR/WaveTypes.h"
 #include "water/Dialect/Wave/Transforms/Passes.h"
 #include "water/c/Dialects.h"
@@ -631,4 +633,24 @@ uint32_t mlirWaveNormalFormAttrGetValue(MlirAttribute attr) {
 
 MlirTypeID mlirWaveNormalFormAttrGetTypeID() {
   return wrap(TypeID::get<wave::WaveNormalFormAttr>());
+}
+
+//===---------------------------------------------------------------------===//
+// Wave Operations
+//===---------------------------------------------------------------------===//
+
+void mlirWaveIterateOpMakeIsolated(MlirOperation op) {
+  Operation *operation = unwrap(op);
+  if (auto iterateOp = dyn_cast<wave::IterateOp>(operation)) {
+    IRRewriter rewriter(operation->getContext());
+    iterateOp.makeIsolated(rewriter);
+  }
+}
+
+void mlirWaveIterateOpMakeNonIsolated(MlirOperation op) {
+  Operation *operation = unwrap(op);
+  if (auto iterateOp = dyn_cast<wave::IterateOp>(operation)) {
+    IRRewriter rewriter(operation->getContext());
+    iterateOp.makeNonIsolated(rewriter);
+  }
 }
