@@ -1437,10 +1437,10 @@ def _dbuf_mxfp4_helper(
 
 @pytest.mark.xfail(
     reason="C++ backend linear scan register allocator exceeds VGPR limit "
-    "(~643 VGPRs needed vs 256 limit) for 4-wave MXFP4 double-buffered "
+    "(~629 VGPRs needed vs 256 limit) for 4-wave MXFP4 double-buffered "
     "kernel. Each wave handles 2x M-work vs 8-wave, doubling accumulators "
-    "and tile data. Loop result liveness fix reduced pressure from ~899 "
-    "but still needs AccVGPR support to fit in 256 VGPRs.",
+    "and tile data. Loop result liveness fix reduced from ~899, memory "
+    "offset opt reduced from ~643. Still needs AccVGPR support.",
     strict=True,
 )
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):

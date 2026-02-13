@@ -197,6 +197,10 @@ LivenessInfo computeLiveness(ProgramOp program) {
   // Pass 2b: Extend live ranges for values used inside loop bodies.
   // Any value used inside a loop body is used on EVERY iteration, so its
   // live range must extend from its definition to the end of the loop body.
+  // We cannot shorten this to just the last use point because the linear
+  // scan allocator processes the loop body only once — if we freed the
+  // register after the use point, a later op could take it, but the next
+  // iteration would still read from the original register.
   for (const auto &[value, defPoint] : info.defPoints) {
     auto it = info.ranges.find(value);
     if (it == info.ranges.end())
