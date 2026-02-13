@@ -1221,6 +1221,16 @@ LogicalResult handleVectorStore(Operation *op, TranslationContext &ctx) {
         storeData = splitResults[splitIndex];
       }
 
+      // If the data source is an AGPR (from MFMA accumulator), we need to
+      // move it to a VGPR before storing. MUBUF store instructions require
+      // VGPR sources. Emit v_accvgpr_read_b32 to a temporary VGPR.
+      if (isAGPRType(storeData.getType())) {
+        auto vregType = ctx.createVRegType(storeDwords,
+                                           storeDwords > 1 ? storeDwords : 1);
+        storeData =
+            V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
+      }
+
       // Use instOffset attribute instead of computing new voffset
       // This generates "offset:N" modifier in assembly, saving a V_ADD_U32
       // instruction

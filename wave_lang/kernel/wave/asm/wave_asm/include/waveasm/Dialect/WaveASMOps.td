@@ -375,18 +375,22 @@ def WaveASM_PackOp : WAVEASMOp<"pack", [Pure]> {
 }
 
 def WaveASM_ExtractOp : WAVEASMOp<"extract", [Pure]> {
-  let summary = "Extract scalar from vector VGPR";
+  let summary = "Extract element(s) from a vector register (VGPR or AGPR)";
   let description = [{
-    Extracts a scalar VGPR from a vector VGPR.
+    Extracts element(s) from a vector register at a given offset.
+    Supports both VGPR and AGPR sources. When the source is an AGPR,
+    the result is also an AGPR - this preserves AGPR type information
+    so that downstream store handlers can insert v_accvgpr_read_b32.
 
     Example:
     ```mlir
     %v0 = waveasm.extract %vec[0] : !waveasm.vreg<4> -> !waveasm.vreg
+    %a0 = waveasm.extract %avec[0] : !waveasm.areg<4> -> !waveasm.areg
     ```
   }];
 
-  let arguments = (ins WaveASM_AnyVGPR:$vector, I64Attr:$index);
-  let results = (outs WaveASM_AnyVGPR:$result);
+  let arguments = (ins WaveASM_AnyVecReg:$vector, I64Attr:$index);
+  let results = (outs WaveASM_AnyVecReg:$result);
   let assemblyFormat = "$vector `[` $index `]` attr-dict `:` type($vector) `->` type($result)";
 }
 
@@ -394,7 +398,15 @@ def WaveASM_ExtractOp : WAVEASMOp<"extract", [Pure]> {
 // VALU Unary Instructions
 //===----------------------------------------------------------------------===//
 
-def WaveASM_V_MOV_B32 : VALUUnaryOp<"v_mov_b32">;
+// v_mov_b32 supports both VGPR and AGPR destinations. When the destination
+// is an AGPR, the assembly emitter produces v_accvgpr_write_b32 instead.
+// This enables AGPR zero-init for MFMA accumulator loop init args on gfx950,
+// eliminating 128 VGPRs of accumulator zero-init pressure.
+def WaveASM_V_MOV_B32 : WAVEASMOp<"v_mov_b32", [Pure, WaveASM_ArithmeticOp]> {
+  let arguments = (ins WaveASM_VRegOrImm:$src);
+  let results = (outs WaveASM_AnyVecReg:$dst);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
+}
 def WaveASM_V_MOV_B64 : VALUUnaryOp<"v_mov_b64">;
 
 // Conversions

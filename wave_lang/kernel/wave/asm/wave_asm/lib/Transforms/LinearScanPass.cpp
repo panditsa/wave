@@ -98,6 +98,12 @@ private:
     auto immType = ImmType::get(loopOp->getContext(), 0);
     Value zeroImm = ConstantOp::create(copyBuilder, loc, immType, 0);
 
+    if (isAGPRType(initArg.getType())) {
+      // AGPR zero-init: V_MOV_B32 with ARegType destination.
+      // The assembly emitter will produce v_accvgpr_write_b32 aN, 0.
+      auto aregType = cast<ARegType>(initArg.getType());
+      return V_MOV_B32::create(copyBuilder, loc, aregType, zeroImm);
+    }
     if (isVGPRType(initArg.getType())) {
       auto vregType = cast<VRegType>(initArg.getType());
       return V_MOV_B32::create(copyBuilder, loc, vregType, zeroImm);

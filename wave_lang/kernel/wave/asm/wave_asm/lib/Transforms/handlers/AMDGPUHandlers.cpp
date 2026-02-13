@@ -253,9 +253,10 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
     accSize = 16;
   }
 
-  bool useAGPR = llvm::isa<GFX950TargetAttr>(ctx.getTarget());
-  Type accRegType = useAGPR ? Type(ctx.createARegType(accSize, 4))
-                            : Type(ctx.createVRegType(accSize, 4));
+  // Use VGPRs for MFMA accumulators. On gfx950, scaled MFMA can write
+  // directly to VGPRs, so AGPRs provide no benefit and would inflate the
+  // total register count (accum_offset + AGPR count), reducing occupancy.
+  Type accRegType = ctx.createVRegType(accSize, 4);
   Value result;
 
   // Generate the appropriate scaled MFMA instruction based on dimensions

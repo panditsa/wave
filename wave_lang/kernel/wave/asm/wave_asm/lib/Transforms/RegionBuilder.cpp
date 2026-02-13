@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "waveasm/Transforms/RegionBuilder.h"
+#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "waveasm/Dialect/WaveASMOps.h"
@@ -82,7 +83,7 @@ LoopOp RegionBuilder::buildLoopFromSCFFor(scf::ForOp forOp) {
   // to block arguments and to handle yield correctly.
   SmallVector<bool> isMemrefIterArg;
 
-  for (Value arg : forOp.getInitArgs()) {
+  for (auto [iterIdx, arg] : llvm::enumerate(forOp.getInitArgs())) {
     bool isLDSMemref = isLDSMemRefValue(arg);
     isMemrefIterArg.push_back(isLDSMemref);
 
@@ -98,17 +99,23 @@ LoopOp RegionBuilder::buildLoopFromSCFFor(scf::ForOp forOp) {
       initArgs.push_back(offsetSgpr);
     } else if (auto mapped = ctx.getMapper().getMapped(arg)) {
       Value mappedValue = *mapped;
-      // Convert immediate iter args to vregs (they'll be used in VALU ops)
+      // Convert immediate iter args to register types
       if (isa<ImmType>(mappedValue.getType())) {
-        // Infer vreg size from the original SCF type.
+        // Infer register size from the original SCF type.
         // For vector types (e.g. vector<4xf32> for MFMA accumulators),
-        // we need a vreg with matching element count and alignment.
-        int64_t vregSize = 1;
+        // we need a register with matching element count and alignment.
+        int64_t regSize = 1;
         if (auto vecType = dyn_cast<VectorType>(arg.getType())) {
-          vregSize = vecType.getNumElements();
+          regSize = vecType.getNumElements();
         }
-        int64_t vregAlign = vregSize > 1 ? vregSize : 1;
-        auto vregType = ctx.createVRegType(vregSize, vregAlign);
+        int64_t regAlign = regSize > 1 ? regSize : 1;
+
+        // Use VGPRs for all iter_args including MFMA accumulators.
+        // On gfx950, MFMA can write directly to VGPRs, so AGPRs are not
+        // needed. Keeping accumulators in VGPRs avoids the AGPR overhead
+        // (accum_offset + AGPR count) that inflates the total register
+        // footprint and reduces occupancy.
+        auto vregType = ctx.createVRegType(regSize, regAlign);
         mappedValue = V_MOV_B32::create(builder, loc, vregType, mappedValue);
       }
       initArgs.push_back(mappedValue);

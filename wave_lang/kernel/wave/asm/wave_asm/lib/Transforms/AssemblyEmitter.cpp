@@ -279,9 +279,15 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   // Accumulator offset (required for gfx9 targets) - must come before
   // next_free_vgpr
   if (llvm::isa<GFX942TargetAttr, GFX950TargetAttr>(targetKind)) {
-    // accum_offset must be in range [4, 256] and multiple of 4
-    int64_t accumOffset = std::max(int64_t(4), ((nextFreeVGPR + 3) / 4) * 4);
-    accumOffset = std::min(accumOffset, int64_t(256));
+    int64_t accumOffset = 0;
+    if (nextFreeAGPR > 0) {
+      // CDNA AGPR layout: keep accum_offset at 256 when AGPRs are used.
+      accumOffset = 256;
+    } else {
+      // No AGPRs used: keep accum_offset within the allocated VGPR range.
+      accumOffset = std::max(int64_t(4), ((nextFreeVGPR + 3) / 4) * 4);
+      accumOffset = std::min(accumOffset, nextFreeVGPR);
+    }
     lines.push_back("  .amdhsa_accum_offset " + std::to_string(accumOffset));
     if (nextFreeAGPR > 0) {
       // On CDNA targets AGPRs share the unified file after accum_offset.
@@ -710,7 +716,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
   return llvm::TypeSwitch<Operation *, std::optional<std::string>>(op)
       // Skip non-instruction ops
       .Case<ProgramOp, LabelOp, CommentOp, RawOp, PrecoloredVRegOp,
-            PrecoloredSRegOp, ConstantOp, PackOp, ExtractOp>(
+            PrecoloredSRegOp, PrecoloredARegOp, ConstantOp, PackOp, ExtractOp>(
           [](auto) { return std::nullopt; })
 
       // Wait count operations
@@ -865,31 +871,103 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
       .Case<S_BARRIER>([](auto) { return std::string("  s_barrier"); })
       .Case<S_ENDPGM>([](auto) { return std::string("  s_endpgm"); })
 
-      // V_MOV_B32 with multi-element handling
+      // V_MOV_B32 with multi-element handling and AGPR support.
+      // When the destination is an AGPR, emit v_accvgpr_write_b32 instead.
+      // This enables AGPR zero-init for MFMA accumulator loop init args.
       .Case<V_MOV_B32>([&](V_MOV_B32 movOp) -> std::optional<std::string> {
         Value result = movOp.getDst();
+        Value srcVal = movOp.getSrc();
         int64_t size = getRegSize(result.getType());
+        bool isAGPR = isAGPRType(result.getType());
+        bool srcIsImm = isa<ImmType>(srcVal.getType());
+
         if (size > 1) {
           int64_t baseIdx = mapping.getPhysReg(result);
           if (baseIdx < 0) {
             if (auto pvreg = dyn_cast<PVRegType>(result.getType())) {
               baseIdx = pvreg.getIndex();
+            } else if (auto pareg = dyn_cast<PARegType>(result.getType())) {
+              baseIdx = pareg.getIndex();
             }
           }
           if (baseIdx >= 0) {
-            std::string src = resolveValue(movOp.getSrc());
+            std::string src = resolveValue(srcVal);
             std::string lines;
-            for (int64_t i = 0; i < size; ++i) {
-              if (i > 0)
-                lines += "\n";
-              lines +=
-                  "  v_mov_b32 v" + std::to_string(baseIdx + i) + ", " + src;
+            if (isAGPR) {
+              // v_accvgpr_write_b32 requires a VGPR source in this backend.
+              // Materialize immediate sources into the reserved scratch VGPR.
+              std::string writeSrc = src;
+              if (srcIsImm) {
+                lines += "  v_mov_b32 " + formatVGPRRange(kScratchVGPR, 1) +
+                         ", " + src;
+                writeSrc = formatVGPRRange(kScratchVGPR, 1);
+                peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
+              }
+              for (int64_t i = 0; i < size; ++i) {
+                if (!lines.empty())
+                  lines += "\n";
+                lines += "  v_accvgpr_write_b32 a" + std::to_string(baseIdx + i) +
+                         ", " + writeSrc;
+              }
+            } else {
+              for (int64_t i = 0; i < size; ++i) {
+                if (i > 0)
+                  lines += "\n";
+                lines += "  v_mov_b32 v" + std::to_string(baseIdx + i) + ", " +
+                         src;
+              }
             }
             return lines;
           }
         }
+        if (isAGPR) {
+          if (srcIsImm) {
+            std::string src = resolveValue(srcVal);
+            std::string scratch = formatVGPRRange(kScratchVGPR, 1);
+            peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
+            return "  v_mov_b32 " + scratch + ", " + src +
+                   "\n  v_accvgpr_write_b32 " + resolveValue(result) + ", " +
+                   scratch;
+          }
+          return emitDefaultFormat(movOp, "v_accvgpr_write_b32");
+        }
         return emitDefaultFormat(movOp, "v_mov_b32");
       })
+
+      // V_ACCVGPR_READ_B32 with multi-element handling.
+      // Per-lane instruction: expands one read per AGPR element.
+      .Case<V_ACCVGPR_READ_B32>(
+          [&](V_ACCVGPR_READ_B32 readOp) -> std::optional<std::string> {
+            Value result = readOp.getDst();
+            Value src = readOp.getSrc();
+            int64_t size = getRegSize(result.getType());
+
+            if (size > 1) {
+              // Get base indices for destination VGPR and source AGPR
+              int64_t dstBase = mapping.getPhysReg(result);
+              if (dstBase < 0) {
+                if (auto pvreg = dyn_cast<PVRegType>(result.getType()))
+                  dstBase = pvreg.getIndex();
+              }
+              int64_t srcBase = mapping.getPhysReg(src);
+              if (srcBase < 0) {
+                if (auto pareg = dyn_cast<PARegType>(src.getType()))
+                  srcBase = pareg.getIndex();
+              }
+              if (dstBase >= 0 && srcBase >= 0) {
+                std::string lines;
+                for (int64_t i = 0; i < size; ++i) {
+                  if (i > 0)
+                    lines += "\n";
+                  lines += "  v_accvgpr_read_b32 v" +
+                           std::to_string(dstBase + i) + ", a" +
+                           std::to_string(srcBase + i);
+                }
+                return lines;
+              }
+            }
+            return emitDefaultFormat(readOp, "v_accvgpr_read_b32");
+          })
 
       // Scaled MFMA: append cbsz and blgp modifiers for data format.
       // Shared lambda to avoid duplication between 16x16x128 and 32x32x64.
@@ -1163,22 +1241,38 @@ std::string KernelGenerator::generateRaw(RawOp rawOp) {
 // Check if a VALU instruction needs literal materialization (v_mov_b32 +
 // scratch VGPR) for immediate operands outside the inline constant range.
 //
-// On AMDGCN, VOP2 instructions (v_add_u32, v_sub_u32, v_and_b32, etc.) and
-// VOP3 instructions (v_mul_lo_u32, v_mad_*, v_lshl_or_b32, etc.) cannot
-// accept literal constants outside the inline range [-16, 64] without
-// special encoding.  Rather than tracking which encoding each instruction
-// uses, we conservatively apply literal materialization to all v_*
-// instructions except v_mov_b32 (which natively supports 32-bit literals as
-// VOP1).
+// On AMDGCN:
+// - VOP1 instructions (v_mov_b32) natively support 32-bit literals.
+// - VOP2 instructions (v_add_u32, v_sub_u32, v_and_b32, v_or_b32, etc.)
+//   support ONE 32-bit literal as src0.  We can emit the literal directly
+//   without materialization, eliminating the extra v_mov_b32 and its VGPR.
+// - VOP3 instructions (v_mul_lo_u32, v_lshl_add_u32, v_lshl_or_b32,
+//   v_mad_u32_u24, etc.) and VOP3-only instructions need materialization
+//   for non-inline literals since VOP3 encoding can hold only one literal
+//   and some instructions have 3 source operands.
+//
+// We only materialize for instructions that truly need it (VOP3 and up).
 static bool needsLiteralMaterialization(llvm::StringRef mnemonic) {
   if (!mnemonic.starts_with("v_"))
     return false;
-  // v_mov_b32 is VOP1 and supports 32-bit literal operands natively
+  // VOP1: v_mov_b32 supports 32-bit literal natively
   if (mnemonic == "v_mov_b32")
     return false;
   // v_cmp_* are emitted with _e64 suffix (VOP3) which supports literals
   if (mnemonic.starts_with("v_cmp_"))
     return false;
+  // VOP2 instructions: support 32-bit literal as src0 — no materialization
+  // needed. These common ALU ops can embed the literal in the instruction
+  // word, saving a v_mov_b32 and a scratch VGPR.
+  if (mnemonic == "v_add_u32" || mnemonic == "v_sub_u32" ||
+      mnemonic == "v_subrev_u32" || mnemonic == "v_and_b32" ||
+      mnemonic == "v_or_b32" || mnemonic == "v_xor_b32" ||
+      mnemonic == "v_lshlrev_b32" || mnemonic == "v_lshrrev_b32" ||
+      mnemonic == "v_ashrrev_i32" || mnemonic == "v_max_u32" ||
+      mnemonic == "v_min_u32" || mnemonic == "v_add_i32" ||
+      mnemonic == "v_sub_i32")
+    return false;
+  // VOP3 and everything else: needs materialization
   return true;
 }
 
