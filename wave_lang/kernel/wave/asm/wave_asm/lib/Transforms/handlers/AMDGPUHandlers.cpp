@@ -594,7 +594,28 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
           if (auto immType = dyn_cast<ImmType>(rowContrib.getType())) {
             rowConstBytes = immType.getValue() * ldsRowStride;
             rowIsConst = true;
+          } else if (!isVGPRType(rowContrib.getType())) {
+            // Row index is an SGPR (e.g., from subgroup_broadcast via
+            // v_readfirstlane). Keep computation in SALU to avoid
+            // unnecessary VGPR pressure.
+            auto sregType = ctx.createSRegType();
+            if (llvm::isPowerOf2_64(ldsRowStride)) {
+              int64_t shiftAmt = llvm::Log2_64(ldsRowStride);
+              auto shiftImm = ctx.createImmType(shiftAmt);
+              auto shiftConst =
+                  ConstantOp::create(builder, loc, shiftImm, shiftAmt);
+              rowContrib = S_LSHL_B32::create(builder, loc, sregType,
+                                              rowContrib, shiftConst);
+            } else {
+              auto strideImm = ctx.createImmType(ldsRowStride);
+              auto strideConst =
+                  ConstantOp::create(builder, loc, strideImm, ldsRowStride);
+              rowContrib = S_MUL_I32::create(builder, loc, sregType,
+                                             rowContrib, strideConst);
+            }
+            rowIsConst = false;
           } else {
+            // Row index is a VGPR: use VALU multiply
             auto strideImm = ctx.createImmType(ldsRowStride);
             auto strideConst =
                 ConstantOp::create(builder, loc, strideImm, ldsRowStride);
@@ -690,17 +711,46 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
                                         m0Val, colConst);
             }
           } else if (colDynamic) {
-            m0Val = convertToVgpr(m0Val);
-            Value colVgpr = convertToVgpr(colDynamic);
-            if (ldsElemBytes > 1) {
-              auto scaleImm = ctx.createImmType(ldsElemBytes);
-              auto scaleConst =
-                  ConstantOp::create(builder, loc, scaleImm, ldsElemBytes);
-              colVgpr = V_MUL_LO_U32::create(builder, loc, ctx.createVRegType(),
-                                             colVgpr, scaleConst);
+            bool colIsSgpr = !isVGPRType(colDynamic.getType()) &&
+                             !isa<ImmType>(colDynamic.getType());
+            bool m0IsSgpr = m0Val && !isVGPRType(m0Val.getType());
+            if (colIsSgpr && m0IsSgpr) {
+              // Both SGPR: stay in SALU domain
+              Value colVal = colDynamic;
+              if (ldsElemBytes > 1) {
+                auto sregType = ctx.createSRegType();
+                if (llvm::isPowerOf2_64(ldsElemBytes)) {
+                  int64_t shiftAmt = llvm::Log2_64(ldsElemBytes);
+                  auto shiftImm = ctx.createImmType(shiftAmt);
+                  auto shiftConst =
+                      ConstantOp::create(builder, loc, shiftImm, shiftAmt);
+                  colVal = S_LSHL_B32::create(builder, loc, sregType, colVal,
+                                              shiftConst);
+                } else {
+                  auto scaleImm = ctx.createImmType(ldsElemBytes);
+                  auto scaleConst =
+                      ConstantOp::create(builder, loc, scaleImm, ldsElemBytes);
+                  colVal = S_MUL_I32::create(builder, loc, sregType, colVal,
+                                             scaleConst);
+                }
+              }
+              auto sregType = ctx.createSRegType();
+              m0Val =
+                  S_ADD_U32::create(builder, loc, sregType, m0Val, colVal);
+            } else {
+              // At least one is VGPR: fall back to VALU
+              m0Val = convertToVgpr(m0Val);
+              Value colVgpr = convertToVgpr(colDynamic);
+              if (ldsElemBytes > 1) {
+                auto scaleImm = ctx.createImmType(ldsElemBytes);
+                auto scaleConst =
+                    ConstantOp::create(builder, loc, scaleImm, ldsElemBytes);
+                colVgpr = V_MUL_LO_U32::create(
+                    builder, loc, ctx.createVRegType(), colVgpr, scaleConst);
+              }
+              m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(),
+                                        m0Val, colVgpr);
             }
-            m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(), m0Val,
-                                      colVgpr);
           }
         }
 
