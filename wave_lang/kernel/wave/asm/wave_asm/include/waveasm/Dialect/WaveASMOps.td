@@ -110,7 +110,7 @@ class SALUBinaryOp<string mnemonic, list<Trait> traits = []>
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, traits> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
-  let results = (outs WaveASM_AnySReg:$result);  // SCC result (see note above)
+  let results = (outs WaveASM_AnySGPR:$result);  // SCC result (see note above)
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($result)";
 }
 

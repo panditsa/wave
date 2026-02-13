@@ -101,11 +101,33 @@ LivenessInfo computeLiveness(ProgramOp program) {
   for (int64_t idx = 0; idx < static_cast<int64_t>(ops.size()); ++idx) {
     Operation *op = ops[idx];
 
-    // Process defs: results are definitions
-    for (Value def : op->getResults()) {
-      if (isVirtualRegType(def.getType())) {
-        if (!info.defPoints.contains(def)) {
-          info.defPoints[def] = idx;
+    // Process defs: results are definitions.
+    // For LoopOp results, the def point should be AFTER the loop body,
+    // not at the LoopOp itself. Loop results are only available after
+    // the loop exits, so their live ranges should not overlap with the
+    // loop body. Using the LoopOp index would inflate register pressure
+    // by keeping these results "live" throughout the entire loop.
+    if (isa<LoopOp>(op)) {
+      // Find the next sibling op after this LoopOp in the parent block
+      Operation *nextOp = op->getNextNode();
+      if (nextOp) {
+        auto nextIt = opToIdx.find(nextOp);
+        if (nextIt != opToIdx.end()) {
+          for (Value def : op->getResults()) {
+            if (isVirtualRegType(def.getType())) {
+              if (!info.defPoints.contains(def)) {
+                info.defPoints[def] = nextIt->second;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (Value def : op->getResults()) {
+        if (isVirtualRegType(def.getType())) {
+          if (!info.defPoints.contains(def)) {
+            info.defPoints[def] = idx;
+          }
         }
       }
     }

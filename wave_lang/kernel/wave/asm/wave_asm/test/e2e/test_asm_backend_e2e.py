@@ -1437,9 +1437,10 @@ def _dbuf_mxfp4_helper(
 
 @pytest.mark.xfail(
     reason="C++ backend linear scan register allocator exceeds VGPR limit "
-    "(~899 VGPRs needed vs 256 limit) for 4-wave MXFP4 double-buffered "
+    "(~643 VGPRs needed vs 256 limit) for 4-wave MXFP4 double-buffered "
     "kernel. Each wave handles 2x M-work vs 8-wave, doubling accumulators "
-    "and tile data. Needs AccVGPR support or instruction scheduling.",
+    "and tile data. Loop result liveness fix reduced pressure from ~899 "
+    "but still needs AccVGPR support to fit in 256 VGPRs.",
     strict=True,
 )
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
@@ -1463,11 +1464,11 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
 
 
 @pytest.mark.xfail(
-    reason="C++ backend linear scan register allocator exceeds VGPR limit "
-    "(~481 VGPRs needed vs 256 limit) for 8-wave MXFP4 double-buffered "
-    "kernel with 64 accumulator iter_args (256 VGPRs) + 128 VGPRs tile "
-    "data + 32 VGPRs scales. Needs AccVGPR support or instruction "
-    "scheduling to reduce peak live ranges.",
+    reason="8-wave MXFP4 double-buffered kernel passes register allocation "
+    "after loop result liveness fix (was ~481 VGPRs, now fits in 256) but "
+    "fails at assembly stage with 'too large value for lgkmcnt' error. "
+    "The waitcnt insertion pass emits lgkmcnt(19) which exceeds the "
+    "hardware limit. Needs waitcnt pass fix to cap lgkmcnt values.",
     strict=True,
 )
 def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
