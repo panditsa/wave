@@ -13,6 +13,7 @@
 // wait threshold and inserts s_waitcnt if required.
 //===----------------------------------------------------------------------===//
 
+#include "waveasm/Dialect/WaveASMAttrs.h"
 #include "waveasm/Dialect/WaveASMDialect.h"
 #include "waveasm/Dialect/WaveASMOps.h"
 #include "waveasm/Transforms/Passes.h"
@@ -205,6 +206,23 @@ private:
   void processProgram(ProgramOp program) {
     Ticketing ticketing;
 
+    // Get target-specific waitcnt limits. GFX9 uses 4-bit lgkmcnt (max 15).
+    // When computed threshold exceeds the limit, we must use 0 (full drain).
+    int64_t maxLgkmcnt = 15;
+    int64_t maxVmcnt = 63;
+    if (auto targetAttr = program.getTarget()) {
+      TargetAttrInterface targetKind = targetAttr.getTargetKind();
+      maxLgkmcnt = targetKind.getMaxLgkmcnt();
+      maxVmcnt = targetKind.getMaxVmcnt();
+    }
+
+    auto capLgkmcnt = [maxLgkmcnt](int64_t v) {
+      return v > maxLgkmcnt ? int64_t(0) : v;
+    };
+    auto capVmcnt = [maxVmcnt](int64_t v) {
+      return v > maxVmcnt ? int64_t(0) : v;
+    };
+
     // Map from Value to the ticket that produces it
     llvm::DenseMap<Value, std::pair<MemOpKind, int64_t>> valueTickets;
 
@@ -246,7 +264,7 @@ private:
 
       // Barriers require all memory to be synchronized before execution.
       // Insert waits for any outstanding VMEM/LGKM operations before the
-      // barrier.
+      // barrier. Always use full drain (0) since barriers need complete sync.
       if (isa<S_BARRIER>(op)) {
         // Check if we need waits before this barrier
         auto vmemWait = ticketing.computeVmemWait(0);
@@ -311,22 +329,26 @@ private:
             OpBuilder builder(op->getContext());
             builder.setInsertionPoint(op);
 
+            int64_t vmcntVal =
+                neededVmcnt.has_value() ? capVmcnt(*neededVmcnt) : 0;
+            int64_t lgkmcntVal =
+                neededLgkmcnt.has_value() ? capLgkmcnt(*neededLgkmcnt) : 0;
+
             if (neededVmcnt.has_value() && neededLgkmcnt.has_value()) {
               S_WAITCNT::create(builder, op->getLoc(),
-                                builder.getI32IntegerAttr(*neededVmcnt),
-                                builder.getI32IntegerAttr(*neededLgkmcnt),
+                                builder.getI32IntegerAttr(vmcntVal),
+                                builder.getI32IntegerAttr(lgkmcntVal),
                                 IntegerAttr());
-              ticketing.observeVmemWait(*neededVmcnt);
-              ticketing.observeLgkmWait(*neededLgkmcnt);
+              ticketing.observeVmemWait(vmcntVal);
+              ticketing.observeLgkmWait(lgkmcntVal);
             } else if (neededVmcnt.has_value()) {
               S_WAITCNT_VMCNT::create(builder, op->getLoc(),
-                                      builder.getI32IntegerAttr(*neededVmcnt));
-              ticketing.observeVmemWait(*neededVmcnt);
+                                      builder.getI32IntegerAttr(vmcntVal));
+              ticketing.observeVmemWait(vmcntVal);
             } else {
-              S_WAITCNT_LGKMCNT::create(
-                  builder, op->getLoc(),
-                  builder.getI32IntegerAttr(*neededLgkmcnt));
-              ticketing.observeLgkmWait(*neededLgkmcnt);
+              S_WAITCNT_LGKMCNT::create(builder, op->getLoc(),
+                                        builder.getI32IntegerAttr(lgkmcntVal));
+              ticketing.observeLgkmWait(lgkmcntVal);
             }
             numWaitcntInserted++;
           }
@@ -404,21 +426,27 @@ private:
         OpBuilder builder(op->getContext());
         builder.setInsertionPoint(op);
 
+        int64_t vmcntVal =
+            neededVmcnt.has_value() ? capVmcnt(*neededVmcnt) : 0;
+        int64_t lgkmcntVal =
+            neededLgkmcnt.has_value() ? capLgkmcnt(*neededLgkmcnt) : 0;
+
         // Use combined s_waitcnt if both are needed
         if (neededVmcnt.has_value() && neededLgkmcnt.has_value()) {
-          S_WAITCNT::create(
-              builder, op->getLoc(), builder.getI32IntegerAttr(*neededVmcnt),
-              builder.getI32IntegerAttr(*neededLgkmcnt), IntegerAttr());
-          ticketing.observeVmemWait(*neededVmcnt);
-          ticketing.observeLgkmWait(*neededLgkmcnt);
+          S_WAITCNT::create(builder, op->getLoc(),
+                            builder.getI32IntegerAttr(vmcntVal),
+                            builder.getI32IntegerAttr(lgkmcntVal),
+                            IntegerAttr());
+          ticketing.observeVmemWait(vmcntVal);
+          ticketing.observeLgkmWait(lgkmcntVal);
         } else if (neededVmcnt.has_value()) {
           S_WAITCNT_VMCNT::create(builder, op->getLoc(),
-                                  builder.getI32IntegerAttr(*neededVmcnt));
-          ticketing.observeVmemWait(*neededVmcnt);
+                                  builder.getI32IntegerAttr(vmcntVal));
+          ticketing.observeVmemWait(vmcntVal);
         } else {
           S_WAITCNT_LGKMCNT::create(builder, op->getLoc(),
-                                    builder.getI32IntegerAttr(*neededLgkmcnt));
-          ticketing.observeLgkmWait(*neededLgkmcnt);
+                                    builder.getI32IntegerAttr(lgkmcntVal));
+          ticketing.observeLgkmWait(lgkmcntVal);
         }
         numWaitcntInserted++;
       }

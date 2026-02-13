@@ -518,19 +518,7 @@ class _MemoryHandlers:
         total_bytes = num_elements * element_bytes
 
         # Alignment depends on load size
-        # ds_read_u8 is byte-aligned, ds_read_u16 is 2-byte, ds_read_b32 is
-        # 4-byte aligned, etc.  Using exact alignment lets the offset-folding
-        # optimiser emit the offset: field for narrow loads too.
-        if total_bytes >= 16:
-            DS_ALIGN = 16
-        elif total_bytes >= 8:
-            DS_ALIGN = 8
-        elif total_bytes >= 4:
-            DS_ALIGN = 4
-        elif total_bytes >= 2:
-            DS_ALIGN = 2
-        else:
-            DS_ALIGN = 1
+        DS_ALIGN = 16 if total_bytes == 16 else (8 if total_bytes == 8 else 4)
 
         if DEBUG_DS_OFFSET:
             print(f"[DS_OFFSET_DEBUG] memref={memref_ssa[:60]}...")
@@ -613,8 +601,7 @@ class _MemoryHandlers:
         else:
             raise NotImplementedError(
                 f"LDS load of {total_bytes} bytes not supported. "
-                f"Expected 1 (ds_read_u8), 2 (ds_read_u16), 4 (ds_read_b32), "
-                f"8 (ds_read_b64), or 16 (ds_read_b128) bytes."
+                f"Expected 4 (ds_read_b32), 8 (ds_read_b64), or 16 (ds_read_b128) bytes."
             )
 
         # Track in SSA mapping as tuple of KVReg

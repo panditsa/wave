@@ -1464,11 +1464,11 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
 
 
 @pytest.mark.xfail(
-    reason="8-wave MXFP4 double-buffered kernel passes register allocation "
-    "after loop result liveness fix (was ~481 VGPRs, now fits in 256) but "
-    "fails at assembly stage with 'too large value for lgkmcnt' error. "
-    "The waitcnt insertion pass emits lgkmcnt(19) which exceeds the "
-    "hardware limit. Needs waitcnt pass fix to cap lgkmcnt values.",
+    reason="C++ backend register allocator needs ~260 VGPRs for 8-wave MXFP4 "
+    "double-buffered kernel (exceeds 256 limit). The tied-register fix "
+    "correctly reserves loop result registers at the loop boundary, "
+    "exposing the true VGPR pressure. Needs AccVGPR support to move 128 "
+    "accumulator VGPRs off the regular VGPR budget.",
     strict=True,
 )
 def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
