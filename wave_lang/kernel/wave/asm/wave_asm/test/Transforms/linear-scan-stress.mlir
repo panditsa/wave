@@ -525,3 +525,26 @@ waveasm.program @large_alignment
   // CHECK: waveasm.s_endpgm
   waveasm.s_endpgm
 }
+
+//===----------------------------------------------------------------------===//
+// Test 13: AGPR allocation smoke test
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: waveasm.program @agpr_pressure_smoke
+// CHECK-NOT: Failed to allocate
+waveasm.program @agpr_pressure_smoke
+  target = #waveasm.target<#waveasm.gfx950, 5>
+  abi = #waveasm.abi<> {
+  %a = waveasm.precolored.vreg 0, 4 : !waveasm.pvreg<0, 4>
+  %b = waveasm.precolored.vreg 4, 4 : !waveasm.pvreg<4, 4>
+  %acc0 = waveasm.precolored.areg 16, 4 : !waveasm.pareg<16, 4>
+  %acc1 = waveasm.precolored.areg 20, 4 : !waveasm.pareg<20, 4>
+
+  // CHECK: -> !waveasm.pareg<16, 4>
+  %r0 = waveasm.v_mfma_f32_16x16x16_f16 %a, %b, %acc0
+      : !waveasm.pvreg<0, 4>, !waveasm.pvreg<4, 4>, !waveasm.pareg<16, 4> -> !waveasm.areg<4, 4>
+  // CHECK: -> !waveasm.pareg<20, 4>
+  %r1 = waveasm.v_mfma_f32_16x16x16_f16 %a, %b, %acc1
+      : !waveasm.pvreg<0, 4>, !waveasm.pvreg<4, 4>, !waveasm.pareg<20, 4> -> !waveasm.areg<4, 4>
+  waveasm.s_endpgm
+}

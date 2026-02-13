@@ -1436,11 +1436,10 @@ def _dbuf_mxfp4_helper(
 
 
 @pytest.mark.xfail(
-    reason="C++ backend linear scan register allocator exceeds VGPR limit "
-    "(~629 VGPRs needed vs 256 limit) for 4-wave MXFP4 double-buffered "
-    "kernel. Each wave handles 2x M-work vs 8-wave, doubling accumulators "
-    "and tile data. Loop result liveness fix reduced from ~899, memory "
-    "offset opt reduced from ~643. Still needs AccVGPR support.",
+    reason="C++ backend linear scan register allocator still exceeds VGPR "
+    "limit (currently ~545 VGPRs vs 256 limit) for 4-wave MXFP4 "
+    "double-buffered kernel. AGPR plumbing reduced pressure but this shape "
+    "still needs additional pressure reduction and/or broader AGPR usage.",
     strict=True,
 )
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
@@ -1464,11 +1463,10 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
 
 
 @pytest.mark.xfail(
-    reason="C++ backend register allocator needs ~260 VGPRs for 8-wave MXFP4 "
-    "double-buffered kernel (exceeds 256 limit). The tied-register fix "
-    "correctly reserves loop result registers at the loop boundary, "
-    "exposing the true VGPR pressure. Needs AccVGPR support to move 128 "
-    "accumulator VGPRs off the regular VGPR budget.",
+    reason="C++ backend register allocator still exceeds the 256 VGPR limit "
+    "for 8-wave MXFP4 double-buffered kernel (currently ~279 VGPRs). "
+    "AGPR support is partially wired but accumulator flows are not yet "
+    "fully moved off the VGPR budget in this e2e pipeline.",
     strict=True,
 )
 def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):

@@ -113,19 +113,20 @@ llvm::SmallVector<std::string> MetadataEmitter::emitPrologue() {
   return lines;
 }
 
-llvm::SmallVector<std::string> MetadataEmitter::emitEpilogue(int64_t peakVGPRs,
-                                                             int64_t peakSGPRs,
-                                                             int64_t ldsSize) {
+llvm::SmallVector<std::string>
+MetadataEmitter::emitEpilogue(int64_t peakVGPRs, int64_t peakSGPRs,
+                              int64_t peakAGPRs, int64_t ldsSize) {
   llvm::SmallVector<std::string> lines;
 
   // Kernel descriptor
-  auto descriptor = emitKernelDescriptor(peakVGPRs, peakSGPRs, ldsSize);
+  auto descriptor =
+      emitKernelDescriptor(peakVGPRs, peakSGPRs, peakAGPRs, ldsSize);
   lines.append(descriptor.begin(), descriptor.end());
 
   lines.push_back("");
 
   // Metadata YAML
-  auto metadata = emitMetadataYAML(peakVGPRs, peakSGPRs, ldsSize);
+  auto metadata = emitMetadataYAML(peakVGPRs, peakSGPRs, peakAGPRs, ldsSize);
   lines.append(metadata.begin(), metadata.end());
 
   return lines;
@@ -188,7 +189,7 @@ static void scanSystemRegisterUsage(ProgramOp program, bool &usesWorkgroupIdX,
 
 llvm::SmallVector<std::string>
 MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
-                                      int64_t ldsSize) {
+                                      int64_t peakAGPRs, int64_t ldsSize) {
   llvm::SmallVector<std::string> lines;
   std::string symName = program.getSymName().str();
 
@@ -264,6 +265,8 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   }
   int64_t nextFreeVGPR =
       ((peakVGPRs + vgprGranularity - 1) / vgprGranularity) * vgprGranularity;
+  int64_t nextFreeAGPR =
+      ((peakAGPRs + vgprGranularity - 1) / vgprGranularity) * vgprGranularity;
 
   int64_t sgprGranularity = 8;
   int64_t nextFreeSGPR =
@@ -278,7 +281,13 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   if (llvm::isa<GFX942TargetAttr, GFX950TargetAttr>(targetKind)) {
     // accum_offset must be in range [4, 256] and multiple of 4
     int64_t accumOffset = std::max(int64_t(4), ((nextFreeVGPR + 3) / 4) * 4);
+    accumOffset = std::min(accumOffset, int64_t(256));
     lines.push_back("  .amdhsa_accum_offset " + std::to_string(accumOffset));
+    if (nextFreeAGPR > 0) {
+      // On CDNA targets AGPRs share the unified file after accum_offset.
+      // next_free_vgpr encodes unified usage when AGPRs are present.
+      nextFreeVGPR = accumOffset + nextFreeAGPR;
+    }
   }
 
   // Register counts
@@ -329,7 +338,7 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
 
 llvm::SmallVector<std::string>
 MetadataEmitter::emitMetadataYAML(int64_t peakVGPRs, int64_t peakSGPRs,
-                                  int64_t ldsSize) {
+                                  int64_t peakAGPRs, int64_t ldsSize) {
   llvm::SmallVector<std::string> lines;
   std::string symName = program.getSymName().str();
 
@@ -377,6 +386,8 @@ MetadataEmitter::emitMetadataYAML(int64_t peakVGPRs, int64_t peakSGPRs,
   // VGPR/SGPR counts
   lines.push_back("    .sgpr_count: " + std::to_string(peakSGPRs));
   lines.push_back("    .vgpr_count: " + std::to_string(peakVGPRs));
+  if (peakAGPRs > 0)
+    lines.push_back("    .agpr_count: " + std::to_string(peakAGPRs));
 
   // Max flat workgroup size
   auto workgroupSize = program.getWorkgroupSize();
@@ -428,6 +439,9 @@ std::string KernelGenerator::resolveValue(Value value) {
   if (auto psreg = dyn_cast<PSRegType>(ty)) {
     return formatSGPRRange(psreg.getIndex(), psreg.getSize());
   }
+  if (auto pareg = dyn_cast<PARegType>(ty)) {
+    return formatAGPRRange(pareg.getIndex(), pareg.getSize());
+  }
 
   // Handle virtual registers (look up in mapping)
   if (isVirtualRegType(ty)) {
@@ -436,6 +450,8 @@ std::string KernelGenerator::resolveValue(Value value) {
       int64_t size = getRegSize(ty);
       if (isVGPRType(ty)) {
         return formatVGPRRange(physIdx, size);
+      } else if (isAGPRType(ty)) {
+        return formatAGPRRange(physIdx, size);
       } else {
         return formatSGPRRange(physIdx, size);
       }
@@ -626,6 +642,12 @@ std::string KernelGenerator::resolveScalarValue(Value value) {
   if (auto psreg = dyn_cast<PSRegType>(ty)) {
     if (psreg.getSize() > 1) {
       return formatSGPRRange(psreg.getIndex(), 1);
+    }
+  }
+  // For multi-register physical AGPRs, use only the first register
+  if (auto pareg = dyn_cast<PARegType>(ty)) {
+    if (pareg.getSize() > 1) {
+      return formatAGPRRange(pareg.getIndex(), 1);
     }
   }
   return resolveValue(value);
@@ -1248,6 +1270,7 @@ llvm::SmallVector<std::string> KernelGenerator::generate() {
   // register.
   peakVGPRs = 0;
   peakSGPRs = 0;
+  peakAGPRs = 0;
   program.walk([&](Operation *preOp) {
     for (Value result : preOp->getResults()) {
       Type ty = result.getType();
@@ -1255,12 +1278,16 @@ llvm::SmallVector<std::string> KernelGenerator::generate() {
         peakVGPRs = std::max(peakVGPRs, pvreg.getIndex() + pvreg.getSize());
       } else if (auto psreg = dyn_cast<PSRegType>(ty)) {
         peakSGPRs = std::max(peakSGPRs, psreg.getIndex() + psreg.getSize());
+      } else if (auto pareg = dyn_cast<PARegType>(ty)) {
+        peakAGPRs = std::max(peakAGPRs, pareg.getIndex() + pareg.getSize());
       } else if (isVirtualRegType(ty)) {
         int64_t size = getRegSize(ty);
         int64_t physIdx = mapping.getPhysReg(result);
         if (physIdx >= 0) {
           if (isVGPRType(ty))
             peakVGPRs = std::max(peakVGPRs, physIdx + size);
+          else if (isAGPRType(ty))
+            peakAGPRs = std::max(peakAGPRs, physIdx + size);
           else if (isSGPRType(ty))
             peakSGPRs = std::max(peakSGPRs, physIdx + size);
         }
@@ -1272,6 +1299,8 @@ llvm::SmallVector<std::string> KernelGenerator::generate() {
         peakVGPRs = std::max(peakVGPRs, pvreg.getIndex() + pvreg.getSize());
       else if (auto psreg = dyn_cast<PSRegType>(ty))
         peakSGPRs = std::max(peakSGPRs, psreg.getIndex() + psreg.getSize());
+      else if (auto pareg = dyn_cast<PARegType>(ty))
+        peakAGPRs = std::max(peakAGPRs, pareg.getIndex() + pareg.getSize());
     }
   });
   peakVGPRs = std::max(peakVGPRs, int64_t(1));
@@ -1300,7 +1329,8 @@ llvm::SmallVector<std::string> KernelGenerator::generate() {
 
   // Emit epilogue
   int64_t ldsSize = program.getLdsSize().value_or(0);
-  auto epilogue = metaEmitter.emitEpilogue(peakVGPRs, peakSGPRs, ldsSize);
+  auto epilogue =
+      metaEmitter.emitEpilogue(peakVGPRs, peakSGPRs, peakAGPRs, ldsSize);
   lines.append(epilogue.begin(), epilogue.end());
 
   return lines;

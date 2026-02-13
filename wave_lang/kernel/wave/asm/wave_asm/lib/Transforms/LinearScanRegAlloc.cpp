@@ -91,7 +91,8 @@ static std::optional<int64_t> tryAllocate(RegPool &pool, int64_t size,
 static LogicalResult allocateRegClass(
     ArrayRef<LiveRange> ranges, RegPool &pool, PhysicalMapping &mapping,
     AllocationStats &stats, const llvm::DenseMap<Value, Value> &tiedOperands,
-    const llvm::DenseMap<Value, int64_t> &precoloredValues, bool isVGPR,
+    const llvm::DenseMap<Value, int64_t> &precoloredValues,
+    llvm::StringRef regClassName,
     ProgramOp program, int64_t maxRegs, int64_t maxPressure) {
 
   llvm::SmallVector<ActiveRange> active;
@@ -166,9 +167,9 @@ static LogicalResult allocateRegClass(
     physReg = tryAllocate(pool, range.size, range.alignment);
 
     if (!physReg) {
-      return program.emitOpError()
-             << "Failed to allocate " << (isVGPR ? "VGPR" : "SGPR")
-             << " for value. Peak pressure: " << maxPressure
+      return program.emitOpError() << "Failed to allocate " << regClassName
+                                   << " for value. Peak pressure: "
+                                   << maxPressure
              << ", limit: " << maxRegs;
     }
 
@@ -203,16 +204,21 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
 
   stats.totalVRegs = liveness.vregRanges.size();
   stats.totalSRegs = liveness.sregRanges.size();
+  stats.totalARegs = liveness.aregRanges.size();
 
   // Step 3: Create register pools with reserved registers
   RegPool vgprPool(RegClass::VGPR, maxVGPRs, reservedVGPRs);
   RegPool sgprPool(RegClass::SGPR, maxSGPRs, reservedSGPRs);
+  RegPool agprPool(RegClass::AGPR, maxAGPRs, reservedAGPRs);
 
   // Step 4: Handle precolored values (from ABI args like tid, kernarg)
   for (const auto &[value, physIdx] : precoloredValues) {
     if (isVGPRType(value.getType())) {
       mapping.valueToPhysReg[value] = physIdx;
       vgprPool.reserve(physIdx, getRegSize(value.getType()));
+    } else if (isAGPRType(value.getType())) {
+      mapping.valueToPhysReg[value] = physIdx;
+      agprPool.reserve(physIdx, getRegSize(value.getType()));
     } else if (isSGPRType(value.getType())) {
       mapping.valueToPhysReg[value] = physIdx;
       sgprPool.reserve(physIdx, getRegSize(value.getType()));
@@ -221,8 +227,8 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
 
   // Step 5: Allocate VGPRs using linear scan
   if (failed(allocateRegClass(liveness.vregRanges, vgprPool, mapping, stats,
-                              tiedOperands, precoloredValues,
-                              /*isVGPR=*/true, program, maxVGPRs,
+                              tiedOperands, precoloredValues, "VGPR", program,
+                              maxVGPRs,
                               liveness.maxVRegPressure))) {
     return failure();
   }
@@ -230,12 +236,20 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
 
   // Step 6: Allocate SGPRs using linear scan
   if (failed(allocateRegClass(liveness.sregRanges, sgprPool, mapping, stats,
-                              tiedOperands, precoloredValues,
-                              /*isVGPR=*/false, program, maxSGPRs,
+                              tiedOperands, precoloredValues, "SGPR", program,
+                              maxSGPRs,
                               liveness.maxSRegPressure))) {
     return failure();
   }
   stats.peakSGPRs = sgprPool.getPeakUsage();
+
+  // Step 7: Allocate AGPRs using linear scan
+  if (failed(allocateRegClass(liveness.aregRanges, agprPool, mapping, stats,
+                              tiedOperands, precoloredValues, "AGPR", program,
+                              maxAGPRs, liveness.maxARegPressure))) {
+    return failure();
+  }
+  stats.peakAGPRs = agprPool.getPeakUsage();
 
   return std::make_pair(mapping, stats);
 }

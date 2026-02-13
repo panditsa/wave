@@ -253,16 +253,18 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
     accSize = 16;
   }
 
-  auto vregType = ctx.createVRegType(accSize, 4);
+  bool useAGPR = llvm::isa<GFX950TargetAttr>(ctx.getTarget());
+  Type accRegType = useAGPR ? Type(ctx.createARegType(accSize, 4))
+                            : Type(ctx.createVRegType(accSize, 4));
   Value result;
 
   // Generate the appropriate scaled MFMA instruction based on dimensions
   if (m == 16 && n == 16 && k == 128) {
     result = V_MFMA_SCALE_F32_16X16X128_F8F6F4::create(
-        builder, loc, vregType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
+        builder, loc, accRegType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
   } else if (m == 32 && n == 32 && k == 64) {
     result = V_MFMA_SCALE_F32_32X32X64_F8F6F4::create(
-        builder, loc, vregType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
+        builder, loc, accRegType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
   } else {
     return op->emitError("Unsupported scaled MFMA dimensions: ")
            << m << "x" << n << "x" << k;

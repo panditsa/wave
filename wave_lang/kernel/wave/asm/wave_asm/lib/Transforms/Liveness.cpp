@@ -298,6 +298,8 @@ LivenessInfo computeLiveness(ProgramOp program) {
       info.vregRanges.push_back(range);
     } else if (range.regClass == RegClass::SGPR) {
       info.sregRanges.push_back(range);
+    } else if (range.regClass == RegClass::AGPR) {
+      info.aregRanges.push_back(range);
     }
   }
 
@@ -310,10 +312,12 @@ LivenessInfo computeLiveness(ProgramOp program) {
 
   llvm::sort(info.vregRanges, sortByStart);
   llvm::sort(info.sregRanges, sortByStart);
+  llvm::sort(info.aregRanges, sortByStart);
 
   // Pass 5: Compute pressure
   info.maxVRegPressure = computeMaxPressure(info.vregRanges);
   info.maxSRegPressure = computeMaxPressure(info.sregRanges);
+  info.maxARegPressure = computeMaxPressure(info.aregRanges);
 
   return info;
 }

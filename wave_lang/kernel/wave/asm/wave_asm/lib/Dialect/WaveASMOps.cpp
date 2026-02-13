@@ -88,6 +88,10 @@ static LogicalResult verifyMFMAOp(MFMAOpType op) {
     accSize = vregType.getSize();
   } else if (auto pvregType = dyn_cast<PVRegType>(accType)) {
     accSize = pvregType.getSize();
+  } else if (auto aregType = dyn_cast<ARegType>(accType)) {
+    accSize = aregType.getSize();
+  } else if (auto paregType = dyn_cast<PARegType>(accType)) {
+    accSize = paregType.getSize();
   }
 
   // Get expected accumulator size from the operation name
@@ -110,6 +114,10 @@ static LogicalResult verifyMFMAOp(MFMAOpType op) {
     dstSize = vregType.getSize();
   } else if (auto pvregType = dyn_cast<PVRegType>(dstType)) {
     dstSize = pvregType.getSize();
+  } else if (auto aregType = dyn_cast<ARegType>(dstType)) {
+    dstSize = aregType.getSize();
+  } else if (auto paregType = dyn_cast<PARegType>(dstType)) {
+    dstSize = paregType.getSize();
   }
 
   if (dstSize != expectedSize) {

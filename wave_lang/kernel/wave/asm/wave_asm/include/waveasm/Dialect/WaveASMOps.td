@@ -119,8 +119,8 @@ class SALUCmpOp<string mnemonic, list<Trait> traits = []>
 // MFMA instructions support inline 0 for the accumulator (no tying needed).
 class MFMAOp<string mnemonic, int accSize, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([Pure, WaveASM_MFMAOp], traits)> {
-  let arguments = (ins WaveASM_VALUSrc:$a, WaveASM_VALUSrc:$b, WaveASM_VALUSrc:$acc);
-  let results = (outs WaveASM_AnyVGPR:$dst);
+  let arguments = (ins WaveASM_VALUSrc:$a, WaveASM_VALUSrc:$b, WaveASM_MFMAAccSrc:$acc);
+  let results = (outs WaveASM_AnyVecReg:$dst);
   let assemblyFormat = "$a `,` $b `,` $acc attr-dict `:` type($a) `,` type($b) `,` type($acc) `->` type($dst)";
 
   // Tied operand: result 0 is tied to operand 2 (accumulator) when acc is VGPR
@@ -319,6 +319,17 @@ def WaveASM_PrecoloredSRegOp : WAVEASMOp<"precolored.sreg", [Pure]> {
 
   let arguments = (ins I64Attr:$index, DefaultValuedAttr<I64Attr, "1">:$size);
   let results = (outs WaveASM_AnySGPR:$result);
+  let assemblyFormat = "$index (`,` $size^)? attr-dict `:` type($result)";
+}
+
+def WaveASM_PrecoloredARegOp : WAVEASMOp<"precolored.areg", [Pure]> {
+  let summary = "Define a precolored physical AGPR";
+  let description = [{
+    Defines an AGPR at a specific physical register index.
+  }];
+
+  let arguments = (ins I64Attr:$index, DefaultValuedAttr<I64Attr, "1">:$size);
+  let results = (outs WaveASM_AnyAGPR:$result);
   let assemblyFormat = "$index (`,` $size^)? attr-dict `:` type($result)";
 }
 
@@ -566,6 +577,21 @@ def WaveASM_V_WRITELANE_B32 : WAVEASMOp<"v_writelane_b32", [Pure]> {
   let assemblyFormat = "$src `,` $lane `,` $vdst_in attr-dict `:` type($src) `,` type($lane) `,` type($vdst_in) `->` type($dst)";
 }
 
+// VGPR/AGPR cross-bank moves
+def WaveASM_V_ACCVGPR_READ_B32 : WAVEASMOp<"v_accvgpr_read_b32", [Pure]> {
+  let summary = "Read AGPR lane into VGPR";
+  let arguments = (ins WaveASM_AnyAGPR:$src);
+  let results = (outs WaveASM_AnyVGPR:$dst);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
+}
+
+def WaveASM_V_ACCVGPR_WRITE_B32 : WAVEASMOp<"v_accvgpr_write_b32", [Pure]> {
+  let summary = "Write VGPR lane into AGPR";
+  let arguments = (ins WaveASM_AnyVGPR:$src, WaveASM_AnyAGPR:$adst);
+  let results = (outs);
+  let assemblyFormat = "$src `,` $adst attr-dict `:` type($src) `,` type($adst)";
+}
+
 //===----------------------------------------------------------------------===//
 // VALU Compare Instructions
 //===----------------------------------------------------------------------===//
@@ -759,9 +785,9 @@ def WaveASM_V_MFMA_F32_32X32X16_BF8_BF8 : MFMAOp<"v_mfma_f32_32x32x16_bf8_bf8", 
 class ScaledMFMAOp<string mnemonic, int accSize, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([Pure, WaveASM_MFMAOp], traits)> {
   // Operands: a_data, b_data, acc, a_scale, b_scale
-  let arguments = (ins WaveASM_VALUSrc:$a, WaveASM_VALUSrc:$b, WaveASM_VALUSrc:$acc,
+  let arguments = (ins WaveASM_VALUSrc:$a, WaveASM_VALUSrc:$b, WaveASM_MFMAAccSrc:$acc,
                        WaveASM_VALUSrc:$a_scale, WaveASM_VALUSrc:$b_scale);
-  let results = (outs WaveASM_AnyVGPR:$dst);
+  let results = (outs WaveASM_AnyVecReg:$dst);
   let assemblyFormat = "$a `,` $b `,` $acc `,` $a_scale `,` $b_scale attr-dict `:` type($a) `,` type($b) `,` type($acc) `,` type($a_scale) `,` type($b_scale) `->` type($dst)";
 
   // Tied operand: result 0 is tied to operand 2 (accumulator) when acc is VGPR

@@ -57,6 +57,10 @@ SRegType TranslationContext::createSRegType(int64_t size, int64_t alignment) {
   return SRegType::get(builder.getContext(), size, alignment);
 }
 
+ARegType TranslationContext::createARegType(int64_t size, int64_t alignment) {
+  return ARegType::get(builder.getContext(), size, alignment);
+}
+
 ImmType TranslationContext::createImmType(int64_t value) {
   return ImmType::get(builder.getContext(), value);
 }
