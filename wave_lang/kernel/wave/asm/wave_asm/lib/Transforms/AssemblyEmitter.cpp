@@ -871,6 +871,12 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         return std::string("  s_nop ") + std::to_string(nopOp.getCount());
       })
 
+      // Wave priority
+      .Case<S_SETPRIO>([&](S_SETPRIO prioOp) {
+        return std::string("  s_setprio ") +
+               std::to_string(prioOp.getCount());
+      })
+
       // Barrier and endpgm
       .Case<S_BARRIER>([](auto) { return std::string("  s_barrier"); })
       .Case<S_ENDPGM>([](auto) { return std::string("  s_endpgm"); })
@@ -1363,7 +1369,7 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
   }
 
   if (literalOperandIdx == 1 && isCommutative && op->getNumOperands() == 2) {
-    // Literal is in src1 but op is commutative — swap to put literal in src0
+    // Literal is in src1 but op is commutative -- swap to put literal in src0
     llvm::SmallVector<std::string> operands;
     for (Value result : op->getResults()) {
       operands.push_back(resolveValue(result));
@@ -1380,7 +1386,7 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
   {
     std::string scratchReg = formatVGPRRange(kScratchVGPR, 1);
     lines.push_back("  v_mov_b32 " + scratchReg + ", " +
-                    std::to_string(literalValue));
+                     std::to_string(literalValue));
 
     llvm::SmallVector<std::string> operands;
     for (Value result : op->getResults()) {

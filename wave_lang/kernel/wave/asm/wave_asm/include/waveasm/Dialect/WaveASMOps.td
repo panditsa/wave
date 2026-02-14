@@ -1040,6 +1040,10 @@ def WaveASM_S_NOP : WaveASM_CountedWaitOp<"s_nop"> {
   let summary = "No operation (wait cycles)";
 }
 
+def WaveASM_S_SETPRIO : WaveASM_CountedWaitOp<"s_setprio"> {
+  let summary = "Set wave priority level (0=default, 1-3=elevated)";
+}
+
 //===----------------------------------------------------------------------===//
 // Misc/Utility Operations
 //===----------------------------------------------------------------------===//

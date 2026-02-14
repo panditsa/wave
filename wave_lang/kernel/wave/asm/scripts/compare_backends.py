@@ -29,6 +29,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,21 @@ from wave_lang.kernel.wave.perf.benchmark_asm_backend import (
     create_gemm_schedule,
 )
 from wave_lang.kernel.wave.asm.utils import extract_func_from_stream_mlir
+
+# Shared parity analysis from the unified benchmark script
+try:
+    # When running from repo root
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+    from bench_mxfp4_comparison import (
+        ParityConfig,
+        LoopStructure,
+        analyze_loop_structure as _analyze_loop_structure,
+    )
+except ImportError:
+    # Stub fallback if bench_mxfp4_comparison is not on the path
+    _analyze_loop_structure = None
+    ParityConfig = None
+    LoopStructure = None
 
 
 # =============================================================================
@@ -1448,16 +1464,15 @@ def run_mxfp4_comparison(
     if cpp_result and not cpp_result.raw_asm.startswith("C++ backend error"):
         cpp_metrics = compute_metrics(cpp_result.raw_asm)
 
-    # Save artifacts
-    (case_dir / "llvm_asm.s").write_text(llvm_text)
-    if llvm_result.disasm:
-        (case_dir / "llvm_disasm.s").write_text(llvm_result.disasm)
-    if cpp_result and not cpp_result.raw_asm.startswith("C++ backend error"):
-        (case_dir / "cpp_asm.s").write_text(cpp_result.raw_asm)
-        if cpp_result.disasm:
-            (case_dir / "cpp_disasm.s").write_text(cpp_result.disasm)
+    # Loop structure analysis (if available from parity harness)
+    llvm_loop = None
+    cpp_loop = None
+    if _analyze_loop_structure is not None:
+        llvm_loop = _analyze_loop_structure(llvm_text)
+        if cpp_result and cpp_metrics:
+            cpp_loop = _analyze_loop_structure(cpp_result.raw_asm)
 
-    # Build report config shape expected by existing formatter
+    # Save parity manifest (Phase 2 - config equivalence)
     report_cfg = {
         "m": cfg["shape"][0],
         "n": cfg["shape"][1],
@@ -1467,7 +1482,24 @@ def run_mxfp4_comparison(
         "block_k": cfg["block"][2],
         "wave_m": cfg["wave_m"],
         "wave_n": cfg["wave_n"],
+        "num_waves": cfg["num_waves"],
+        "use_stagger": cfg["use_stagger"],
+        "schedule": "aiter_style" if cfg["num_waves"] <= 4 else "dbuf",
+        "arch": get_default_arch(),
     }
+    manifest_path = case_dir / "parity_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(report_cfg, f, indent=2)
+
+    # Save artifacts
+    (case_dir / "llvm_asm.s").write_text(llvm_text)
+    if llvm_result.disasm:
+        (case_dir / "llvm_disasm.s").write_text(llvm_result.disasm)
+    if cpp_result and not cpp_result.raw_asm.startswith("C++ backend error"):
+        (case_dir / "cpp_asm.s").write_text(cpp_result.raw_asm)
+        if cpp_result.disasm:
+            (case_dir / "cpp_disasm.s").write_text(cpp_result.disasm)
+
     if cpp_result and cpp_metrics:
         metrics_table = format_llvm_cpp_metrics_comparison(llvm_metrics, cpp_metrics)
         resource_table = format_llvm_cpp_resource_comparison(llvm_result, cpp_result)
@@ -1481,16 +1513,55 @@ def run_mxfp4_comparison(
             f"  Shape: M={report_cfg['m']}, N={report_cfg['n']}, K={report_cfg['k']}",
             f"  Blocks: BLOCK_M={report_cfg['block_m']}, BLOCK_N={report_cfg['block_n']}, BLOCK_K={report_cfg['block_k']}",
             f"  Waves: WAVE_M={report_cfg['wave_m']}, WAVE_N={report_cfg['wave_n']}",
+            f"  Waves/WG: {cfg['num_waves']}",
+            f"  Schedule: {report_cfg['schedule']}",
             f"  Architecture: {get_default_arch()}",
             "",
             metrics_table,
             "",
             resource_table,
-            "",
-            "=" * 70,
-            "Preliminary Analysis",
-            "=" * 70,
         ]
+
+        # Append loop structure if available
+        if llvm_loop is not None and cpp_loop is not None:
+            report_lines.append("")
+            report_lines.append("=" * 70)
+            report_lines.append("Loop Structure Analysis")
+            report_lines.append("=" * 70)
+            report_lines.append(f"{'Metric':<30s} {'LLVM':>12s} {'C++':>12s} {'Diff':>12s}")
+            report_lines.append("-" * 70)
+
+            def _lrow(label, llvm_val, cpp_val, fmt="d"):
+                diff = cpp_val - llvm_val
+                diff_s = f"+{diff}" if diff > 0 else str(diff)
+                if fmt == "d":
+                    return f"{label:<30s} {int(llvm_val):>12d} {int(cpp_val):>12d} {diff_s:>12s}"
+                else:
+                    return f"{label:<30s} {llvm_val:>12.2f} {cpp_val:>12.2f} {diff_s:>12s}"
+
+            report_lines.append(_lrow("Loop count", llvm_loop.loop_count, cpp_loop.loop_count))
+            report_lines.append(_lrow("Loop body instructions", llvm_loop.loop_body_instructions, cpp_loop.loop_body_instructions))
+            report_lines.append(_lrow("Prologue instructions", llvm_loop.prologue_instructions, cpp_loop.prologue_instructions))
+            report_lines.append(_lrow("Epilogue instructions", llvm_loop.epilogue_instructions, cpp_loop.epilogue_instructions))
+            report_lines.append("-" * 70)
+            report_lines.append(_lrow("  Loop MFMA", llvm_loop.loop_mfma, cpp_loop.loop_mfma))
+            report_lines.append(_lrow("  Loop VMEM", llvm_loop.loop_vmem, cpp_loop.loop_vmem))
+            report_lines.append(_lrow("  Loop DS", llvm_loop.loop_ds, cpp_loop.loop_ds))
+            report_lines.append(_lrow("  Loop SALU", llvm_loop.loop_salu, cpp_loop.loop_salu))
+            report_lines.append(_lrow("  Loop VALU", llvm_loop.loop_valu, cpp_loop.loop_valu))
+            report_lines.append(_lrow("  Loop waits", llvm_loop.loop_wait, cpp_loop.loop_wait))
+            report_lines.append(_lrow("  Loop barriers", llvm_loop.loop_barrier, cpp_loop.loop_barrier))
+            report_lines.append(_lrow("  Loop NOPs", llvm_loop.loop_nop, cpp_loop.loop_nop))
+            report_lines.append("-" * 70)
+            report_lines.append(_lrow("MFMA density", llvm_loop.mfma_density, cpp_loop.mfma_density, ".2f"))
+            report_lines.append(_lrow("Prefetch loads", llvm_loop.prefetch_loads_before_first_mfma, cpp_loop.prefetch_loads_before_first_mfma))
+            report_lines.append("=" * 70)
+
+        report_lines.append("")
+        report_lines.append("=" * 70)
+        report_lines.append("Preliminary Analysis")
+        report_lines.append("=" * 70)
+
         if llvm_metrics.total > 0:
             cpp_overhead_ratio = cpp_metrics.total / llvm_metrics.total
             report_lines.append(
@@ -1509,9 +1580,15 @@ def run_mxfp4_comparison(
     if cpp_result and cpp_metrics:
         print("\n" + format_llvm_cpp_metrics_comparison(llvm_metrics, cpp_metrics))
         print("\n" + format_llvm_cpp_resource_comparison(llvm_result, cpp_result))
+        # Print loop structure if available
+        if llvm_loop and cpp_loop:
+            print(f"\nLoop Structure: LLVM body={llvm_loop.loop_body_instructions}, "
+                  f"C++ body={cpp_loop.loop_body_instructions}, "
+                  f"LLVM MFMA_density={llvm_loop.mfma_density:.2f}, "
+                  f"C++ MFMA_density={cpp_loop.mfma_density:.2f}")
     else:
         print("\nC++ backend failed; skipped LLVM vs C++ metrics table.")
-    print(f"\nSaved report: {case_dir / 'comparison_report.txt'}")
+    print(f"\nSaved: {case_dir / 'comparison_report.txt'}, {manifest_path}")
 
 
 def main():
