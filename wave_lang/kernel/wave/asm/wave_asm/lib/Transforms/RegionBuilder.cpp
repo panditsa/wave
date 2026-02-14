@@ -49,6 +49,29 @@ static Value resolveLDSOffset(Value memref, TranslationContext &ctx,
   return nullptr;
 }
 
+/// Check if an scf.for region iter arg is used exclusively as a scaled MFMA
+/// accumulator (destC operand). Used to decide whether the init arg
+/// should be an AGPR on gfx950+ targets.
+///
+/// Only matches ScaledMFMAOp — regular MFMAOp uses VGPR accumulators in
+/// the C++ backend, so AGPR init would cause a type mismatch.
+static bool isAccumulatorIterArg(scf::ForOp forOp, unsigned iterArgIdx) {
+  auto regionIterArgs = forOp.getRegionIterArgs();
+  if (iterArgIdx >= regionIterArgs.size())
+    return false;
+  Value regionArg = regionIterArgs[iterArgIdx];
+
+  for (OpOperand &use : regionArg.getUses()) {
+    Operation *user = use.getOwner();
+    // Only scaled MFMA uses AGPR accumulators in this backend
+    if (!isa<amdgpu::ScaledMFMAOp>(user))
+      return false;
+    if (use.getOperandNumber() != 2)
+      return false;
+  }
+  return !regionArg.use_empty();
+}
+
 // Forward declaration
 LogicalResult translateOperation(Operation *op, TranslationContext &ctx);
 
@@ -110,13 +133,19 @@ LoopOp RegionBuilder::buildLoopFromSCFFor(scf::ForOp forOp) {
         }
         int64_t regAlign = regSize > 1 ? regSize : 1;
 
-        // Use VGPRs for all iter_args including MFMA accumulators.
-        // On gfx950, MFMA can write directly to VGPRs, so AGPRs are not
-        // needed. Keeping accumulators in VGPRs avoids the AGPR overhead
-        // (accum_offset + AGPR count) that inflates the total register
-        // footprint and reduces occupancy.
-        auto vregType = ctx.createVRegType(regSize, regAlign);
-        mappedValue = V_MOV_B32::create(builder, loc, vregType, mappedValue);
+        // On gfx950, use AGPRs for MFMA accumulator iter_args.
+        // This keeps accumulators in the upper half of the unified register
+        // file (a0, a1, ...) so that VGPR indices stay within the 256
+        // hardware limit. Without AGPRs, large tiles would need v256+ which
+        // the assembler rejects.
+        bool useAGPR = llvm::isa<GFX950TargetAttr>(ctx.getTarget());
+        if (useAGPR && isAccumulatorIterArg(forOp, iterIdx)) {
+          auto aregType = ctx.createARegType(regSize, regAlign);
+          mappedValue = V_MOV_B32::create(builder, loc, aregType, mappedValue);
+        } else {
+          auto vregType = ctx.createVRegType(regSize, regAlign);
+          mappedValue = V_MOV_B32::create(builder, loc, vregType, mappedValue);
+        }
       }
       initArgs.push_back(mappedValue);
     } else {

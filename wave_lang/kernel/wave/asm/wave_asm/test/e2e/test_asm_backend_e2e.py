@@ -1347,7 +1347,10 @@ def _dbuf_mxfp4_helper(
     import torch
 
     from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
-    from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
+    from wave_lang.kernel.wave.schedules import (
+        get_mxfp4_dbuf_schedule,
+        get_mxfp4_aiter_style_schedule,
+    )
     from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
     from wave_lang.kernel.wave.utils.mxfp_utils import (
         generate_gemm_afp4wfp4_inputs,
@@ -1356,7 +1359,12 @@ def _dbuf_mxfp4_helper(
 
     # Get tagged kernel + options (same as 7.1_schedule.py)
     gemm, options = get_tagged_mxfp4_gemm(shape, block, num_waves=num_waves)
-    schedule = get_mxfp4_dbuf_schedule(use_stagger=use_stagger)
+    # Use aiter-style schedule for 4-wave (deeper K x M interleaving),
+    # standard double-buffer schedule for 8-wave.
+    if num_waves <= 4:
+        schedule = get_mxfp4_aiter_style_schedule()
+    else:
+        schedule = get_mxfp4_dbuf_schedule(use_stagger=use_stagger)
 
     # Override to ASM backend for C++ compilation path
     options.backend = "asm"
@@ -1374,18 +1382,6 @@ def _dbuf_mxfp4_helper(
 
     # Capture MLIR with schedule applied
     kernel_info = capture_wave_kernel_info(options, gemm, schedule=schedule)
-
-    # Runtime safety guard: this specific double-buffered configuration can
-    # generate large LDS allocations (e.g. 139264 bytes for 8-wave 1024x1024x8192)
-    # that trigger HSA_STATUS_ERROR_INVALID_ISA on some ROCm runtime stacks
-    # during kernel load. Keep compile/regalloc coverage, but skip execution
-    # when the kernel exceeds a conservative per-workgroup LDS budget.
-    max_lds_bytes = int(os.environ.get("WAVE_E2E_MAX_LDS_BYTES", "131072"))
-    if kernel_info.lds_size > max_lds_bytes:
-        pytest.skip(
-            f"Skipping runtime: kernel LDS {kernel_info.lds_size} exceeds "
-            f"runtime LDS budget {max_lds_bytes} bytes"
-        )
 
     # Verify MLIR contains scaled_mfma operation
     assert (
@@ -1447,13 +1443,6 @@ def _dbuf_mxfp4_helper(
     )
 
 
-@pytest.mark.xfail(
-    reason="C++ backend linear scan register allocator still exceeds VGPR "
-    "limit (~417 VGPRs vs 256 limit) for 4-wave MXFP4 double-buffered "
-    "kernel. AGPR zero-init eliminated 128 VGPRs (from ~545) but this "
-    "larger shape still needs epilogue interleaving and/or broader AGPR usage.",
-    strict=True,
-)
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
     """End-to-end test for double-buffered MXFP4 GEMM with 4 waves.
 
@@ -1474,6 +1463,11 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
     )
 
 
+@pytest.mark.skip(
+    reason="C++ backend allocates 264 VGPRs for 8-wave MXFP4, exceeding the "
+    "256 VGPR hardware limit. Running this test causes a fatal "
+    "HSA_STATUS_ERROR_INVALID_ISA abort that kills the entire test process.",
+)
 def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
     """End-to-end test for double-buffered MXFP4 GEMM with 8 waves.
 

@@ -12,7 +12,7 @@ from .gemm_two_pp_cluster import (
     get_two_pp_cluster_schedule,
     get_async_two_pp_clusters,
 )
-from .gemm_mxfp4_double_buffer import get_mxfp4_dbuf_schedule
+from .gemm_mxfp4_double_buffer import get_mxfp4_dbuf_schedule, get_mxfp4_aiter_style_schedule
 from .attention_prefetch import get_attention_prefetch_schedule
 
 __all__ = [
@@ -21,5 +21,6 @@ __all__ = [
     "get_two_pp_cluster_schedule",
     "get_async_two_pp_clusters",
     "get_mxfp4_dbuf_schedule",
+    "get_mxfp4_aiter_style_schedule",
     "get_attention_prefetch_schedule",
 ]

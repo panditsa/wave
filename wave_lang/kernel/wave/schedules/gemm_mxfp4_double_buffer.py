@@ -250,3 +250,318 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
             tkw.stagger(pipeline_loop.KERNEL)
 
     return mxfp4_dbuf_schedule
+
+
+def get_mxfp4_aiter_style_schedule():
+    """Return an aiter-emulating MXFP4 schedule for 4-wave configs.
+
+    This schedule targets the pipeline structure of the hand-tuned aiter
+    128x128 MXFP4 kernel:
+    - 2 K-partitions x 2 M-partitions = 4 MMA groups (~32 MFMAs each)
+    - 8 clusters alternating shared loads with MFMA compute
+    - No wave staggering (not beneficial at 4-wave occupancy)
+    - High wave priority around all MFMA clusters
+    - SharedMemoryBarrier at loop boundaries
+
+    The K dimension only has 2 unique IDs (from the 2-stage pipeline), so
+    we use M-dimension sub-partitioning within each K-half to create 4
+    total MMA groups. This interleaves memory and compute more finely than
+    the default 2-cluster schedule.
+    """
+    K = tkl.sym.K
+    M = tkl.sym.M
+
+    @wave_schedule.wave_schedule()
+    def mxfp4_aiter_schedule():
+        # =====================================================================
+        # Get tagged nodes from the kernel (same as double-buffer schedule)
+        # =====================================================================
+        k_loop = tkw.get_node_by_tag("k_loop")
+
+        # Matrix A data - GatherToLDS (global->shared) + Read (shared load)
+        all_read_a = tkw.get_node_by_tag("read_a")
+        global_to_shared_a = tkw.filter_nodes(all_read_a, node_type=tkw.GatherToLDS)
+        shared_load_a = tkw.filter_nodes(all_read_a, node_type=tkw.Read)
+
+        # Matrix A scale
+        all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
+        global_to_shared_a_scale = tkw.filter_nodes(
+            all_read_a_scale, node_type=tkw.GatherToLDS
+        )
+        shared_load_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
+
+        # Matrix B data
+        all_read_b = tkw.get_node_by_tag("read_b")
+        global_to_shared_b = tkw.filter_nodes(all_read_b, node_type=tkw.GatherToLDS)
+        shared_load_b = tkw.filter_nodes(all_read_b, node_type=tkw.Read)
+
+        # Matrix B scale
+        all_read_b_scale = tkw.get_node_by_tag("read_b_scale")
+        global_to_shared_b_scale = tkw.filter_nodes(
+            all_read_b_scale, node_type=tkw.GatherToLDS
+        )
+        shared_load_b_scale = tkw.filter_nodes(all_read_b_scale, node_type=tkw.Read)
+
+        # Bitcast operations (needed alongside compute)
+        bitcast_a = tkw.get_node_by_tag("bitcast_a")
+        bitcast_a_scale = tkw.get_node_by_tag("bitcast_a_scale")
+        bitcast_b = tkw.get_node_by_tag("bitcast_b")
+        bitcast_b_scale = tkw.get_node_by_tag("bitcast_b_scale")
+
+        # Scaled MMA
+        scaled_mma = tkw.get_node_by_tag("scaled_mma")
+
+        # =====================================================================
+        # Create 2-stage pipeline (double buffering, same as base schedule)
+        # =====================================================================
+        pipeline_loop = tkw.pipeline(k_loop)
+
+        with pipeline_loop as pl:
+            # Stage 0: Global-to-shared prefetch via GatherToLDS
+            pl.set_stage(
+                [
+                    (
+                        global_to_shared_a,
+                        global_to_shared_a_scale,
+                        global_to_shared_b,
+                        global_to_shared_b_scale,
+                    ),
+                    (),
+                    (),
+                ],
+            )
+            # Stage 1: Shared memory loads + bitcasts + compute
+            pl.set_stage(
+                [
+                    (
+                        shared_load_a,
+                        shared_load_b,
+                        shared_load_a_scale,
+                        shared_load_b_scale,
+                    ),
+                    (bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale),
+                    (scaled_mma,),
+                ],
+            )
+
+        # =====================================================================
+        # KERNEL: Main loop body with K x M partitioning (aiter-style)
+        # =====================================================================
+
+        # Filter nodes for KERNEL stage
+        loop_global_to_shared = (
+            tkw.filter_nodes(global_to_shared_a, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_a_scale, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b, subgraph=pipeline_loop.KERNEL)
+            + tkw.filter_nodes(global_to_shared_b_scale, subgraph=pipeline_loop.KERNEL)
+        )
+
+        loop_shared_load_a = tkw.filter_nodes(
+            shared_load_a, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b = tkw.filter_nodes(
+            shared_load_b, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_a_scale = tkw.filter_nodes(
+            shared_load_a_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_b_scale = tkw.filter_nodes(
+            shared_load_b_scale, subgraph=pipeline_loop.KERNEL
+        )
+
+        loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_a_scale = tkw.filter_nodes(
+            bitcast_a_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_b_scale = tkw.filter_nodes(
+            bitcast_b_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
+
+        # =================================================================
+        # Partition by K (2-way), then sub-partition by M (2-way) to get
+        # 4 MMA groups of ~32 MFMAs each.
+        #
+        # The K dimension only has 2 unique IDs (from the 2-stage pipeline).
+        # Within each K-half, we sub-partition by M to further interleave
+        # loads and compute, reducing live register pressure at each phase.
+        # =================================================================
+
+        # First: 2-way K partition (same as base schedule)
+        loop_scaled_mma_k0, loop_scaled_mma_k1 = tkw.partition_by_dim(
+            loop_scaled_mma, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_k0, loop_shared_load_a_k1 = tkw.partition_by_dim(
+            loop_shared_load_a, dim=K, num_partitions=2
+        )
+        loop_shared_load_b_k0, loop_shared_load_b_k1 = tkw.partition_by_dim(
+            loop_shared_load_b, dim=K, num_partitions=2
+        )
+        loop_shared_load_a_scale_k0, loop_shared_load_a_scale_k1 = (
+            tkw.partition_by_dim(loop_shared_load_a_scale, dim=K, num_partitions=2)
+        )
+        loop_shared_load_b_scale_k0, loop_shared_load_b_scale_k1 = (
+            tkw.partition_by_dim(loop_shared_load_b_scale, dim=K, num_partitions=2)
+        )
+        loop_bitcast_a_k0, loop_bitcast_a_k1 = tkw.partition_by_dim(
+            loop_bitcast_a, dim=K, num_partitions=2
+        )
+        loop_bitcast_a_scale_k0, loop_bitcast_a_scale_k1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_k0, loop_bitcast_b_k1 = tkw.partition_by_dim(
+            loop_bitcast_b, dim=K, num_partitions=2
+        )
+        loop_bitcast_b_scale_k0, loop_bitcast_b_scale_k1 = tkw.partition_by_dim(
+            loop_bitcast_b_scale, dim=K, num_partitions=2
+        )
+
+        # Second: 2-way M sub-partition within each K-half for MFMAs.
+        # A loads and A scale loads are partitioned by M (they depend on M).
+        # B loads and B scale loads are NOT partitioned by M (shared across
+        # M groups — all B data is needed for all M tile rows).
+        mma_k0_m0, mma_k0_m1 = tkw.partition_by_dim(
+            loop_scaled_mma_k0, dim=M, num_partitions=2
+        )
+        mma_k1_m0, mma_k1_m1 = tkw.partition_by_dim(
+            loop_scaled_mma_k1, dim=M, num_partitions=2
+        )
+
+        # Partition A loads/bitcasts by M within each K-half
+        a_load_k0_m0, a_load_k0_m1 = tkw.partition_by_dim(
+            loop_shared_load_a_k0, dim=M, num_partitions=2
+        )
+        a_load_k1_m0, a_load_k1_m1 = tkw.partition_by_dim(
+            loop_shared_load_a_k1, dim=M, num_partitions=2
+        )
+        a_scale_load_k0_m0, a_scale_load_k0_m1 = tkw.partition_by_dim(
+            loop_shared_load_a_scale_k0, dim=M, num_partitions=2
+        )
+        a_scale_load_k1_m0, a_scale_load_k1_m1 = tkw.partition_by_dim(
+            loop_shared_load_a_scale_k1, dim=M, num_partitions=2
+        )
+        bitcast_a_k0_m0, bitcast_a_k0_m1 = tkw.partition_by_dim(
+            loop_bitcast_a_k0, dim=M, num_partitions=2
+        )
+        bitcast_a_k1_m0, bitcast_a_k1_m1 = tkw.partition_by_dim(
+            loop_bitcast_a_k1, dim=M, num_partitions=2
+        )
+        bitcast_a_scale_k0_m0, bitcast_a_scale_k0_m1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale_k0, dim=M, num_partitions=2
+        )
+        bitcast_a_scale_k1_m0, bitcast_a_scale_k1_m1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale_k1, dim=M, num_partitions=2
+        )
+
+        independent_global_count = len(loop_global_to_shared)
+
+        # =================================================================
+        # Build 8 clusters: 4 MMA groups (K0-M0, K0-M1, K1-M0, K1-M1)
+        # each preceded by its corresponding loads.
+        #
+        # Structure per cluster pair:
+        #   Load cluster: A loads (M-partitioned) + B loads (shared) +
+        #                 A/B bitcasts + scheduling barrier
+        #   MFMA cluster: SetWavePrio(1) + MFMAs + SetWavePrio(0)
+        # =================================================================
+
+        clusters = [
+            # --- K0-M0: First K-half, first M-half ---
+            tkw.cluster(
+                [
+                    a_load_k0_m0,
+                    a_scale_load_k0_m0,
+                    loop_shared_load_b_k0,  # B loads shared across M
+                    loop_shared_load_b_scale_k0,
+                    bitcast_a_k0_m0,
+                    bitcast_a_scale_k0_m0,
+                    loop_bitcast_b_k0,
+                    loop_bitcast_b_scale_k0,
+                    tkw.SchedulingBarrier([]),
+                    loop_global_to_shared,  # Async G2S prefetch
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    tkw.SetWavePrio(1),
+                    mma_k0_m0,
+                    tkw.SetWavePrio(0),
+                    tkw.SchedulingBarrier([]),
+                    tkw.MemoryCounterWaitBarrier(load=independent_global_count),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            # --- K0-M1: First K-half, second M-half ---
+            tkw.cluster(
+                [
+                    a_load_k0_m1,
+                    a_scale_load_k0_m1,
+                    bitcast_a_k0_m1,
+                    bitcast_a_scale_k0_m1,
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    tkw.SetWavePrio(1),
+                    mma_k0_m1,
+                    tkw.SetWavePrio(0),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            # --- K1-M0: Second K-half, first M-half ---
+            tkw.cluster(
+                [
+                    a_load_k1_m0,
+                    a_scale_load_k1_m0,
+                    loop_shared_load_b_k1,  # B loads shared across M
+                    loop_shared_load_b_scale_k1,
+                    bitcast_a_k1_m0,
+                    bitcast_a_scale_k1_m0,
+                    loop_bitcast_b_k1,
+                    loop_bitcast_b_scale_k1,
+                    tkw.SchedulingBarrier([]),
+                    tkw.MemoryCounterWaitBarrier(load=0),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    tkw.SetWavePrio(1),
+                    mma_k1_m0,
+                    tkw.SetWavePrio(0),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            # --- K1-M1: Second K-half, second M-half ---
+            tkw.cluster(
+                [
+                    a_load_k1_m1,
+                    a_scale_load_k1_m1,
+                    bitcast_a_k1_m1,
+                    bitcast_a_scale_k1_m1,
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    tkw.SetWavePrio(1),
+                    mma_k1_m1,
+                    tkw.SetWavePrio(0),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+        ]
+
+        # Insert shared memory barriers at loop boundaries
+        tkw.insert_before(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+        tkw.insert_at_end(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+
+        # Apply the cluster-based reordering
+        tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
+
+        # NO wave staggering — not beneficial at 4-wave occupancy
+
+    return mxfp4_aiter_schedule

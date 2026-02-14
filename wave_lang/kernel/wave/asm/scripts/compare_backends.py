@@ -600,6 +600,8 @@ def compile_cpp_backend(
             "--waveasm-peephole",
             "--waveasm-memory-offset-opt",  # Fold constant addresses into offset fields
             "--waveasm-linear-scan",
+            "--max-vgprs=512",  # Allow up to 512 VGPRs (4-wave occupancy)
+            "--max-agprs=512",  # Allow up to 512 AGPRs (accumulators)
             "--waveasm-insert-waitcnt",
             "--waveasm-hazard-mitigation",
             "--emit-assembly",
@@ -1360,14 +1362,20 @@ def run_mxfp4_comparison(
 ):
     """Run llvm/asm/cpp comparison for an MXFP4 dbuf kernel variant."""
     from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
-    from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
+    from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule, get_mxfp4_aiter_style_schedule
     from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
     cfg = MXFP4_CONFIGS[key]
     case_dir = output_dir / cfg["name"]
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    schedule = get_mxfp4_dbuf_schedule(use_stagger=cfg["use_stagger"])
+    # Use the aiter-style schedule for 4-wave configs (4 K-partitions,
+    # 16 MFMAs per barrier, no stagger).  Keep the double-buffer schedule
+    # for 8-wave configs.
+    if cfg["num_waves"] <= 4:
+        schedule = get_mxfp4_aiter_style_schedule()
+    else:
+        schedule = get_mxfp4_dbuf_schedule(use_stagger=cfg["use_stagger"])
 
     # Create a *fresh* kernel + options for each backend.  The wave kernel
     # object is stateful and mutated during tracing/lowering, so reusing it

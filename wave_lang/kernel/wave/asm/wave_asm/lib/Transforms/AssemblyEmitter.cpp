@@ -281,8 +281,12 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   if (llvm::isa<GFX942TargetAttr, GFX950TargetAttr>(targetKind)) {
     int64_t accumOffset = 0;
     if (nextFreeAGPR > 0) {
-      // CDNA AGPR layout: keep accum_offset at 256 when AGPRs are used.
-      accumOffset = 256;
+      // On CDNA targets, accum_offset marks the boundary between VGPRs and
+      // AGPRs in the unified register file. Set it to the actual VGPR count
+      // (rounded up to granularity) so AGPRs start right after VGPRs.
+      // This avoids wasting register file entries for small kernels that
+      // use few VGPRs but need AGPRs for MFMA accumulators.
+      accumOffset = std::max(int64_t(4), ((nextFreeVGPR + 3) / 4) * 4);
     } else {
       // No AGPRs used: keep accum_offset within the allocated VGPR range.
       accumOffset = std::max(int64_t(4), ((nextFreeVGPR + 3) / 4) * 4);
@@ -1287,67 +1291,113 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
     mnemonic = opName.drop_front(8);
   }
 
-  // Check if this is a VALU instruction that needs literal materialization
-  if (!needsLiteralMaterialization(mnemonic)) {
-    // Non-VALU or v_mov_b32: use normal generation (supports inline literals)
-    if (auto line = generateOp(op)) {
-      lines.push_back(*line);
-    }
-    return lines;
-  }
-
   // Check operands for literals outside inline range
-  bool needsLiteralLoad = false;
+  bool hasNonInlineLiteral = false;
   int64_t literalValue = 0;
   int literalOperandIdx = -1;
 
   for (int i = 0; i < static_cast<int>(op->getNumOperands()); ++i) {
     auto [isLiteral, val] = getLiteralValue(op->getOperand(i));
     if (isLiteral && !isInlineConstant(val)) {
-      needsLiteralLoad = true;
+      hasNonInlineLiteral = true;
       literalValue = val;
       literalOperandIdx = i;
       break; // Only handle first non-inline literal
     }
   }
 
-  if (!needsLiteralLoad) {
-    // All literals are inline constants, use normal generation
+  // No non-inline literals: use normal generation
+  if (!hasNonInlineLiteral) {
     if (auto line = generateOp(op)) {
       lines.push_back(*line);
     }
     return lines;
   }
 
-  // Emit v_mov_b32 to load the literal into scratch VGPR
-  // This matches the Python backend approach in kernel_expr_emitter.py
-  std::string scratchReg = formatVGPRRange(kScratchVGPR, 1);
-  lines.push_back("  v_mov_b32 " + scratchReg + ", " +
-                  std::to_string(literalValue));
-
-  // Now generate the instruction with scratch VGPR instead of literal
-  llvm::SmallVector<std::string> operands;
-
-  // Results come first
-  for (Value result : op->getResults()) {
-    operands.push_back(resolveValue(result));
-  }
-
-  // Then input operands, replacing the literal with scratch register
-  for (int i = 0; i < static_cast<int>(op->getNumOperands()); ++i) {
-    if (i == literalOperandIdx) {
-      operands.push_back(scratchReg);
-    } else {
-      operands.push_back(resolveValue(op->getOperand(i)));
+  // SALU instructions (s_*) support 32-bit literals natively in any operand
+  // position. Just emit directly — no materialization or swapping needed.
+  if (mnemonic.starts_with("s_")) {
+    if (auto line = generateOp(op)) {
+      lines.push_back(*line);
     }
+    return lines;
   }
 
-  lines.push_back(formatter.format(mnemonic, operands));
+  // VOP3+ instructions always need literal materialization into scratch VGPR
+  if (needsLiteralMaterialization(mnemonic)) {
+    std::string scratchReg = formatVGPRRange(kScratchVGPR, 1);
+    lines.push_back("  v_mov_b32 " + scratchReg + ", " +
+                    std::to_string(literalValue));
 
-  // Track that we used the scratch VGPR (update peak if needed)
-  peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
+    llvm::SmallVector<std::string> operands;
+    for (Value result : op->getResults()) {
+      operands.push_back(resolveValue(result));
+    }
+    for (int i = 0; i < static_cast<int>(op->getNumOperands()); ++i) {
+      if (i == literalOperandIdx) {
+        operands.push_back(scratchReg);
+      } else {
+        operands.push_back(resolveValue(op->getOperand(i)));
+      }
+    }
 
-  return lines;
+    lines.push_back(formatter.format(mnemonic, operands));
+    peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
+    return lines;
+  }
+
+  // VOP2 instructions: literal MUST be in src0 (first source operand).
+  // The first source operand is operand index 0 in the MLIR op.
+  // If the literal is already in src0 (operandIdx 0): emit directly.
+  // If the literal is in src1 (operandIdx 1) for a commutative op: swap.
+  // If the literal is in src1 for a non-commutative op: materialize.
+
+  bool isCommutative = op->hasTrait<mlir::OpTrait::IsCommutative>();
+
+  if (literalOperandIdx == 0) {
+    // Literal is already in src0 — emit directly, VOP2 handles it
+    if (auto line = generateOp(op)) {
+      lines.push_back(*line);
+    }
+    return lines;
+  }
+
+  if (literalOperandIdx == 1 && isCommutative && op->getNumOperands() == 2) {
+    // Literal is in src1 but op is commutative — swap to put literal in src0
+    llvm::SmallVector<std::string> operands;
+    for (Value result : op->getResults()) {
+      operands.push_back(resolveValue(result));
+    }
+    // Emit src0 = literal, src1 = original src0
+    operands.push_back(std::to_string(literalValue));
+    operands.push_back(resolveValue(op->getOperand(0)));
+    lines.push_back(formatter.format(mnemonic, operands));
+    return lines;
+  }
+
+  // Non-commutative op with literal in src1, or unexpected position:
+  // fall back to materialization into scratch VGPR
+  {
+    std::string scratchReg = formatVGPRRange(kScratchVGPR, 1);
+    lines.push_back("  v_mov_b32 " + scratchReg + ", " +
+                    std::to_string(literalValue));
+
+    llvm::SmallVector<std::string> operands;
+    for (Value result : op->getResults()) {
+      operands.push_back(resolveValue(result));
+    }
+    for (int i = 0; i < static_cast<int>(op->getNumOperands()); ++i) {
+      if (i == literalOperandIdx) {
+        operands.push_back(scratchReg);
+      } else {
+        operands.push_back(resolveValue(op->getOperand(i)));
+      }
+    }
+
+    lines.push_back(formatter.format(mnemonic, operands));
+    peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
+    return lines;
+  }
 }
 
 llvm::SmallVector<std::string> KernelGenerator::generate() {
