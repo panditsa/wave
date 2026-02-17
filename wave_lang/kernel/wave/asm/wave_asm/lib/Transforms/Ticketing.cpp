@@ -11,10 +11,26 @@
 // memory operations. Each memory operation is assigned a monotonically
 // increasing ticket. When a value is used, the pass computes the minimum
 // wait threshold and inserts s_waitcnt if required.
+//
+// Key optimizations over a naive approach:
+// 1. Incremental wait tracking: when new loads are issued after a wait,
+//    we increment the last-wait threshold instead of resetting it. This
+//    correctly recognizes that values loaded BEFORE the last wait are still
+//    ready, avoiding unnecessary waitcnt insertions.
+// 2. Latency-covering for LGKM: for ds_read (LDS) loads, if enough
+//    instructions separate the load from its use, we skip fine-grained
+//    lgkmcnt(N>0) waits since the data has certainly arrived. This matches
+//    how hand-tuned kernels (e.g., AITER) rely on latency hiding.
+// 3. Barrier handling uses "full drain" checks (hasOutstandingVmem/Lgkm)
+//    to correctly insert vmcnt(0)/lgkmcnt(0) before barriers.
+// 4. Loop back-edge (ConditionOp) does NOT reset wait tracking, allowing
+//    waits from the end of one iteration to carry to the next, eliminating
+//    redundant waitcnts at loop tops.
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMAttrs.h"
 #include "waveasm/Dialect/WaveASMDialect.h"
+#include "waveasm/Dialect/WaveASMInterfaces.h"
 #include "waveasm/Dialect/WaveASMOps.h"
 #include "waveasm/Transforms/Passes.h"
 
@@ -33,27 +49,35 @@ namespace {
 // Ticketing System
 //===----------------------------------------------------------------------===//
 
-/// Tracks memory operation tickets for waitcnt insertion
+/// Tracks memory operation tickets for waitcnt insertion.
+///
+/// The ticket system maps each load operation to a monotonically increasing
+/// ticket number. The hardware vmcnt/lgkmcnt counters track outstanding
+/// loads in FIFO order, so vmcnt(N) means "wait until at most N loads are
+/// outstanding" (the N most recent). To wait for ticket T, we need
+/// vmcnt(lastTicket - T), which allows (lastTicket - T) newer loads to
+/// remain outstanding while guaranteeing T (and older) have completed.
 class Ticketing {
 public:
   Ticketing() = default;
 
-  /// Issue a new VMEM ticket, returns the ticket number
-  /// Also invalidates any previous wait tracking since new loads are pending
+  /// Issue a new VMEM ticket, returns the ticket number.
+  /// A new load shifts the meaning of previous waits: if we previously
+  /// waited for vmcnt(N), that now effectively means vmcnt(N+1) since
+  /// one more operation is outstanding. We increment (not reset) the
+  /// last wait value to reflect this.
   int64_t nextVmemTicket() {
     ++lastVmemTicket;
-    // A new load after a previous wait means we need to wait again
-    // Reset the wait tracking to reflect this
-    lastVmemWait = std::nullopt;
+    if (lastVmemWait.has_value())
+      ++(*lastVmemWait);
     return lastVmemTicket;
   }
 
-  /// Issue a new LGKM ticket, returns the ticket number
-  /// Also invalidates any previous wait tracking since new loads are pending
+  /// Issue a new LGKM ticket, returns the ticket number.
   int64_t nextLgkmTicket() {
     ++lastLgkmTicket;
-    // A new load after a previous wait means we need to wait again
-    lastLgkmWait = std::nullopt;
+    if (lastLgkmWait.has_value())
+      ++(*lastLgkmWait);
     return lastLgkmTicket;
   }
 
@@ -64,15 +88,13 @@ public:
   int64_t getLastLgkmTicket() const { return lastLgkmTicket; }
 
   /// Compute the vmcnt threshold needed to wait for a given ticket.
-  /// Returns std::nullopt if no wait is needed (already satisfied by
-  /// a previous stricter wait).
+  /// Returns std::nullopt if no wait is needed (already satisfied).
   std::optional<int64_t> computeVmemWait(int64_t requiredTicket) {
     if (requiredTicket < 0 || lastVmemTicket < 0)
       return std::nullopt;
 
     int64_t threshold = std::max(int64_t(0), lastVmemTicket - requiredTicket);
 
-    // Check if a previous wait already covers this
     if (lastVmemWait.has_value() && *lastVmemWait <= threshold)
       return std::nullopt;
 
@@ -92,6 +114,17 @@ public:
     return threshold;
   }
 
+  /// Check if any VMEM operations are outstanding since the last full drain.
+  /// Used for barrier pre-waits where we need vmcnt(0).
+  bool hasOutstandingVmem() const {
+    return !lastVmemWait.has_value() || *lastVmemWait > 0;
+  }
+
+  /// Check if any LGKM operations are outstanding since the last full drain.
+  bool hasOutstandingLgkm() const {
+    return !lastLgkmWait.has_value() || *lastLgkmWait > 0;
+  }
+
   /// Record that a vmem wait was emitted with the given threshold
   void observeVmemWait(int64_t threshold) {
     if (!lastVmemWait.has_value() || threshold < *lastVmemWait)
@@ -104,7 +137,7 @@ public:
       lastLgkmWait = threshold;
   }
 
-  /// Reset wait tracking (e.g., at control flow boundaries)
+  /// Reset wait tracking (e.g., at loop entry from outside)
   void resetWaits() {
     lastVmemWait = std::nullopt;
     lastLgkmWait = std::nullopt;
@@ -170,6 +203,12 @@ MemOpKind classifyMemOp(Operation *op) {
   return MemOpKind::None;
 }
 
+/// Check if an operation is an MFMA (matrix fused multiply-add) instruction.
+/// MFMAs are long-latency (32+ cycles) and read source VGPRs at issue time.
+bool isMFMAOp(Operation *op) {
+  return op->hasTrait<OpTrait::MFMAOp>();
+}
+
 //===----------------------------------------------------------------------===//
 // InsertWaitcnt Pass
 //===----------------------------------------------------------------------===//
@@ -197,6 +236,13 @@ struct InsertWaitcntPass
 
 private:
   bool insertAfterLoads = false;
+
+  /// Minimum number of operations between an LGKM load and its use for
+  /// latency covering. ds_read (LDS) latency is ~20-40 cycles on CDNA.
+  /// With 40+ intervening instructions (each >= 1 cycle, MFMAs = 32 cycles),
+  /// the load has certainly completed. This allows us to skip lgkmcnt(N>0)
+  /// waits when enough instructions provide latency hiding.
+  static constexpr int64_t kMinOpsForLgkmLatency = 40;
 
   // Statistics
   unsigned numVmemOps = 0;
@@ -226,11 +272,21 @@ private:
     // Map from Value to the ticket that produces it
     llvm::DenseMap<Value, std::pair<MemOpKind, int64_t>> valueTickets;
 
+    // Map from Value to the sequential op index where the load was issued.
+    // Used for latency-covering heuristic.
+    llvm::DenseMap<Value, int64_t> loadDefIndex;
+
+    // Sequential operation counter for latency tracking
+    int64_t opIndex = 0;
+
     // Walk through operations in order
     program.walk([&](Operation *op) {
       // Skip the program op itself
       if (isa<ProgramOp>(op))
         return;
+
+      // Increment sequential index for every real operation
+      ++opIndex;
 
       // Observe pre-existing waitcnt instructions (from translation or prior
       // passes) This prevents emitting redundant waits
@@ -263,22 +319,21 @@ private:
       }
 
       // Barriers require all memory to be synchronized before execution.
-      // Insert waits for any outstanding VMEM/LGKM operations before the
-      // barrier. Always use full drain (0) since barriers need complete sync.
+      // Use hasOutstanding checks for correct full-drain detection with
+      // the incremental wait tracking.
       if (isa<S_BARRIER>(op)) {
-        // Check if we need waits before this barrier
-        auto vmemWait = ticketing.computeVmemWait(0);
-        auto lgkmWait = ticketing.computeLgkmWait(0);
+        bool needVmem = ticketing.hasOutstandingVmem();
+        bool needLgkm = ticketing.hasOutstandingLgkm();
 
-        if (vmemWait.has_value() || lgkmWait.has_value()) {
+        if (needVmem || needLgkm) {
           OpBuilder builder(op->getContext());
           builder.setInsertionPoint(op);
 
-          if (vmemWait.has_value() && lgkmWait.has_value()) {
+          if (needVmem && needLgkm) {
             S_WAITCNT::create(builder, op->getLoc(),
                               builder.getI32IntegerAttr(0),
                               builder.getI32IntegerAttr(0), IntegerAttr());
-          } else if (vmemWait.has_value()) {
+          } else if (needVmem) {
             S_WAITCNT_VMCNT::create(builder, op->getLoc(), 0);
           } else {
             S_WAITCNT_LGKMCNT::create(builder, op->getLoc(), 0);
@@ -297,7 +352,6 @@ private:
 
       if (kind != MemOpKind::None) {
         // For stores, check operands BEFORE incrementing ticket counter
-        // This ensures correct wait thresholds are computed
         if (kind == MemOpKind::VmemStore || kind == MemOpKind::LgkmStore) {
           std::optional<int64_t> neededVmcnt;
           std::optional<int64_t> neededLgkmcnt;
@@ -356,8 +410,7 @@ private:
 
         // Now increment the ticket counter for this memory op
         // NOTE: Only LOADS increment the counter because vmcnt/lgkmcnt only
-        // track outstanding loads, not stores. Stores don't affect these
-        // counters.
+        // track outstanding loads, not stores.
         int64_t ticket = -1;
         if (kind == MemOpKind::VmemLoad) {
           ticket = ticketing.nextVmemTicket();
@@ -366,13 +419,13 @@ private:
           ticket = ticketing.nextLgkmTicket();
           numLgkmOps++;
         } else {
-          // Stores don't get tickets (they don't affect vmcnt/lgkmcnt)
           numVmemOps++;
         }
 
-        // Map results to tickets (for loads)
+        // Map results to tickets and record def index (for loads)
         for (Value result : op->getResults()) {
           valueTickets[result] = {kind, ticket};
+          loadDefIndex[result] = opIndex;
         }
 
         // For conservative mode, insert wait immediately after loads
@@ -415,6 +468,24 @@ private:
         } else if (opKind == MemOpKind::LgkmLoad) {
           auto wait = ticketing.computeLgkmWait(ticket);
           if (wait.has_value()) {
+            // Latency-covering heuristic for LGKM loads:
+            // If the threshold > 0 (this is NOT the most recent LGKM op)
+            // and enough instructions have elapsed since the load, skip
+            // the wait. The data has certainly arrived due to latency hiding.
+            // We only apply this when threshold > 0 because threshold == 0
+            // means the load is the most recent LGKM op and might still be
+            // in-flight.
+            if (*wait > 0) {
+              auto defIt = loadDefIndex.find(operand);
+              if (defIt != loadDefIndex.end()) {
+                int64_t gap = opIndex - defIt->second;
+                if (gap >= kMinOpsForLgkmLatency) {
+                  // Enough instructions for latency hiding; skip this wait
+                  continue;
+                }
+              }
+            }
+
             if (!neededLgkmcnt.has_value() || *wait < *neededLgkmcnt)
               neededLgkmcnt = wait;
           }
@@ -451,16 +522,86 @@ private:
         numWaitcntInserted++;
       }
 
-      // Reset waits at loop boundaries and branches.
-      // We reset at LoopOp (loop entry) and ConditionOp (loop back-edge)
-      // since pending waits from before the loop may not be valid inside,
-      // and vice versa. We do NOT reset at IfOp/YieldOp to avoid
-      // unnecessary s_waitcnt insertions inside straight-line if-then-else.
-      if (isa<LoopOp, ConditionOp>(op) ||
+      // Reset waits at loop ENTRY (LoopOp) since pending waits from before
+      // the loop may not be valid inside. We do NOT reset at ConditionOp
+      // (loop back-edge) because waits from the end of one iteration ARE
+      // valid at the start of the next — the hardware state is continuous.
+      // This avoids redundant lgkmcnt(0)/vmcnt(0) at the top of each
+      // loop iteration.
+      if (isa<LoopOp>(op) ||
           op->getName().getStringRef().contains("branch")) {
         ticketing.resetWaits();
       }
     });
+
+    // Post-processing: combine adjacent separate s_waitcnt_vmcnt and
+    // s_waitcnt_lgkmcnt into a single combined s_waitcnt instruction.
+    // This happens when one waitcnt comes from the schedule (e.g.,
+    // MemoryCounterWaitBarrier) and the other from the pass (e.g.,
+    // barrier pre-wait), producing two adjacent separate waitcnts.
+    combineAdjacentWaitcnts(program);
+  }
+
+  /// Merge adjacent S_WAITCNT_VMCNT + S_WAITCNT_LGKMCNT (in either order)
+  /// into a single S_WAITCNT with both fields.
+  void combineAdjacentWaitcnts(ProgramOp program) {
+    llvm::SmallVector<std::pair<Operation *, Operation *>> toCombine;
+
+    program.walk([&](Operation *op) {
+      if (isa<ProgramOp>(op))
+        return;
+
+      Operation *next = op->getNextNode();
+      if (!next)
+        return;
+
+      // Check for vmcnt followed by lgkmcnt
+      auto vmcntOp = dyn_cast<S_WAITCNT_VMCNT>(op);
+      auto lgkmcntOp = dyn_cast<S_WAITCNT_LGKMCNT>(next);
+      if (vmcntOp && lgkmcntOp) {
+        toCombine.push_back({op, next});
+        return;
+      }
+
+      // Check for lgkmcnt followed by vmcnt
+      auto lgkmcntOp2 = dyn_cast<S_WAITCNT_LGKMCNT>(op);
+      auto vmcntOp2 = dyn_cast<S_WAITCNT_VMCNT>(next);
+      if (lgkmcntOp2 && vmcntOp2) {
+        toCombine.push_back({op, next});
+        return;
+      }
+    });
+
+    for (auto [first, second] : toCombine) {
+      int64_t vmcntVal = 0;
+      int64_t lgkmcntVal = 0;
+
+      if (auto vmcnt = dyn_cast<S_WAITCNT_VMCNT>(first)) {
+        vmcntVal = vmcnt.getCountAttr().getValue().getSExtValue();
+        lgkmcntVal = dyn_cast<S_WAITCNT_LGKMCNT>(second)
+                         .getCountAttr()
+                         .getValue()
+                         .getSExtValue();
+      } else {
+        lgkmcntVal = dyn_cast<S_WAITCNT_LGKMCNT>(first)
+                         .getCountAttr()
+                         .getValue()
+                         .getSExtValue();
+        vmcntVal = dyn_cast<S_WAITCNT_VMCNT>(second)
+                       .getCountAttr()
+                       .getValue()
+                       .getSExtValue();
+      }
+
+      OpBuilder builder(first->getContext());
+      builder.setInsertionPoint(first);
+      S_WAITCNT::create(builder, first->getLoc(),
+                        builder.getI32IntegerAttr(vmcntVal),
+                        builder.getI32IntegerAttr(lgkmcntVal), IntegerAttr());
+
+      second->erase();
+      first->erase();
+    }
   }
 };
 
