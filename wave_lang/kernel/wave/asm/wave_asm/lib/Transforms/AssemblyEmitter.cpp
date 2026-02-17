@@ -1053,57 +1053,89 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 }
               }
 
-              // Emit copies for loop-carried value swaps. Detect 2-element swap
-              // cycles (A->B, B->A) and use a temporary register to implement
-              // a parallel swap. Multiple independent swap pairs are handled.
+              // Emit copies for loop-carried value rotation/swaps.
+              // Uses general permutation cycle decomposition to handle
+              // N-way rotations (not just 2-way swaps).
               //
-              // Algorithm: find swap pairs in the pending copies, emit each
-              // pair using 3 s_mov_b32 instructions (tmp=A, A=B, B=tmp).
-              // Non-swap copies are emitted directly.
-              SmallVector<bool> handled(pendingCopies.size(), false);
+              // Algorithm:
+              // 1. Build adjacency map: dst -> (src, isSGPR)
+              // 2. Find cycles by following dst->src chains
+              // 3. For each cycle of length N:
+              //      tmp = reg[0]; reg[0]=reg[1]; ...; reg[N-1]=tmp
+              //    Cost: N+1 moves (using one scratch register)
+              // 4. Non-cycle copies emit directly
+              //
+              // This handles 2-way swaps (A<->B: 3 moves),
+              // 3-way rotations (A->B->C->A: 4 moves), and any N.
 
-              // First pass: find and emit swap pairs
-              for (size_t i = 0; i < pendingCopies.size(); ++i) {
-                if (handled[i])
-                  continue;
-                for (size_t j = i + 1; j < pendingCopies.size(); ++j) {
-                  if (handled[j])
-                    continue;
-                  // Check if (i, j) form a swap pair
-                  if (pendingCopies[i].dst == pendingCopies[j].src &&
-                      pendingCopies[j].dst == pendingCopies[i].src) {
-                    if (pendingCopies[i].isSGPR && pendingCopies[j].isSGPR) {
-                      // Emit 3-instruction swap using a temporary SGPR.
-                      int64_t regA = pendingCopies[i].dst;
-                      int64_t regB = pendingCopies[j].dst;
-                      int64_t tmp = peakSGPRs;
-                      peakSGPRs = std::max(peakSGPRs, tmp + 1);
-                      os << "  s_mov_b32 s" << tmp << ", s" << regA << "\n";
-                      os << "  s_mov_b32 s" << regA << ", s" << regB << "\n";
-                      os << "  s_mov_b32 s" << regB << ", s" << tmp << "\n";
-                      handled[i] = true;
-                      handled[j] = true;
-                      break;
-                    }
-                    assert(!((!pendingCopies[i].isSGPR) &&
-                             (!pendingCopies[j].isSGPR)) &&
-                           "VGPR swap cycles in iter_args are not supported; "
-                           "extend swap emission to handle VGPRs");
-                  }
-                }
+              // Build adjacency: dst -> src
+              llvm::DenseMap<int64_t, int64_t> dstToSrc;
+              llvm::DenseMap<int64_t, bool> regIsSGPR;
+              for (const auto &copy : pendingCopies) {
+                dstToSrc[copy.dst] = copy.src;
+                regIsSGPR[copy.dst] = copy.isSGPR;
+                regIsSGPR[copy.src] = copy.isSGPR;
               }
 
-              // Second pass: emit remaining non-swap copies
-              for (size_t i = 0; i < pendingCopies.size(); ++i) {
-                if (handled[i])
+              llvm::DenseSet<int64_t> visited;
+
+              for (const auto &copy : pendingCopies) {
+                int64_t start = copy.dst;
+                if (visited.contains(start))
                   continue;
-                const auto &copy = pendingCopies[i];
-                if (copy.isSGPR) {
-                  os << "  s_mov_b32 s" << copy.dst << ", s" << copy.src
-                     << "\n";
+
+                // Follow the chain: start -> src -> src's src -> ...
+                SmallVector<int64_t> chain;
+                int64_t cur = start;
+                while (!visited.contains(cur) && dstToSrc.contains(cur)) {
+                  visited.insert(cur);
+                  chain.push_back(cur);
+                  cur = dstToSrc[cur];
+                }
+
+                if (cur == start && chain.size() > 1) {
+                  // Found a cycle of length chain.size()
+                  // Emit: tmp = chain[0]
+                  //        chain[0] = chain[1]
+                  //        chain[1] = chain[2]
+                  //        ...
+                  //        chain[N-1] = tmp
+                  bool isSGPR = regIsSGPR.lookup(chain[0]);
+                  if (isSGPR) {
+                    int64_t tmp = peakSGPRs;
+                    peakSGPRs = std::max(peakSGPRs, tmp + 1);
+                    os << "  s_mov_b32 s" << tmp << ", s" << chain[0] << "\n";
+                    for (size_t k = 0; k + 1 < chain.size(); ++k) {
+                      os << "  s_mov_b32 s" << chain[k] << ", s"
+                         << chain[k + 1] << "\n";
+                    }
+                    os << "  s_mov_b32 s" << chain.back() << ", s" << tmp
+                       << "\n";
+                  } else {
+                    int64_t tmp = peakVGPRs;
+                    peakVGPRs = std::max(peakVGPRs, tmp + 1);
+                    os << "  v_mov_b32 v" << tmp << ", v" << chain[0] << "\n";
+                    for (size_t k = 0; k + 1 < chain.size(); ++k) {
+                      os << "  v_mov_b32 v" << chain[k] << ", v"
+                         << chain[k + 1] << "\n";
+                    }
+                    os << "  v_mov_b32 v" << chain.back() << ", v" << tmp
+                       << "\n";
+                  }
                 } else {
-                  os << "  v_mov_b32 v" << copy.dst << ", v" << copy.src
-                     << "\n";
+                  // Not a cycle: emit simple copies for chain elements
+                  // (copies whose dst is not part of a cycle)
+                  for (int64_t reg : chain) {
+                    if (!dstToSrc.contains(reg))
+                      continue;
+                    int64_t src = dstToSrc[reg];
+                    bool isSGPR = regIsSGPR.lookup(reg);
+                    if (isSGPR) {
+                      os << "  s_mov_b32 s" << reg << ", s" << src << "\n";
+                    } else {
+                      os << "  v_mov_b32 v" << reg << ", v" << src << "\n";
+                    }
+                  }
                 }
               }
             }

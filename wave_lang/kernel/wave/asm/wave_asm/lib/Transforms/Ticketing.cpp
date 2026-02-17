@@ -34,6 +34,7 @@
 #include "waveasm/Dialect/WaveASMDialect.h"
 #include "waveasm/Dialect/WaveASMInterfaces.h"
 #include "waveasm/Dialect/WaveASMOps.h"
+#include "waveasm/Transforms/Liveness.h"
 #include "waveasm/Transforms/Passes.h"
 
 #include "mlir/IR/Builders.h"
@@ -285,11 +286,13 @@ private:
     // Sequential operation counter for latency tracking
     int64_t opIndex = 0;
 
-    // Walk through operations in order
-    program.walk([&](Operation *op) {
-      // Skip the program op itself
-      if (isa<ProgramOp>(op))
-        return;
+    // Collect all ops first then iterate, to avoid iterator invalidation
+    // when inserting new waitcnt ops during traversal.  program.walk
+    // triggers double-free crashes on large triple-buffered kernels.
+    llvm::SmallVector<Operation *> allOps;
+    collectOpsRecursive(program.getBodyBlock(), allOps);
+
+    auto processOp = [&](Operation *op) {
 
       // Increment sequential index for every real operation
       ++opIndex;
@@ -588,7 +591,10 @@ private:
           op->getName().getStringRef().contains("branch")) {
         ticketing.resetWaits();
       }
-    });
+    };
+
+    for (Operation *op : allOps)
+      processOp(op);
 
     // Post-processing: combine adjacent separate s_waitcnt_vmcnt and
     // s_waitcnt_lgkmcnt into a single combined s_waitcnt instruction.
@@ -603,32 +609,37 @@ private:
   void combineAdjacentWaitcnts(ProgramOp program) {
     llvm::SmallVector<std::pair<Operation *, Operation *>> toCombine;
 
-    program.walk([&](Operation *op) {
-      if (isa<ProgramOp>(op))
-        return;
+    // Collect ops first to avoid walk-during-modification issues.
+    llvm::SmallVector<Operation *> combineOps;
+    collectOpsRecursive(program.getBodyBlock(), combineOps);
 
+    for (Operation *op : combineOps) {
       Operation *next = op->getNextNode();
       if (!next)
-        return;
+        continue;
 
-      // Check for vmcnt followed by lgkmcnt
       auto vmcntOp = dyn_cast<S_WAITCNT_VMCNT>(op);
       auto lgkmcntOp = dyn_cast<S_WAITCNT_LGKMCNT>(next);
       if (vmcntOp && lgkmcntOp) {
         toCombine.push_back({op, next});
-        return;
+        continue;
       }
 
-      // Check for lgkmcnt followed by vmcnt
       auto lgkmcntOp2 = dyn_cast<S_WAITCNT_LGKMCNT>(op);
       auto vmcntOp2 = dyn_cast<S_WAITCNT_VMCNT>(next);
       if (lgkmcntOp2 && vmcntOp2) {
         toCombine.push_back({op, next});
-        return;
+        continue;
       }
-    });
+    }
 
+    // Track erased ops to avoid double-free when consecutive toCombine
+    // entries share an operation (e.g. vmcnt/lgkmcnt/vmcnt triple).
+    llvm::DenseSet<Operation *> erased;
     for (auto [first, second] : toCombine) {
+      if (erased.contains(first) || erased.contains(second))
+        continue;
+
       int64_t vmcntVal = 0;
       int64_t lgkmcntVal = 0;
 
@@ -655,6 +666,8 @@ private:
                         builder.getI32IntegerAttr(vmcntVal),
                         builder.getI32IntegerAttr(lgkmcntVal), IntegerAttr());
 
+      erased.insert(first);
+      erased.insert(second);
       second->erase();
       first->erase();
     }

@@ -1010,3 +1010,295 @@ def get_mxfp4_aiter_faithful_schedule():
         # No wave staggering — not beneficial at 4-wave occupancy
 
     return mxfp4_aiter_faithful
+
+
+def get_mxfp4_dbuf_hipblaslt_schedule():
+    """Return an asymmetric MXFP4 schedule (HipBLASLt-style).
+
+    - A data goes through LDS (GatherToLDS -> ds_read -> VGPR), triple-buffered
+    - B data loaded directly from global to VGPRs (no LDS)
+    - Prefetch depth of A is 2
+    - Fixed/optimized waitcnts for barriers
+    """
+    M = tkl.sym.M
+
+    @wave_schedule.wave_schedule()
+    def mxfp4_dbuf_schedule():
+        k_loop = tkw.get_node_by_tag("k_loop")
+
+        all_read_a = tkw.get_node_by_tag("read_a")
+        g2s_a = tkw.filter_nodes(all_read_a, node_type=tkw.GatherToLDS)
+        s2v_a = tkw.filter_nodes(all_read_a, node_type=tkw.Read)
+
+        all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
+        g2s_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.GatherToLDS)
+        s2v_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
+
+        s2v_a_0, s2v_a_1 = tkw.partition_by_dim(s2v_a, dim=M, num_partitions=2)
+        s2v_a_scale_0, s2v_a_scale_1 = tkw.partition_by_dim(
+            s2v_a_scale, dim=M, num_partitions=2
+        )
+
+        # B data and B scale - Global to Vector (no LDS)
+        g2v_b = tkw.get_node_by_tag("read_b")
+        g2v_b_scale = tkw.get_node_by_tag("read_b_scale")
+
+        bitcast_a = tkw.get_node_by_tag("bitcast_a")
+        bitcast_a_scale = tkw.get_node_by_tag("bitcast_a_scale")
+        bitcast_b = tkw.get_node_by_tag("bitcast_b")
+        bitcast_b_scale = tkw.get_node_by_tag("bitcast_b_scale")
+
+        scaled_mma = tkw.get_node_by_tag("scaled_mma")
+
+        # 3-stage pipeline (triple buffer for A)
+        pipeline_loop = tkw.pipeline(k_loop)
+
+        with pipeline_loop as pl:
+            pl.set_stage(
+                [
+                    (g2s_a, g2s_a_scale),
+                    (),
+                    (),
+                ],
+            )
+            pl.set_stage(
+                [
+                    (g2v_b, g2v_b_scale),
+                    (s2v_a_0, s2v_a_scale_0),
+                    (),
+                ],
+            )
+            pl.set_stage(
+                [
+                    (s2v_a_1, s2v_a_scale_1),
+                    (bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale),
+                    (scaled_mma,),
+                ],
+            )
+
+        num_m_partitions = 2
+        num_pf_iters = 2
+
+        # ======================= Prologue =======================
+        prologue_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2s_a_scale = tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.PROLOGUE)
+        prologue_s2v_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=pipeline_loop.PROLOGUE)
+        prologue_s2v_a_scale_0 = tkw.filter_nodes(s2v_a_scale_0, subgraph=pipeline_loop.PROLOGUE)
+
+        g2s_per_iter = (len(prologue_g2s_a) + len(prologue_g2s_a_scale)) // num_pf_iters
+        must_complete = g2s_per_iter // num_m_partitions
+        total_vmcnt = (
+            len(prologue_g2s_a) + len(prologue_g2s_a_scale)
+            + len(prologue_g2v_b) + len(prologue_g2v_b_scale)
+        )
+        prologue_vmcnt = total_vmcnt - must_complete
+
+        prologue_clusters = [
+            tkw.cluster([
+                prologue_g2s_a, prologue_g2s_a_scale,
+                prologue_g2v_b, prologue_g2v_b_scale,
+                tkw.MemoryCounterWaitBarrier(load=prologue_vmcnt),
+                prologue_s2v_a_0, prologue_s2v_a_scale_0,
+            ])
+        ]
+
+        # ======================= Kernel =======================
+        # Compute waitcnt values before unrolling (use pre-unroll node counts)
+        loop_g2v_b_pre = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.KERNEL)
+        loop_g2v_b_scale_pre = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.KERNEL)
+        n_b_loads = len(loop_g2v_b_pre) + len(loop_g2v_b_scale_pre)
+        a_sub_block = g2s_per_iter // num_m_partitions
+        total_prologue_loads = total_vmcnt
+        prologue_wait_load = total_prologue_loads - a_sub_block
+        loop_wait_load = prologue_wait_load - a_sub_block - n_b_loads
+
+        tkw.insert_at_start(
+            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=loop_wait_load)
+        )
+
+        # Unroll FIRST, then reorder across iterations to reduce VGPR
+        # pressure at the iteration boundary.
+        unroll_factor = 2
+        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
+
+        # Access nodes per unrolled iteration using tag + iteration.
+        # Tags are preserved through unrolling; iteration 0 = original,
+        # iteration 1 = unrolled copy.
+        def get_iter(tag, it):
+            return tkw.get_node_by_tag_and_iteration(tag, iteration=it)
+
+        # Iter 0 nodes
+        g2s_a_i0 = get_iter("read_a", 0)
+        g2s_a_scale_i0 = get_iter("read_a_scale", 0)
+        g2v_b_i0 = get_iter("read_b", 0)
+        g2v_b_scale_i0 = get_iter("read_b_scale", 0)
+        bitcast_a_i0 = get_iter("bitcast_a", 0)
+        bitcast_a_scale_i0 = get_iter("bitcast_a_scale", 0)
+        bitcast_b_i0 = get_iter("bitcast_b", 0)
+        bitcast_b_scale_i0 = get_iter("bitcast_b_scale", 0)
+        mma_i0 = get_iter("scaled_mma", 0)
+
+        # Iter 1 nodes
+        g2s_a_i1 = get_iter("read_a", 1)
+        g2s_a_scale_i1 = get_iter("read_a_scale", 1)
+        g2v_b_i1 = get_iter("read_b", 1)
+        g2v_b_scale_i1 = get_iter("read_b_scale", 1)
+        bitcast_a_i1 = get_iter("bitcast_a", 1)
+        bitcast_a_scale_i1 = get_iter("bitcast_a_scale", 1)
+        bitcast_b_i1 = get_iter("bitcast_b", 1)
+        bitcast_b_scale_i1 = get_iter("bitcast_b_scale", 1)
+        mma_i1 = get_iter("scaled_mma", 1)
+
+        # Filter to keep only KERNEL-stage nodes (tags return all stages).
+        # After unrolling, filter_nodes with subgraph still works since
+        # unrolled nodes inherit pipeline_stage metadata.
+        def keep_kernel(nodes):
+            """Filter nodes to only those in the KERNEL pipeline stage."""
+            return [n for n in nodes
+                    if hasattr(n, 'meta') and n.meta.get('pipeline_stage') == pipeline_loop.KERNEL.stage]
+
+        # The read_a tag includes both GatherToLDS (G2S) and Read (s2v) nodes.
+        # Separate them by node type.
+        g2s_a_i0 = tkw.filter_nodes(g2s_a_i0, node_type=tkw.GatherToLDS)
+        g2s_a_scale_i0 = tkw.filter_nodes(g2s_a_scale_i0, node_type=tkw.GatherToLDS)
+        s2v_a_i0 = tkw.filter_nodes(get_iter("read_a", 0), node_type=tkw.Read)
+        s2v_a_scale_i0 = tkw.filter_nodes(get_iter("read_a_scale", 0), node_type=tkw.Read)
+
+        g2s_a_i1 = tkw.filter_nodes(g2s_a_i1, node_type=tkw.GatherToLDS)
+        g2s_a_scale_i1 = tkw.filter_nodes(g2s_a_scale_i1, node_type=tkw.GatherToLDS)
+        s2v_a_i1 = tkw.filter_nodes(get_iter("read_a", 1), node_type=tkw.Read)
+        s2v_a_scale_i1 = tkw.filter_nodes(get_iter("read_a_scale", 1), node_type=tkw.Read)
+
+        # Partition s2v_a by M (each iter has M0 and M1 halves)
+        s2v_a_i0_m0, s2v_a_i0_m1 = tkw.partition_by_dim(s2v_a_i0, dim=M, num_partitions=2)
+        s2v_a_scale_i0_m0, s2v_a_scale_i0_m1 = tkw.partition_by_dim(s2v_a_scale_i0, dim=M, num_partitions=2)
+        s2v_a_i1_m0, s2v_a_i1_m1 = tkw.partition_by_dim(s2v_a_i1, dim=M, num_partitions=2)
+        s2v_a_scale_i1_m0, s2v_a_scale_i1_m1 = tkw.partition_by_dim(s2v_a_scale_i1, dim=M, num_partitions=2)
+
+        # Partition MMA and bitcast_a by M
+        mma_i0_m0, mma_i0_m1 = tkw.partition_by_dim(mma_i0, dim=M, num_partitions=2)
+        mma_i1_m0, mma_i1_m1 = tkw.partition_by_dim(mma_i1, dim=M, num_partitions=2)
+        bitcast_a_i0_m0, bitcast_a_i0_m1 = tkw.partition_by_dim(bitcast_a_i0, dim=M, num_partitions=2)
+        bitcast_a_scale_i0_m0, bitcast_a_scale_i0_m1 = tkw.partition_by_dim(bitcast_a_scale_i0, dim=M, num_partitions=2)
+        bitcast_a_i1_m0, bitcast_a_i1_m1 = tkw.partition_by_dim(bitcast_a_i1, dim=M, num_partitions=2)
+        bitcast_a_scale_i1_m0, bitcast_a_scale_i1_m1 = tkw.partition_by_dim(bitcast_a_scale_i1, dim=M, num_partitions=2)
+
+        # Build cross-iteration clusters.
+        # Key idea: iter0 uses data already loaded (from prev iteration/prologue),
+        # completes MFMAs and frees VGPRs BEFORE iter1 loads new data.
+        # This reduces peak VGPR pressure at the iteration boundary.
+        clusters = [
+            # Iter 0: bitcasts + MMA_0, then load next-half data + MMA_1 + G2S
+            tkw.cluster([
+                bitcast_a_i0_m0, bitcast_a_scale_i0_m0,
+                bitcast_b_i0, bitcast_b_scale_i0,
+                mma_i0_m0,
+                g2v_b_i0, s2v_a_i0_m1,
+                g2v_b_scale_i0, s2v_a_scale_i0_m1,
+                bitcast_a_i0_m1, bitcast_a_scale_i0_m1,
+                tkw.SchedulingBarrier([]),
+            ]),
+            tkw.cluster([
+                mma_i0_m1,
+                g2s_a_i0, g2s_a_scale_i0,
+                tkw.MemoryCounterWaitBarrier(load=n_b_loads, ds=0),
+                s2v_a_i0_m0, s2v_a_scale_i0_m0,
+                tkw.SchedulingBarrier([]),
+            ]),
+            # Iter 1: bitcasts + MMA_0, then load next-half data + MMA_1 + G2S
+            tkw.cluster([
+                bitcast_a_i1_m0, bitcast_a_scale_i1_m0,
+                bitcast_b_i1, bitcast_b_scale_i1,
+                mma_i1_m0,
+                g2v_b_i1, s2v_a_i1_m1,
+                g2v_b_scale_i1, s2v_a_scale_i1_m1,
+                bitcast_a_i1_m1, bitcast_a_scale_i1_m1,
+                tkw.SchedulingBarrier([]),
+            ]),
+            tkw.cluster([
+                mma_i1_m1,
+                g2s_a_i1, g2s_a_scale_i1,
+                tkw.MemoryCounterWaitBarrier(load=n_b_loads, ds=0),
+                s2v_a_i1_m0, s2v_a_scale_i1_m0,
+                tkw.SchedulingBarrier([]),
+            ]),
+        ]
+
+        # ======================= Epilogue =======================
+        epilogue_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_s2v_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_s2v_a_scale_0 = tkw.filter_nodes(s2v_a_scale_0, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_s2v_a_1 = tkw.filter_nodes(s2v_a_1, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_s2v_a_scale_1 = tkw.filter_nodes(s2v_a_scale_1, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_bitcast_a_scale = tkw.filter_nodes(bitcast_a_scale, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_bitcast_b_scale = tkw.filter_nodes(bitcast_b_scale, subgraph=pipeline_loop.EPILOGUE)
+        epilogue_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.EPILOGUE)
+
+        def split_by_iteration(nodes, key="name"):
+            itr0, itr1 = [], []
+            for node in nodes:
+                value = getattr(node, key)
+                if "1_2" in value:
+                    itr0.append(node)
+                elif "2_2" in value:
+                    itr1.append(node)
+                else:
+                    raise ValueError(f"Unknown {key} for node: {value}")
+            return itr0, itr1
+
+        epilogue_mma_itr0, epilogue_mma_itr1 = split_by_iteration(epilogue_mma)
+        epilogue_s2v_a_1_itr0, epilogue_s2v_a_1_itr1 = split_by_iteration(epilogue_s2v_a_1)
+        epilogue_s2v_a_scale_1_itr0, epilogue_s2v_a_scale_1_itr1 = split_by_iteration(epilogue_s2v_a_scale_1)
+        epilogue_bitcast_a_itr0, epilogue_bitcast_a_itr1 = split_by_iteration(epilogue_bitcast_a)
+        epilogue_bitcast_a_scale_itr0, epilogue_bitcast_a_scale_itr1 = split_by_iteration(epilogue_bitcast_a_scale)
+        epilogue_bitcast_b_itr0, epilogue_bitcast_b_itr1 = split_by_iteration(epilogue_bitcast_b)
+        epilogue_bitcast_b_scale_itr0, epilogue_bitcast_b_scale_itr1 = split_by_iteration(epilogue_bitcast_b_scale)
+
+        epilogue_mma_itr0_0, epilogue_mma_itr0_1 = tkw.partition_by_dim(epilogue_mma_itr0, dim=M, num_partitions=2)
+        epilogue_bitcast_a_itr0_0, epilogue_bitcast_a_itr0_1 = tkw.partition_by_dim(epilogue_bitcast_a_itr0, dim=M, num_partitions=2)
+        epilogue_bitcast_a_scale_itr0_0, epilogue_bitcast_a_scale_itr0_1 = tkw.partition_by_dim(epilogue_bitcast_a_scale_itr0, dim=M, num_partitions=2)
+        epilogue_mma_itr1_0, epilogue_mma_itr1_1 = tkw.partition_by_dim(epilogue_mma_itr1, dim=M, num_partitions=2)
+        epilogue_bitcast_a_itr1_0, epilogue_bitcast_a_itr1_1 = tkw.partition_by_dim(epilogue_bitcast_a_itr1, dim=M, num_partitions=2)
+        epilogue_bitcast_a_scale_itr1_0, epilogue_bitcast_a_scale_itr1_1 = tkw.partition_by_dim(epilogue_bitcast_a_scale_itr1, dim=M, num_partitions=2)
+
+        epilogue_clusters_itr0 = [
+            tkw.cluster([
+                epilogue_bitcast_a_itr0_0, epilogue_bitcast_a_scale_itr0_0,
+                epilogue_bitcast_b_itr0, epilogue_bitcast_b_scale_itr0,
+                tkw.SchedulingBarrier([]),
+                epilogue_mma_itr0_0,
+                epilogue_g2v_b, epilogue_s2v_a_1_itr0,
+                epilogue_g2v_b_scale, epilogue_s2v_a_scale_1_itr0,
+                epilogue_bitcast_a_itr0_1, epilogue_bitcast_a_scale_itr0_1,
+            ]),
+            tkw.cluster([
+                epilogue_mma_itr0_1,
+                tkw.SchedulingBarrier([]),
+                epilogue_s2v_a_0, epilogue_s2v_a_scale_0,
+            ]),
+            tkw.cluster([
+                epilogue_bitcast_a_itr1_0, epilogue_bitcast_a_scale_itr1_0,
+                epilogue_bitcast_b_itr1, epilogue_bitcast_b_scale_itr1,
+                tkw.SchedulingBarrier([]),
+                epilogue_mma_itr1_0,
+                epilogue_s2v_a_1_itr1, epilogue_s2v_a_scale_1_itr1,
+            ]),
+            tkw.cluster([
+                epilogue_bitcast_a_itr1_1, epilogue_bitcast_a_scale_itr1_1,
+                epilogue_mma_itr1_1,
+            ]),
+        ]
+
+        # Reorder the KERNEL with cross-iteration clusters
+        tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
+
+        # Reorder the EPILOGUE (unchanged from original)
+        epi_clusters = epilogue_clusters_itr0 + prologue_clusters
+        tkw.reorder_graph(pipeline_loop.EPILOGUE, epi_clusters)
+
+    return mxfp4_dbuf_schedule

@@ -1400,8 +1400,10 @@ def run_mxfp4_comparison(
 
     def _fresh_options():
         """Return a fresh (kernel, options) pair for this MXFP4 config."""
+        _nw = cfg["num_waves"]
+        _ws = (2, 2) if _nw <= 4 else (4, 2)
         gemm, opts = get_tagged_mxfp4_gemm(
-            cfg["shape"], cfg["block"], num_waves=cfg["num_waves"]
+            cfg["shape"], cfg["block"], wave_shape=_ws
         )
         opts = set_default_run_config(opts)
         opts.compile_to_mlir = False

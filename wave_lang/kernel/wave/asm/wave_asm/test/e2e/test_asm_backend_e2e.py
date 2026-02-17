@@ -1358,7 +1358,9 @@ def _dbuf_mxfp4_helper(
     )
 
     # Get tagged kernel + options (same as 7.1_schedule.py)
-    gemm, options = get_tagged_mxfp4_gemm(shape, block, num_waves=num_waves)
+    # Convert num_waves to wave_shape: 4->(2,2), 8->(4,2)
+    wave_shape = (2, 2) if num_waves <= 4 else (4, 2)
+    gemm, options = get_tagged_mxfp4_gemm(shape, block, wave_shape=wave_shape)
     # Use aiter-style schedule for 4-wave (deeper K x M interleaving),
     # standard double-buffer schedule for 8-wave.
     if num_waves <= 4:

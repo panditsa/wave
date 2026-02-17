@@ -1456,7 +1456,8 @@ M, N, K = {M}, {N}, {K}
 shape = (M, N, K)
 block_shape = ({bm}, {bn}, {bk})
 
-gemm, options = get_tagged_mxfp4_gemm(shape, block_shape, num_waves={num_waves})
+_ws = (2, 2) if {num_waves} <= 4 else (4, 2)
+gemm, options = get_tagged_mxfp4_gemm(shape, block_shape, wave_shape=_ws)
 schedule = get_mxfp4_aiter_style_schedule()
 options = set_default_run_config(options)
 
@@ -1517,7 +1518,8 @@ M, N, K = {M}, {N}, {K}
 shape = (M, N, K)
 block_shape = ({bm}, {bn}, {bk})
 
-gemm, opts = get_tagged_mxfp4_gemm(shape, block_shape, num_waves={num_waves})
+_ws = (2, 2) if {num_waves} <= 4 else (4, 2)
+gemm, opts = get_tagged_mxfp4_gemm(shape, block_shape, wave_shape=_ws)
 schedule = get_mxfp4_aiter_style_schedule()
 opts = set_default_run_config(opts)
 opts.backend = "asm"
@@ -1826,8 +1828,9 @@ def main():
         from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
         from wave_lang.kernel.wave.utils.mxfp_utils import generate_gemm_afp4wfp4_inputs
 
+        _ws = (2, 2) if pcfg.num_waves <= 4 else (4, 2)
         gemm, options = get_tagged_mxfp4_gemm(
-            shape, pcfg.block_shape, num_waves=pcfg.num_waves)
+            shape, pcfg.block_shape, wave_shape=_ws)
         schedule = get_mxfp4_aiter_style_schedule()
         options = set_default_run_config(options)
 
@@ -1933,8 +1936,9 @@ def main():
         from test_asm_backend_e2e import capture_wave_kernel_info
         from waveasm_e2e import WaveASMCompiler, run_with_wave_runtime
 
+        _ws2 = (2, 2) if pcfg.num_waves <= 4 else (4, 2)
         gemm2, opts2 = get_tagged_mxfp4_gemm(
-            shape, pcfg.block_shape, num_waves=pcfg.num_waves)
+            shape, pcfg.block_shape, wave_shape=_ws2)
         schedule2 = get_mxfp4_aiter_style_schedule()
         opts2 = set_default_run_config(opts2)
         opts2.backend = "asm"
