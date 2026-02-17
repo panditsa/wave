@@ -492,8 +492,6 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
           auto scaledImm = ctx.createImmType(scaledConst);
           auto scaledConstOp =
               ConstantOp::create(builder, loc, scaledImm, scaledConst);
-          // NOTE: constant must be src0 (first operand) for VOP2 encoding.
-          // src1 must be a VGPR on AMDGCN.
           voff = V_ADD_U32::create(builder, loc, vregType, scaledConstOp,
                                    baseVoff);
         } else {

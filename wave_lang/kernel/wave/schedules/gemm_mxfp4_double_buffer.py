@@ -457,66 +457,73 @@ def get_mxfp4_aiter_style_schedule():
         independent_global_count = len(loop_global_to_shared)
 
         # =================================================================
-        # Build 8 clusters: 4 MMA groups (K0-M0, K0-M1, K1-M0, K1-M1)
-        # each preceded by its corresponding loads.
+        # Build 4 merged clusters.  Each cluster contains:
+        #   1. Current-phase data loads + bitcasts (RAW dep: before MFMAs)
+        #   2. SchedulingBarrier (LLVM: don't hoist MFMAs before loads)
+        #   3. MFMAs for this phase
+        #   4. Next-phase prefetch reads (safe: different VGPR dests)
+        #   5. G2S loads for next K iteration (safe: writes other LDS bank)
+        #   6. SchedulingBarrier (LLVM: boundary before next phase)
         #
-        # Structure per cluster pair:
-        #   Load cluster: A loads (M-partitioned) + B loads (shared) +
-        #                 A/B bitcasts + scheduling barrier
-        #   MFMA cluster: SetWavePrio(1) + MFMAs + SetWavePrio(0)
+        # The C++ backend ignores SchedulingBarrier (silently dropped)
+        # and emits ops in source order, producing:
+        #   [ds_reads] [MFMAs] [ds_reads_next] [G2S]
+        # This overlaps next-phase reads and G2S with MFMA execution.
+        #
+        # LLVM gets freedom to reorder within each barrier-bounded
+        # region while preserving the macro-level phase ordering.
         # =================================================================
 
+        # Split G2S loads into 2 halves: first half with K0, second with K1
+        g2s_all = list(loop_global_to_shared)
+        g2s_half = max(1, len(g2s_all) // 2)
+        g2s_h0 = g2s_all[:g2s_half]
+        g2s_h1 = g2s_all[g2s_half:]
+
         clusters = [
-            # --- K0-M0: First K-half, first M-half ---
+            # --- Phase 0 (K0-M0): loads + G2S + MFMAs + K0-M1 prefetch ---
+            # G2S loads go BEFORE MFMAs so they have time to complete before
+            # the barrier at the end (vmcnt(N) must count completed G2S).
             tkw.cluster(
                 [
+                    # Current-phase data (must complete before MFMAs)
                     a_load_k0_m0,
                     a_scale_load_k0_m0,
-                    loop_shared_load_b_k0,  # B loads shared across M
+                    loop_shared_load_b_k0,
                     loop_shared_load_b_scale_k0,
                     bitcast_a_k0_m0,
                     bitcast_a_scale_k0_m0,
                     loop_bitcast_b_k0,
                     loop_bitcast_b_scale_k0,
                     tkw.SchedulingBarrier([]),
-                    loop_global_to_shared,  # Async G2S prefetch
+                    # G2S loads (next-K prefetch, writes to other LDS bank)
+                    loop_global_to_shared,
                     tkw.SchedulingBarrier([]),
-                ],
-            ),
-            tkw.cluster(
-                [
+                    # MFMAs
                     tkw.SetWavePrio(1),
                     mma_k0_m0,
                     tkw.SetWavePrio(0),
-                    tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=independent_global_count),
-                    tkw.SchedulingBarrier([]),
-                ],
-            ),
-            # --- K0-M1: First K-half, second M-half ---
-            tkw.cluster(
-                [
+                    # Next-phase prefetch reads (different VGPR dests, safe)
                     a_load_k0_m1,
                     a_scale_load_k0_m1,
                     bitcast_a_k0_m1,
                     bitcast_a_scale_k0_m1,
                     tkw.SchedulingBarrier([]),
+                    tkw.MemoryCounterWaitBarrier(load=independent_global_count),
+                    tkw.SchedulingBarrier([]),
                 ],
             ),
+            # --- Phase 1 (K0-M1): MFMAs + K1-M0 prefetch ---
+            # K0-M1 data was prefetched during Phase 0 (after MFMAs).
             tkw.cluster(
                 [
                     tkw.SetWavePrio(1),
                     mma_k0_m1,
                     tkw.SetWavePrio(0),
-                    tkw.SchedulingBarrier([]),
-                ],
-            ),
-            # --- K1-M0: Second K-half, first M-half ---
-            tkw.cluster(
-                [
+                    # K1-M0 prefetch: B loads for K1 + A loads for K1-M0
                     a_load_k1_m0,
                     a_scale_load_k1_m0,
-                    loop_shared_load_b_k1,  # B loads shared across M
+                    loop_shared_load_b_k1,
                     loop_shared_load_b_scale_k1,
                     bitcast_a_k1_m0,
                     bitcast_a_scale_k1_m0,
@@ -527,17 +534,14 @@ def get_mxfp4_aiter_style_schedule():
                     tkw.SchedulingBarrier([]),
                 ],
             ),
+            # --- Phase 2 (K1-M0): MFMAs + K1-M1 prefetch ---
+            # K1-M0 data was prefetched during Phase 1 (after MFMAs).
             tkw.cluster(
                 [
                     tkw.SetWavePrio(1),
                     mma_k1_m0,
                     tkw.SetWavePrio(0),
-                    tkw.SchedulingBarrier([]),
-                ],
-            ),
-            # --- K1-M1: Second K-half, second M-half ---
-            tkw.cluster(
-                [
+                    # K1-M1 prefetch
                     a_load_k1_m1,
                     a_scale_load_k1_m1,
                     bitcast_a_k1_m1,
@@ -545,6 +549,8 @@ def get_mxfp4_aiter_style_schedule():
                     tkw.SchedulingBarrier([]),
                 ],
             ),
+            # --- Phase 3 (K1-M1): MFMAs only ---
+            # K1-M1 data was prefetched during Phase 2 (after MFMAs).
             tkw.cluster(
                 [
                     tkw.SetWavePrio(1),

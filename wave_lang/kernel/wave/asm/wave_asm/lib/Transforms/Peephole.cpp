@@ -830,9 +830,63 @@ struct PeepholePass
       return;
     }
 
-    // After pattern-based optimizations, eliminate redundant M0 writes.
-    // Track the last M0 source value and skip writes that set M0 to the
-    // same value. This requires sequential analysis, not a rewrite pattern.
+    // Loop-invariant code motion (LICM): hoist VALU instructions whose
+    // operands all dominate the loop out of LoopOp bodies.  This matches
+    // the aiter pattern where all LDS address computation is in the
+    // prologue and zero VALU appears in the hot loop.
+    module.walk([](LoopOp loopOp) {
+      Block &body = loopOp.getBodyBlock();
+      Region *loopRegion = &loopOp.getBodyRegion();
+
+      // Check if a value dominates the loop (defined outside the region)
+      auto dominatesLoop = [&](Value val) -> bool {
+        if (auto *defOp = val.getDefiningOp()) {
+          return defOp->getParentRegion() != loopRegion;
+        }
+        // Block arguments of the loop body do NOT dominate (they're
+        // loop-carried values that change each iteration)
+        if (auto blockArg = dyn_cast<BlockArgument>(val)) {
+          return blockArg.getOwner()->getParentOp() != loopOp.getOperation();
+        }
+        return false;
+      };
+
+      // Check if an op is a VALU (address computation) that's safe to hoist
+      auto isHoistableVALU = [](Operation *op) -> bool {
+        return isa<V_LSHLREV_B32, V_ADD_U32, V_MUL_LO_U32, V_AND_B32,
+                   V_OR_B32, V_LSHL_ADD_U32, V_LSHRREV_B32>(op);
+      };
+
+      // Iteratively collect and hoist: after hoisting a batch, new ops
+      // may become hoistable (their producer was just hoisted).
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        SmallVector<Operation *> toHoist;
+        for (Operation &op : body) {
+          if (!isHoistableVALU(&op))
+            continue;
+          bool allDominate = true;
+          for (Value operand : op.getOperands()) {
+            if (!dominatesLoop(operand)) {
+              allDominate = false;
+              break;
+            }
+          }
+          if (allDominate)
+            toHoist.push_back(&op);
+        }
+        for (Operation *op : toHoist) {
+          op->moveBefore(loopOp);
+          changed = true;
+        }
+      }
+    });
+
+    // After LICM and pattern-based optimizations, eliminate redundant M0
+    // writes. Track the last M0 source value and skip writes that set M0
+    // to the same value. This requires sequential analysis, not a
+    // rewrite pattern.
     module.walk([](ProgramOp program) {
       program.walk([](Block *block) {
         Value lastM0Source;

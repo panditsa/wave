@@ -1074,13 +1074,9 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                       pendingCopies[j].dst == pendingCopies[i].src) {
                     if (pendingCopies[i].isSGPR && pendingCopies[j].isSGPR) {
                       // Emit 3-instruction swap using a temporary SGPR.
-                      // Use peakSGPRs as the scratch register -- it is
-                      // guaranteed to be beyond all allocated SGPRs (computed
-                      // in a pre-pass over the entire IR before code gen).
                       int64_t regA = pendingCopies[i].dst;
                       int64_t regB = pendingCopies[j].dst;
                       int64_t tmp = peakSGPRs;
-                      // Update peak to account for the scratch register
                       peakSGPRs = std::max(peakSGPRs, tmp + 1);
                       os << "  s_mov_b32 s" << tmp << ", s" << regA << "\n";
                       os << "  s_mov_b32 s" << regA << ", s" << regB << "\n";
@@ -1089,9 +1085,6 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                       handled[j] = true;
                       break;
                     }
-                    // VGPR swap cycles are not yet supported. If we encounter
-                    // one, the two independent copies would produce incorrect
-                    // results (second copy reads overwritten value).
                     assert(!((!pendingCopies[i].isSGPR) &&
                              (!pendingCopies[j].isSGPR)) &&
                            "VGPR swap cycles in iter_args are not supported; "
@@ -1116,12 +1109,6 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             }
 
             // ConditionOp: emit conditional branch back to loop label.
-            // INVARIANT: The SCC flag must be set by the s_cmp immediately
-            // preceding this ConditionOp. No SCC-clobbering instructions
-            // (s_add, s_and, s_waitcnt, etc.) may be inserted between the
-            // s_cmp and this branch. Hazard mitigation and waitcnt insertion
-            // passes must respect this constraint (s_waitcnt and s_nop do
-            // not clobber SCC and are safe).
             os << "  s_cbranch_scc1 " << labelName;
             break;
           }

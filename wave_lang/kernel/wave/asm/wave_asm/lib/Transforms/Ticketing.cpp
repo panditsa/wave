@@ -21,8 +21,10 @@
 //    instructions separate the load from its use, we skip fine-grained
 //    lgkmcnt(N>0) waits since the data has certainly arrived. This matches
 //    how hand-tuned kernels (e.g., AITER) rely on latency hiding.
-// 3. Barrier handling uses "full drain" checks (hasOutstandingVmem/Lgkm)
-//    to correctly insert vmcnt(0)/lgkmcnt(0) before barriers.
+// 3. Barrier handling respects schedule-placed waitcnts: if the schedule
+//    already placed a partial wait (e.g., vmcnt(10)) before a barrier, the
+//    pass trusts it and only supplements missing counters.  This matches
+//    the aiter kernel's pattern of partial drains before barriers.
 // 4. Loop back-edge (ConditionOp) does NOT reset wait tracking, allowing
 //    waits from the end of one iteration to carry to the next, eliminating
 //    redundant waitcnts at loop tops.
@@ -117,11 +119,15 @@ public:
   /// Check if any VMEM operations are outstanding since the last full drain.
   /// Used for barrier pre-waits where we need vmcnt(0).
   bool hasOutstandingVmem() const {
+    if (lastVmemTicket < 0)
+      return false; // No VMEM ops issued at all
     return !lastVmemWait.has_value() || *lastVmemWait > 0;
   }
 
   /// Check if any LGKM operations are outstanding since the last full drain.
   bool hasOutstandingLgkm() const {
+    if (lastLgkmTicket < 0)
+      return false; // No LGKM ops issued at all
     return !lastLgkmWait.has_value() || *lastLgkmWait > 0;
   }
 
@@ -318,12 +324,39 @@ private:
         return;
       }
 
-      // Barriers require all memory to be synchronized before execution.
-      // Use hasOutstanding checks for correct full-drain detection with
-      // the incremental wait tracking.
+      // Barriers require memory to be synchronized before execution.
+      //
+      // If the schedule has already placed a waitcnt immediately before
+      // the barrier (e.g., from MemoryCounterWaitBarrier), we trust it
+      // and only add a supplementary wait for any counter the schedule
+      // didn't cover.  This allows partial waits like vmcnt(10) from
+      // the schedule to survive, matching the aiter kernel pattern.
+      //
+      // If no schedule-placed waitcnt precedes the barrier, fall back to
+      // the conservative full drain (vmcnt(0) lgkmcnt(0)).
       if (isa<S_BARRIER>(op)) {
-        bool needVmem = ticketing.hasOutstandingVmem();
-        bool needLgkm = ticketing.hasOutstandingLgkm();
+        // Check if the immediately preceding op is a waitcnt placed by the
+        // schedule (i.e., already in the IR before this pass ran).
+        // We detect this by checking the previous node.
+        Operation *prev = op->getPrevNode();
+        bool hasScheduleVmcnt = false;
+        bool hasScheduleLgkmcnt = false;
+
+        if (prev) {
+          if (auto swc = dyn_cast<S_WAITCNT>(prev)) {
+            hasScheduleVmcnt = swc.getVmcntAttr() != nullptr;
+            hasScheduleLgkmcnt = swc.getLgkmcntAttr() != nullptr;
+          } else if (isa<S_WAITCNT_VMCNT>(prev)) {
+            hasScheduleVmcnt = true;
+          } else if (isa<S_WAITCNT_LGKMCNT>(prev)) {
+            hasScheduleLgkmcnt = true;
+          }
+        }
+
+        // Only insert waits for counters not already covered by the
+        // schedule-placed waitcnt.
+        bool needVmem = !hasScheduleVmcnt && ticketing.hasOutstandingVmem();
+        bool needLgkm = !hasScheduleLgkmcnt && ticketing.hasOutstandingLgkm();
 
         if (needVmem || needLgkm) {
           OpBuilder builder(op->getContext());
@@ -341,9 +374,32 @@ private:
           numWaitcntInserted++;
         }
 
-        // Observe that a full drain occurred
-        ticketing.observeVmemWait(0);
-        ticketing.observeLgkmWait(0);
+        // Observe the effective wait state after the barrier.
+        // If the schedule placed a partial wait (e.g. vmcnt(10)), observe
+        // that value instead of 0.
+        if (hasScheduleVmcnt && prev) {
+          if (auto swc = dyn_cast<S_WAITCNT>(prev)) {
+            if (auto attr = swc.getVmcntAttr())
+              ticketing.observeVmemWait(attr.getInt());
+          } else if (auto swcv = dyn_cast<S_WAITCNT_VMCNT>(prev)) {
+            if (auto attr = swcv.getCountAttr())
+              ticketing.observeVmemWait(attr.getInt());
+          }
+        } else {
+          ticketing.observeVmemWait(0);
+        }
+
+        if (hasScheduleLgkmcnt && prev) {
+          if (auto swc = dyn_cast<S_WAITCNT>(prev)) {
+            if (auto attr = swc.getLgkmcntAttr())
+              ticketing.observeLgkmWait(attr.getInt());
+          } else if (auto swcl = dyn_cast<S_WAITCNT_LGKMCNT>(prev)) {
+            if (auto attr = swcl.getCountAttr())
+              ticketing.observeLgkmWait(attr.getInt());
+          }
+        } else {
+          ticketing.observeLgkmWait(0);
+        }
         return;
       }
 

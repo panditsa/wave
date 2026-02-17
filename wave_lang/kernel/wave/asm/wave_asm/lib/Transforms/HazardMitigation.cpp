@@ -9,6 +9,10 @@
 //
 // This pass handles hardware-specific hazards that require NOP insertion:
 // - VALU → v_readfirstlane hazard (gfx940+)
+// - s_barrier → MFMA/LDS-consumer hazard (gfx940+): the hardware needs
+//   at least 2 wait states after s_barrier before an MFMA that consumes
+//   data written to LDS by another wave.  We insert s_nop 0 (1 wait state
+//   each) after each barrier to match the aiter kernel's pattern.
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMAttrs.h"
@@ -171,7 +175,14 @@ private:
 
     // Check if this target needs VALU → readfirstlane hazard mitigation
     bool needsVALUHazard = needsVALUReadFirstLaneHazard(targetKind);
-    if (!needsVALUHazard)
+
+    // gfx940+ also needs barrier-adjacent NOPs for the s_barrier → MFMA/LDS
+    // consumer hazard.  The hardware requires at least 2 wait states after
+    // s_barrier before an instruction that reads data written to LDS by
+    // another wave (the common pattern in double-buffered GEMM kernels).
+    bool needsBarrierNops = needsVALUReadFirstLaneHazard(targetKind);
+
+    if (!needsVALUHazard && !needsBarrierNops)
       return;
 
     // Collect operations in order, recursively walking into while/if bodies
@@ -179,33 +190,80 @@ private:
     collectOpsRecursive(program.getBodyBlock(), ops);
 
     // Scan for hazards and collect insertion points
-    llvm::SmallVector<Operation *> insertionPoints;
+    llvm::SmallVector<Operation *> varuReadfirstlanePoints;
+    llvm::SmallVector<Operation *> barrierNopPoints;
 
     for (size_t i = 0; i + 1 < ops.size(); ++i) {
       Operation *current = ops[i];
       Operation *next = ops[i + 1];
 
       // Check for VALU → v_readfirstlane hazard
-      if (isVALUOp(current) && isReadfirstlaneOp(next)) {
-        // Get VGPRs written by current and read by next
+      if (needsVALUHazard && isVALUOp(current) && isReadfirstlaneOp(next)) {
         auto defs = getVGPRDefs(current);
         auto uses = getVGPRUses(next);
-
-        // If there's an intersection, we have a hazard
         if (hasIntersection(defs, uses)) {
-          insertionPoints.push_back(next);
+          varuReadfirstlanePoints.push_back(next);
         }
       }
     }
 
-    // Insert s_nop instructions
-    for (Operation *insertBefore : insertionPoints) {
+    // Barrier-adjacent NOP insertion: insert 2 s_nop 0 after each s_barrier.
+    // This ensures the hardware has enough wait states before the next
+    // instruction (typically an MFMA or ds_read) can safely consume data
+    // that was written to LDS by other waves before the barrier.
+    if (needsBarrierNops) {
+      for (Operation *op : ops) {
+        if (isa<S_BARRIER>(op)) {
+          // Count existing NOPs immediately after the barrier
+          int existingNops = 0;
+          Operation *scan = op->getNextNode();
+          while (scan && isa<S_NOP>(scan)) {
+            existingNops++;
+            scan = scan->getNextNode();
+          }
+
+          // Insert enough NOPs to reach 2 total after barrier
+          int nopsNeeded = 2 - existingNops;
+          if (nopsNeeded > 0 && op->getNextNode()) {
+            barrierNopPoints.push_back(op);
+          }
+        }
+      }
+    }
+
+    // Insert VALU → readfirstlane NOPs
+    for (Operation *insertBefore : varuReadfirstlanePoints) {
       OpBuilder builder(insertBefore);
-      // Insert s_nop 0 (no extra wait states beyond the instruction itself)
       S_NOP::create(builder, insertBefore->getLoc(),
                     builder.getI32IntegerAttr(0));
       numNopsInserted++;
     }
+
+    // Insert barrier-adjacent NOPs
+    for (Operation *barrierOp : barrierNopPoints) {
+      int existingNops = 0;
+      Operation *scan = barrierOp->getNextNode();
+      while (scan && isa<S_NOP>(scan)) {
+        existingNops++;
+        scan = scan->getNextNode();
+      }
+
+      int nopsNeeded = 2 - existingNops;
+      if (nopsNeeded > 0 && barrierOp->getNextNode()) {
+        Operation *insertBefore = barrierOp->getNextNode();
+        while (insertBefore && isa<S_NOP>(insertBefore))
+          insertBefore = insertBefore->getNextNode();
+        if (!insertBefore)
+          continue;
+        OpBuilder builder(insertBefore);
+        for (int n = 0; n < nopsNeeded; ++n) {
+          S_NOP::create(builder, barrierOp->getLoc(),
+                        builder.getI32IntegerAttr(0));
+          numNopsInserted++;
+        }
+      }
+    }
+
   }
 };
 

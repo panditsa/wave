@@ -426,6 +426,252 @@ def _count_prefetch_loads(asm_text: str, loop_header_line: int = 0) -> int:
     return count
 
 
+@dataclass
+class LoopSignature:
+    """Detailed instruction-level signature of a loop body for diffing."""
+    # Ordered list of instruction categories in the loop body
+    category_sequence: List[str] = field(default_factory=list)
+    # Waitcnt values encountered, ordered: [(position_in_loop, vmcnt, lgkmcnt)]
+    waitcnt_sequence: List[Tuple[int, Optional[int], Optional[int]]] = field(
+        default_factory=list
+    )
+    # Number of NOPs adjacent to each barrier (within 3 instructions)
+    barrier_adjacent_nops: List[int] = field(default_factory=list)
+    # MFMA-to-load interleave ratio: loads interspersed among MFMAs / total loads
+    interleave_ratio: float = 0.0
+    # Runs: consecutive instructions of same type [(category, count)]
+    runs: List[Tuple[str, int]] = field(default_factory=list)
+    # Max consecutive MFMAs without an intervening load
+    max_consecutive_mfma: int = 0
+    # Max consecutive loads (vmem+ds) without an intervening MFMA
+    max_consecutive_loads: int = 0
+
+
+def extract_loop_signature(asm_text: str) -> LoopSignature:
+    """Extract a detailed loop-body signature for comparison.
+
+    Uses the same loop-detection heuristic as analyze_loop_structure,
+    then builds a fine-grained instruction sequence for diffing.
+    """
+    sig = LoopSignature()
+    if not asm_text:
+        return sig
+
+    lines = asm_text.splitlines()
+
+    # Detect format
+    is_disasm = any(
+        re.match(r'^\s+[0-9a-f]+:', l) for l in lines[:200]
+    )
+
+    label_positions: Dict[str, int] = {}
+    instruction_lines: List[Tuple[int, str, str]] = []
+
+    raw_label_re = re.compile(r'^(\.?[A-Za-z_]\w*):')
+    objdump_label_re = re.compile(r'^[0-9a-f]+\s+<(\w+)>:')
+
+    for idx, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        m_raw = raw_label_re.match(stripped)
+        if m_raw:
+            label_positions[m_raw.group(1)] = idx
+            continue
+        m_obj = objdump_label_re.match(stripped)
+        if m_obj:
+            label_positions[m_obj.group(1)] = idx
+            continue
+
+        if is_disasm:
+            parts = stripped.split("\t")
+            if len(parts) >= 2:
+                inst_text = parts[-1].split("//")[0].strip()
+                if not inst_text:
+                    for p in reversed(parts):
+                        t = p.split("//")[0].strip()
+                        if t and not re.match(r'^[0-9a-fA-F]+$', t.replace(" ", "")):
+                            inst_text = t
+                            break
+            else:
+                inst_text = stripped
+        else:
+            inst_text = stripped
+
+        cat = classify_instruction(inst_text)
+        if cat is not None:
+            instruction_lines.append((idx, cat, inst_text))
+
+    # Find largest loop
+    loop_ranges: List[Tuple[int, int]] = []
+    for inst_idx, (line_idx, cat, text) in enumerate(instruction_lines):
+        if cat == "branch" and ("cbranch" in text.lower() or "s_branch " in text.lower()):
+            text_no_comment = text.split("//")[0].strip()
+            parts = text_no_comment.split()
+            if len(parts) >= 2:
+                target = parts[-1].strip()
+                if target in label_positions and label_positions[target] < line_idx:
+                    loop_ranges.append((label_positions[target], line_idx))
+
+    if not loop_ranges:
+        return sig
+
+    best = max(loop_ranges, key=lambda r: r[1] - r[0])
+    header, back_edge = best
+
+    # Extract loop body instructions
+    loop_cats: List[str] = []
+    loop_texts: List[str] = []
+    for line_idx, cat, text in instruction_lines:
+        if header <= line_idx <= back_edge:
+            loop_cats.append(cat)
+            loop_texts.append(text)
+
+    sig.category_sequence = loop_cats
+
+    # Extract waitcnt values
+    waitcnt_re = re.compile(r'vmcnt\((\d+)\)')
+    lgkmcnt_re = re.compile(r'lgkmcnt\((\d+)\)')
+    for pos, (cat, text) in enumerate(zip(loop_cats, loop_texts)):
+        if cat == "wait":
+            vm = waitcnt_re.search(text)
+            lg = lgkmcnt_re.search(text)
+            vmcnt_val = int(vm.group(1)) if vm else None
+            lgkmcnt_val = int(lg.group(1)) if lg else None
+            sig.waitcnt_sequence.append((pos, vmcnt_val, lgkmcnt_val))
+
+    # Barrier-adjacent NOP count (within 3 instructions after each barrier)
+    for pos, cat in enumerate(loop_cats):
+        if cat == "barrier":
+            nop_count = 0
+            for j in range(1, 4):
+                if pos + j < len(loop_cats) and loop_cats[pos + j] == "nop":
+                    nop_count += 1
+                else:
+                    break
+            sig.barrier_adjacent_nops.append(nop_count)
+
+    # Compute runs of consecutive same-category instructions
+    if loop_cats:
+        runs = []
+        cur_cat = loop_cats[0]
+        cur_count = 1
+        for cat in loop_cats[1:]:
+            if cat == cur_cat:
+                cur_count += 1
+            else:
+                runs.append((cur_cat, cur_count))
+                cur_cat = cat
+                cur_count = 1
+        runs.append((cur_cat, cur_count))
+        sig.runs = runs
+
+    # Max consecutive MFMAs and loads
+    max_mfma_run = 0
+    max_load_run = 0
+    cur_mfma = 0
+    cur_load = 0
+    for cat in loop_cats:
+        if cat == "mfma":
+            cur_mfma += 1
+            cur_load = 0
+            max_mfma_run = max(max_mfma_run, cur_mfma)
+        elif cat in ("vmem", "ds"):
+            cur_load += 1
+            cur_mfma = 0
+            max_load_run = max(max_load_run, cur_load)
+        else:
+            cur_mfma = 0
+            cur_load = 0
+    sig.max_consecutive_mfma = max_mfma_run
+    sig.max_consecutive_loads = max_load_run
+
+    # Interleave ratio: count loads that appear between MFMAs
+    loads_between_mfma = 0
+    total_loads = sum(1 for c in loop_cats if c in ("vmem", "ds"))
+    in_mfma_region = False
+    for cat in loop_cats:
+        if cat == "mfma":
+            in_mfma_region = True
+        elif cat in ("vmem", "ds"):
+            if in_mfma_region:
+                loads_between_mfma += 1
+        elif cat not in ("nop", "salu", "wait", "barrier"):
+            in_mfma_region = False
+    sig.interleave_ratio = loads_between_mfma / total_loads if total_loads > 0 else 0.0
+
+    return sig
+
+
+def format_loop_signature_diff(
+    name_a: str, sig_a: LoopSignature,
+    name_b: str, sig_b: LoopSignature,
+) -> str:
+    """Format a human-readable diff between two loop signatures."""
+    lines = []
+    w = 80
+    lines.append("=" * w)
+    lines.append(f"Loop Body Signature Diff: {name_a} vs {name_b}")
+    lines.append("=" * w)
+
+    lines.append(f"{'Metric':<40s} {name_a:>18s} {name_b:>18s}")
+    lines.append("-" * w)
+
+    lines.append(f"{'Loop body length':<40s} {len(sig_a.category_sequence):>18d} {len(sig_b.category_sequence):>18d}")
+    lines.append(f"{'Waitcnt count':<40s} {len(sig_a.waitcnt_sequence):>18d} {len(sig_b.waitcnt_sequence):>18d}")
+    lines.append(f"{'Max consecutive MFMAs':<40s} {sig_a.max_consecutive_mfma:>18d} {sig_b.max_consecutive_mfma:>18d}")
+    lines.append(f"{'Max consecutive loads':<40s} {sig_a.max_consecutive_loads:>18d} {sig_b.max_consecutive_loads:>18d}")
+    lines.append(f"{'Load interleave ratio':<40s} {sig_a.interleave_ratio:>18.2%} {sig_b.interleave_ratio:>18.2%}")
+    lines.append(f"{'Barrier count':<40s} {sig_a.barrier_adjacent_nops.__len__():>18d} {sig_b.barrier_adjacent_nops.__len__():>18d}")
+
+    # Barrier-adjacent NOPs
+    if sig_a.barrier_adjacent_nops or sig_b.barrier_adjacent_nops:
+        avg_a = sum(sig_a.barrier_adjacent_nops) / len(sig_a.barrier_adjacent_nops) if sig_a.barrier_adjacent_nops else 0
+        avg_b = sum(sig_b.barrier_adjacent_nops) / len(sig_b.barrier_adjacent_nops) if sig_b.barrier_adjacent_nops else 0
+        lines.append(f"{'Avg NOPs after barrier':<40s} {avg_a:>18.1f} {avg_b:>18.1f}")
+
+    lines.append("-" * w)
+
+    # Waitcnt sequence comparison
+    lines.append("Waitcnt sequences:")
+    max_show = max(len(sig_a.waitcnt_sequence), len(sig_b.waitcnt_sequence))
+    for i in range(min(max_show, 20)):
+        a_str = ""
+        b_str = ""
+        if i < len(sig_a.waitcnt_sequence):
+            pos, vm, lg = sig_a.waitcnt_sequence[i]
+            parts = []
+            if vm is not None:
+                parts.append(f"vmcnt({vm})")
+            if lg is not None:
+                parts.append(f"lgkmcnt({lg})")
+            a_str = f"@{pos}: {' '.join(parts)}"
+        if i < len(sig_b.waitcnt_sequence):
+            pos, vm, lg = sig_b.waitcnt_sequence[i]
+            parts = []
+            if vm is not None:
+                parts.append(f"vmcnt({vm})")
+            if lg is not None:
+                parts.append(f"lgkmcnt({lg})")
+            b_str = f"@{pos}: {' '.join(parts)}"
+        match = " ==" if a_str == b_str and a_str else ""
+        lines.append(f"  [{i:2d}] {a_str:<35s} {b_str:<35s}{match}")
+
+    if max_show > 20:
+        lines.append(f"  ... ({max_show - 20} more)")
+
+    # Run-length summary (top 10 longest runs per side)
+    lines.append("-" * w)
+    lines.append("Top instruction runs (category, length):")
+    top_a = sorted(sig_a.runs, key=lambda r: -r[1])[:10]
+    top_b = sorted(sig_b.runs, key=lambda r: -r[1])[:10]
+    for i in range(max(len(top_a), len(top_b))):
+        a_str = f"{top_a[i][0]}x{top_a[i][1]}" if i < len(top_a) else ""
+        b_str = f"{top_b[i][0]}x{top_b[i][1]}" if i < len(top_b) else ""
+        lines.append(f"  {a_str:<35s} {b_str:<35s}")
+
+    lines.append("=" * w)
+    return "\n".join(lines)
+
+
 def extract_resource_usage(asm_text: str) -> dict:
     """Extract VGPRs, SGPRs, LDS from assembly metadata."""
     resources = {"vgprs": 0, "sgprs": 0, "lds": 0, "agprs": 0}
@@ -1824,6 +2070,21 @@ def main():
         print(f"  Result: {'PASS' if rg.passed else 'FAIL'}")
         print("=" * 70)
 
+    # Loop signature diff: C++ ASM vs aiter reference kernel
+    aiter_ref_s = Path("/dockerx/aiter_kernels/f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256.s")
+    if aiter_ref_s.exists() and "C++ ASM 4-wave" in backends:
+        cpp_asm_path = backends["C++ ASM 4-wave"].get("asm_path")
+        cpp_asm_text = Path(cpp_asm_path).read_text() if cpp_asm_path and Path(cpp_asm_path).exists() else ""
+        aiter_ref_text = aiter_ref_s.read_text()
+        if cpp_asm_text and aiter_ref_text:
+            sig_aiter = extract_loop_signature(aiter_ref_text)
+            sig_cpp = extract_loop_signature(cpp_asm_text)
+            sig_diff = format_loop_signature_diff("aiter-ref", sig_aiter, "C++ ASM", sig_cpp)
+            print("\n" + sig_diff)
+            sig_path = out_dir / "loop_signature_diff.txt"
+            sig_path.write_text(sig_diff)
+            print(f"  Loop signature diff saved: {sig_path}")
+
     # ============================================================
     # ATT Thread Trace capture (optional)
     # ============================================================
@@ -1954,6 +2215,10 @@ def main():
             for reg in rg.regressions:
                 f.write(f"  [-] {reg}\n")
             f.write(f"  Result: {'PASS' if rg.passed else 'FAIL'}\n")
+        # Include loop signature diff if available
+        sig_path = out_dir / "loop_signature_diff.txt"
+        if sig_path.exists():
+            f.write("\n" + sig_path.read_text() + "\n")
         # Include ATT analysis if available
         att_report = out_dir / "att_stall_analysis.txt"
         if att_report.exists():
