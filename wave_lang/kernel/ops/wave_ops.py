@@ -1488,7 +1488,26 @@ class IterArg(Placeholder):
     def distributed_shape(self):
         init_arg = self.parent_op().init_args[self.iter_idx]
         allocate = get_custom(init_arg)
-        assert isinstance(allocate, Allocate)
+        # Trace through Placeholder / Conditional chain to find Allocate
+        while not isinstance(allocate, Allocate):
+            if isinstance(allocate, Placeholder):
+                captured = allocate.get_captured_fx_node()
+                if captured is None:
+                    break
+                allocate = get_custom(captured)
+            elif isinstance(allocate, GetResult):
+                parent = get_custom(allocate.value)
+                if isinstance(parent, Conditional) and parent.else_return:
+                    allocate = get_custom(parent.else_return[allocate.res_idx])
+                elif isinstance(parent, Iterate):
+                    allocate = get_custom(parent.init_args[allocate.res_idx])
+                else:
+                    break
+            else:
+                break
+        assert isinstance(
+            allocate, Allocate
+        ), f"Expected Allocate, got {type(allocate).__name__}"
         return allocate.distributed_shape
 
     def infer_type(self, *args):
@@ -2792,9 +2811,32 @@ class GetResult(CustomOp):
 
     @property
     def distributed_shape(self):
-        iterate = get_custom(self.value)
-        allocate = get_custom(iterate.init_args[self.res_idx])
-        assert isinstance(allocate, Allocate)
+        parent = get_custom(self.value)
+        if isinstance(parent, Conditional) and parent.else_return:
+            init_arg = parent.else_return[self.res_idx]
+        else:
+            init_arg = parent.init_args[self.res_idx]
+        allocate = get_custom(init_arg)
+        # Trace through Placeholder / Conditional chain to find Allocate
+        while not isinstance(allocate, Allocate):
+            if isinstance(allocate, Placeholder):
+                captured = allocate.get_captured_fx_node()
+                if captured is None:
+                    break
+                allocate = get_custom(captured)
+            elif isinstance(allocate, GetResult):
+                p = get_custom(allocate.value)
+                if isinstance(p, Conditional) and p.else_return:
+                    allocate = get_custom(p.else_return[allocate.res_idx])
+                elif isinstance(p, Iterate):
+                    allocate = get_custom(p.init_args[allocate.res_idx])
+                else:
+                    break
+            else:
+                break
+        assert isinstance(
+            allocate, Allocate
+        ), f"Expected Allocate, got {type(allocate).__name__}"
         return allocate.distributed_shape
 
 

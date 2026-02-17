@@ -699,14 +699,21 @@ def propagate_loop_carried_vars(n: fx.Node, depth: int = 0) -> fx.Node:
     c = get_custom(n)
     if isinstance(c, IterArg):
         idx = c.iter_idx
-        iterate = c.parent_op()
-        assert isinstance(iterate, Iterate), f"Expected Iterate, but got {iterate}"
-        args = iterate.init_args if depth == 0 else iterate.outputs()
-        assert idx < len(
-            args
-        ), f"IterArg index {idx} out of range for {args}, depth={depth}"
-        depth = max(depth - 1, 0)
-        return propagate_loop_carried_vars(args[idx], depth)
+        parent = c.parent_op()
+        if isinstance(parent, Iterate):
+            args = parent.init_args if depth == 0 else parent.outputs()
+            assert idx < len(
+                args
+            ), f"IterArg index {idx} out of range for {args}, depth={depth}"
+            depth = max(depth - 1, 0)
+            return propagate_loop_carried_vars(args[idx], depth)
+        elif isinstance(parent, Conditional):
+            # Conditional's init_args = else_return; propagate through them
+            if parent.init_args and idx < len(parent.init_args):
+                return propagate_loop_carried_vars(parent.init_args[idx], depth)
+            return n
+        else:
+            assert False, f"Expected Iterate or Conditional, but got {parent}"
     elif isinstance(c, Placeholder):
         p = c.get_captured_fx_node()
 
@@ -715,15 +722,22 @@ def propagate_loop_carried_vars(n: fx.Node, depth: int = 0) -> fx.Node:
         if p is not None:
             return p
     elif isinstance(c, GetResult):
-        iterate = get_custom(c.value)
-        assert isinstance(iterate, Iterate), f"Expected Iterate, but got {iterate}"
+        parent = get_custom(c.value)
         idx = c.res_idx
-        args = iterate.init_args if depth == 0 else iterate.outputs()
-        assert idx < len(
-            args
-        ), f"GetResult index {idx} out of range for {args}, depth={depth}"
-        depth = max(depth - 1, 0)
-        return propagate_loop_carried_vars(args[idx], depth)
+        if isinstance(parent, Iterate):
+            args = parent.init_args if depth == 0 else parent.outputs()
+            assert idx < len(
+                args
+            ), f"GetResult index {idx} out of range for {args}, depth={depth}"
+            depth = max(depth - 1, 0)
+            return propagate_loop_carried_vars(args[idx], depth)
+        elif isinstance(parent, Conditional):
+            # Propagate through the else_return (pass-through path)
+            if parent.else_return and idx < len(parent.else_return):
+                return propagate_loop_carried_vars(parent.else_return[idx], depth)
+            return n
+        else:
+            assert False, f"Expected Iterate or Conditional, but got {parent}"
 
     return n
 

@@ -334,6 +334,11 @@ def get_mxfp4_dbuf_hipblaslt_schedule():
                 ],
             )
 
+        # Split kernel into wave_lo / wave_hi conditional variants.
+        # After this, tagged lists are auto-updated so filter_nodes with
+        # KERNEL_0 / KERNEL_1 returns the right copies.
+        wave_lo, wave_hi = tkw.conditional_loop(pipeline_loop.KERNEL)
+
         # Constants derived from schedule structure
         num_m_partitions = (
             2  # we are dividing the M dimension into 2 paritions per loop iteration
@@ -381,109 +386,97 @@ def get_mxfp4_dbuf_hipblaslt_schedule():
         ]
 
         # =====================================================================
-        # KERNEL: Main loop body with custom cluster ordering
+        # KERNEL: Same schedule applied to both wave variants (KERNEL_0 / KERNEL_1)
         # =====================================================================
 
-        # Filter nodes for KERNEL stage
-        loop_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.KERNEL)
-        loop_g2s_a_scale = tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.KERNEL)
+        for kernel_ref in [pipeline_loop.KERNEL_0, pipeline_loop.KERNEL_1]:
+            # Filter nodes for this kernel variant
+            loop_g2s_a = tkw.filter_nodes(g2s_a, subgraph=kernel_ref)
+            loop_g2s_a_scale = tkw.filter_nodes(g2s_a_scale, subgraph=kernel_ref)
+            loop_g2v_b = tkw.filter_nodes(g2v_b, subgraph=kernel_ref)
+            loop_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=kernel_ref)
+            loop_shared_load_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=kernel_ref)
+            loop_shared_load_a_scale_0 = tkw.filter_nodes(
+                s2v_a_scale_0, subgraph=kernel_ref
+            )
+            loop_shared_load_a_1 = tkw.filter_nodes(s2v_a_1, subgraph=kernel_ref)
+            loop_shared_load_a_scale_1 = tkw.filter_nodes(
+                s2v_a_scale_1, subgraph=kernel_ref
+            )
+            loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=kernel_ref)
+            loop_bitcast_a_scale = tkw.filter_nodes(
+                bitcast_a_scale, subgraph=kernel_ref
+            )
+            loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=kernel_ref)
+            loop_bitcast_b_scale = tkw.filter_nodes(
+                bitcast_b_scale, subgraph=kernel_ref
+            )
+            loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=kernel_ref)
 
-        loop_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.KERNEL)
-        loop_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.KERNEL)
+            loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(
+                loop_scaled_mma, dim=M, num_partitions=2
+            )
+            loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
+                loop_bitcast_a, dim=M, num_partitions=2
+            )
+            loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(
+                loop_bitcast_a_scale, dim=M, num_partitions=2
+            )
 
-        loop_shared_load_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_a_scale_0 = tkw.filter_nodes(
-            s2v_a_scale_0, subgraph=pipeline_loop.KERNEL
-        )
-        loop_shared_load_a_1 = tkw.filter_nodes(s2v_a_1, subgraph=pipeline_loop.KERNEL)
-        loop_shared_load_a_scale_1 = tkw.filter_nodes(
-            s2v_a_scale_1, subgraph=pipeline_loop.KERNEL
-        )
+            # Barrier count calculations
+            g2s_per_iter_k = (
+                len(prologue_g2s_a) + len(prologue_g2s_a_scale)
+            ) // num_pf_iters
+            n_b_loads = len(loop_g2v_b) + len(loop_g2v_b_scale)
+            a_sub_block = g2s_per_iter_k // num_m_partitions
 
-        loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_a_scale = tkw.filter_nodes(
-            bitcast_a_scale, subgraph=pipeline_loop.KERNEL
-        )
-        loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
-        loop_bitcast_b_scale = tkw.filter_nodes(
-            bitcast_b_scale, subgraph=pipeline_loop.KERNEL
-        )
-        loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
-        # Partition by K dimension for interleaving compute with memory ops.
-        # NOTE: Bitcasts MUST also be partitioned by K to match their producer
-        # shared loads, otherwise reorder_graph fails with
-        # "Cannot find producer(s)" because bitcasts in an earlier cluster
-        # would depend on shared loads in a later cluster.
-        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(
-            loop_scaled_mma, dim=M, num_partitions=2
-        )
-        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
-            loop_bitcast_a, dim=M, num_partitions=2
-        )
-        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(
-            loop_bitcast_a_scale, dim=M, num_partitions=2
-        )
+            total_prologue_loads = (
+                len(prologue_g2s_a)
+                + len(prologue_g2s_a_scale)
+                + len(prologue_g2v_b)
+                + len(prologue_g2v_b_scale)
+            )
+            prologue_wait_load = total_prologue_loads - a_sub_block
+            loop_wait_load = prologue_wait_load - a_sub_block - n_b_loads
 
-        # Barrier count calculations
-        g2s_per_iter = (len(prologue_g2s_a) + len(prologue_g2s_a_scale)) // num_pf_iters
-        n_b_loads = len(loop_g2v_b) + len(loop_g2v_b_scale)
+            tkw.insert_at_start(
+                kernel_ref, tkw.MemoryCounterWaitBarrier(load=loop_wait_load)
+            )
 
-        # First A sub-block that must land in LDS before ds_read
-        a_sub_block = g2s_per_iter // num_m_partitions
+            kernel_clusters = [
+                tkw.cluster(
+                    [
+                        loop_bitcast_a_0,
+                        loop_bitcast_a_scale_0,
+                        loop_bitcast_b,
+                        loop_bitcast_b_scale,
+                        loop_scaled_mma_0,
+                        loop_g2v_b,
+                        loop_shared_load_a_1,
+                        loop_g2v_b_scale,
+                        loop_shared_load_a_scale_1,
+                        loop_bitcast_a_1,
+                        loop_bitcast_a_scale_1,
+                        tkw.SchedulingBarrier([]),
+                    ],
+                ),
+                tkw.cluster(
+                    [
+                        loop_scaled_mma_1,
+                        loop_g2s_a,
+                        loop_g2s_a_scale,
+                        tkw.MemoryCounterWaitBarrier(load=n_b_loads, ds=0),
+                        loop_shared_load_a_0,
+                        loop_shared_load_a_scale_0,
+                        tkw.SchedulingBarrier([]),
+                    ]
+                ),
+            ]
 
-        total_prologue_loads = (
-            len(prologue_g2s_a)
-            + len(prologue_g2s_a_scale)
-            + len(prologue_g2v_b)
-            + len(prologue_g2v_b_scale)
-        )
+            tkw.reorder_graph(kernel_ref, kernel_clusters)
 
-        prologue_wait_load = total_prologue_loads - a_sub_block
-
-        # ===========================================================
-        # Loop vmcnt: wait for first A sub-block + ALL B loads
-        # ===========================================================
-        loop_wait_load = prologue_wait_load - a_sub_block - n_b_loads
-
-        # Insert MemoryCounterWaitBarrier at the start of the kernel
-        tkw.insert_at_start(
-            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=loop_wait_load)
-        )
-
-        clusters = [
-            tkw.cluster(
-                [
-                    loop_bitcast_a_0,
-                    loop_bitcast_a_scale_0,
-                    loop_bitcast_b,
-                    loop_bitcast_b_scale,
-                    loop_scaled_mma_0,
-                    loop_g2v_b,
-                    loop_shared_load_a_1,
-                    loop_g2v_b_scale,
-                    loop_shared_load_a_scale_1,
-                    loop_bitcast_a_1,
-                    loop_bitcast_a_scale_1,
-                    tkw.SchedulingBarrier([]),
-                ],
-            ),
-            tkw.cluster(
-                [
-                    loop_scaled_mma_1,
-                    loop_g2s_a,
-                    loop_g2s_a_scale,
-                    tkw.MemoryCounterWaitBarrier(load=n_b_loads, ds=0),
-                    loop_shared_load_a_0,
-                    loop_shared_load_a_scale_0,
-                    tkw.SchedulingBarrier([]),
-                ]
-            ),
-        ]
-
-        # Barrier 3 (insert_at_end): loop backedge between C2 and next
-        #   iteration's C0.  No vmcnt ops outstanding after C2 (only
-        #   lgkmcnt from the LDS reads), so SharedMemoryBarrier suffices.
-        # tkw.insert_at_end(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+            unroll_factor = 2
+            tkw.unroll(kernel_ref, unroll_factor)
 
         #################### EPILOGUE ####################
 
@@ -570,7 +563,7 @@ def get_mxfp4_dbuf_hipblaslt_schedule():
             tkw.partition_by_dim(epilogue_bitcast_a_scale_itr1, dim=M, num_partitions=2)
         )
 
-        epilogue_clusters_itr0 = [
+        epi_clusters = [
             tkw.cluster(
                 [
                     epilogue_bitcast_a_itr0_0,
@@ -616,12 +609,7 @@ def get_mxfp4_dbuf_hipblaslt_schedule():
             ),
         ]
 
-        clusters += epilogue_clusters_itr0
-        clusters += prologue_clusters
-        # Apply the cluster-based reordering
-        tkw.reorder_graph(pipeline_loop.EPILOGUE, clusters)
-        # Unroll factor requires per-GEMM tuning:
-        unroll_factor = 2
-        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
+        epi_clusters += prologue_clusters
+        tkw.reorder_graph(pipeline_loop.EPILOGUE, epi_clusters)
 
     return mxfp4_dbuf_schedule

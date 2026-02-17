@@ -6,7 +6,11 @@ import torch.fx as fx
 import sympy
 from ..ops.wave_ops import (
     get_custom,
+    Allocate,
     Conditional,
+    GetResult,
+    IterArg,
+    Output,
     Read,
     Write,
     Placeholder,
@@ -218,6 +222,10 @@ def unroll(loop: Any, factor: int): ...
 def get_hardware_constraint(): ...
 
 
+@define_schedule_op
+def conditional_loop(loop: Any): ...
+
+
 def add_op_before(op, subgraph: fx.Graph, anchor: fx.Node, location=None):
     """Insert a scheduling operation before the anchor node."""
     with subgraph.inserting_before(anchor):
@@ -247,11 +255,13 @@ def extract_nodes(item):
 
 def get_nodes_from_ref(ref):
     """
-    Get the actual nodes from a reference (PipelineStageRef, list, or fx.Node).
+    Get the actual nodes from a reference (PipelineStageRef, WaveVariantStageRef, list, or fx.Node).
     """
     if isinstance(ref, PipelineStageRef):
         # For PipelineStageRef, return the pipelined iterate node directly
         return [ref.pipelined_iterate_node]
+    elif isinstance(ref, WaveVariantStageRef):
+        return [ref.iterate_node]
     elif isinstance(ref, fx.Node):
         # Direct fx.Node - wrap in list
         return [ref]
@@ -259,7 +269,9 @@ def get_nodes_from_ref(ref):
         # Direct list of nodes
         return list(ref)
     else:
-        raise ValueError(f"Expected PipelineStageRef, fx.Node or list, got {type(ref)}")
+        raise ValueError(
+            f"Expected PipelineStageRef, WaveVariantStageRef, fx.Node or list, got {type(ref)}"
+        )
 
 
 @dataclass
@@ -268,6 +280,44 @@ class PipelineStageRef:
 
     pipelined_iterate_node: Any
     stage: Any
+
+
+@dataclass
+class WaveVariantStageRef:
+    """Reference to a wave-variant kernel loop (KERNEL_0 or KERNEL_1).
+
+    Used with filter_nodes to select nodes belonging to a specific wave variant
+    after conditional_loop has split the kernel.
+    """
+
+    iterate_node: Any
+    wave_variant: int  # 0 = wave_lo, 1 = wave_hi
+
+
+@dataclass
+class ConditionalLoopResult:
+    """Result of conditional_loop: references to both wave-conditional loop variants.
+
+    Both variants start as identical copies of the original loop body.
+    They can be independently modified (different cluster orderings
+    via reorder_graph, etc.) to achieve wave-dependent instruction scheduling
+    for memory port de-contention.
+
+    Attributes:
+        wave_lo: [iterate_node] for wavefronts 0..mid-1
+        wave_hi: [iterate_node] for wavefronts mid..total-1
+        wave_lo_node_map: original subgraph node -> wave_lo copy
+        wave_hi_node_map: original subgraph node -> wave_hi copy
+    """
+
+    wave_lo: list
+    wave_hi: list
+    wave_lo_node_map: dict
+    wave_hi_node_map: dict
+
+    def __iter__(self):
+        """Support tuple unpacking: lo, hi = conditional_loop(...)"""
+        return iter((self.wave_lo, self.wave_hi))
 
 
 def get_node_by_tag_helper(kernel_trace, tag: str | set[str]):
@@ -579,11 +629,17 @@ class ReorderGraph(CustomScheduleOp):
         kernel_trace.get_root_graph().subgraphs[
             reordered_subgraph_name
         ] = reordered_subgraph
+        # Also register in the iterate's local root graph (may differ from
+        # the trace root when the iterate is nested inside a Conditional).
+        local_root = custom_iterate.get_root_graph()
+        local_root.subgraphs[reordered_subgraph_name] = reordered_subgraph
         custom_iterate.update_arg("subgraph_name", reordered_subgraph_name)
 
         # Remove the old subgraph
         del kernel_trace.region_graph.subgraphs[original_subgraph_name]
         del kernel_trace.get_root_graph().subgraphs[original_subgraph_name]
+        if original_subgraph_name in local_root.subgraphs:
+            del local_root.subgraphs[original_subgraph_name]
 
         logger.info(
             f"Successfully reordered graph: {original_subgraph_name} -> {reordered_subgraph_name}"
@@ -694,6 +750,10 @@ class PipelinedLoop:
         self._PROLOGUE = None
         self._EPILOGUE = None
 
+        # Set after conditional_loop splits the kernel
+        self._KERNEL_0 = None
+        self._KERNEL_1 = None
+
         # Track lists used during set_stage to auto-update after pipelining
         # This allows us to mutate lists in-place with their pipelined nodes
         self._tracked_lists = {}
@@ -764,6 +824,7 @@ class PipelinedLoop:
             ctx = ScheduleContext.current()
             if ctx is not None:
                 ctx.node_mapping.update(node_mapping)
+                ctx.pipelined_loop = self
                 logger.info(
                     f"Stored {len(node_mapping)} node mappings in context for auto-update"
                 )
@@ -805,6 +866,16 @@ class PipelinedLoop:
     def EPILOGUE(self):
         """Get a reference to the EPILOGUE stage (nodes after pipelined iterate)."""
         return self._EPILOGUE
+
+    @property
+    def KERNEL_0(self):
+        """Get a reference to the wave_lo kernel variant (after conditional_loop)."""
+        return self._KERNEL_0
+
+    @property
+    def KERNEL_1(self):
+        """Get a reference to the wave_hi kernel variant (after conditional_loop)."""
+        return self._KERNEL_1
 
     def _update_kernel_node_mapping(self):
         """
@@ -1326,9 +1397,18 @@ class FilterNodes(CustomScheduleOp):
                 logger.info(
                     f"Filtered to {len(filtered_nodes)} nodes in {subgraph.stage.name} stage"
                 )
+            elif isinstance(subgraph, WaveVariantStageRef):
+                filtered_nodes = [
+                    node
+                    for node in filtered_nodes
+                    if node.meta.get("wave_variant") == subgraph.wave_variant
+                ]
+                logger.info(
+                    f"Filtered to {len(filtered_nodes)} nodes in wave variant {subgraph.wave_variant}"
+                )
             else:
                 logger.warning(
-                    f"Subgraph filter must be a PipelineStageRef, got {type(subgraph)}"
+                    f"Subgraph filter must be a PipelineStageRef or WaveVariantStageRef, got {type(subgraph)}"
                 )
 
         # Filter by node type if specified
@@ -1469,3 +1549,300 @@ class GetHardwareConstraint(CustomScheduleOp):
                 "Make sure your kernel has a HardwareConstraint defined."
             )
         return hw
+
+
+@dataclass
+class ConditionalLoop(CustomScheduleOp):
+    """
+    Split a loop into two conditional variants based on wave ID.
+
+    Creates two copies of the loop body, each guarded by a wave condition:
+    - wave_lo: wavefronts 0 .. mid_wave-1
+    - wave_hi: wavefronts mid_wave .. total_waves-1
+
+    Both copies start identical.  The caller can then independently modify
+    each variant (e.g. different cluster orderings via reorder_graph) to
+    achieve memory-port de-contention across wave groups.
+
+    Generated IR structure (matching the HipBLAS SP3 pattern):
+
+        prologue            # unchanged
+        if wave_id < mid_wave:
+            lo_results = iterate_lo(init_args)
+        else:
+            lo_results = init_args          # pass-through
+        if wave_id >= mid_wave:
+            hi_results = iterate_hi(lo_results)
+        else:
+            hi_results = lo_results         # pass-through
+        epilogue            # uses hi_results
+
+    At runtime only one branch executes per wave, giving the assembly
+    pattern:
+        if wave_hi jump to loop_hi
+        loop_lo: ...
+        jump to epilogue
+        loop_hi: ...
+        epilogue
+
+    Usage in a schedule:
+        loop = tkw.get_node_by_tag("k_loop")
+        wave_lo, wave_hi = tkw.conditional_loop(loop)
+        tkw.reorder_graph(wave_lo, clusters_lo)
+        tkw.reorder_graph(wave_hi, clusters_hi)
+
+    Returns:
+        ConditionalLoopResult with .wave_lo and .wave_hi iterate references,
+        plus node_maps from original subgraph nodes to each copy.
+    """
+
+    schedule_op_name = "conditional_loop"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        loop: Any,
+    ):
+        from ..wave.utils.graph_utils import (
+            graph_copy,
+            prepare_subgraph_for_conditional,
+        )
+
+        # ----- hardware info -----
+        hw = _get_hardware_constraint(constraints)
+        if hw is None:
+            raise ValueError("conditional_loop requires a HardwareConstraint")
+        flat_wave_count = math.prod(hw.waves_per_block)
+        assert (
+            flat_wave_count % 2 == 0
+        ), f"Wave count {flat_wave_count} must be even for 2-way split"
+        mid_wave = flat_wave_count // 2
+
+        # ----- resolve the iterate node -----
+        loop_nodes = get_nodes_from_ref(loop)
+        assert (
+            len(loop_nodes) == 1
+        ), f"conditional_loop expects exactly one iterate node, got {len(loop_nodes)}"
+        iterate_node = loop_nodes[0]
+        custom_iterate = get_custom(iterate_node)
+        assert isinstance(
+            custom_iterate, Iterate
+        ), f"Expected Iterate node, got {type(custom_iterate).__name__}"
+
+        main_graph = custom_iterate.graph
+        location = custom_iterate.location
+        original_subgraph = kernel_trace.get_subgraph(custom_iterate.subgraph_name)
+        original_init_args = list(custom_iterate.init_args)
+        original_implicit_captures = list(custom_iterate.implicit_captures)
+
+        # ----- wave condition nodes -----
+        flat_id = hw.linearized_thread_id
+        wave_id_expr = flat_id // hw.threads_per_wave
+
+        with main_graph.inserting_before(iterate_node):
+            mid_wave_reg = _get_graph_node(
+                NewScalar(mid_wave, tkl.i32), main_graph, location
+            )
+            wave_id_reg = _get_graph_node(
+                NewScalar(wave_id_expr, tkl.i32), main_graph, location
+            )
+            is_wave_lo = _get_graph_node(
+                Lt(wave_id_reg, mid_wave_reg), main_graph, location
+            )
+            is_wave_hi = _get_graph_node(
+                Ge(wave_id_reg, mid_wave_reg), main_graph, location
+            )
+
+        # ----- helper: wrap a copy of the loop in a Conditional -----
+        def _wrap_iterate_in_conditional(
+            condition_node: fx.Node,
+            suffix: str,
+            body_source_graph: fx.Graph,
+            else_return_args: list[fx.Node],
+        ):
+            """Create  if (<condition>) iterate(...) else pass-through."""
+
+            # Captured nodes = init_args that flow into the iterate
+            #                 + implicit captures the iterate needs
+            captured_nodes = list(else_return_args) + list(original_implicit_captures)
+            memory_nodes = [
+                n for n in captured_nodes if isinstance(get_custom(n), Allocate)
+            ]
+
+            cond_sg_name = f"cond_{suffix}_{iterate_node.name}"
+            cond_sg, implicit_captures, placeholders = prepare_subgraph_for_conditional(
+                cond_sg_name, captured_nodes, memory_nodes=memory_nodes
+            )
+
+            # Ensure ALL placeholders have "lifted" metadata (not just
+            # memory nodes).  This is needed so the iterate codegen
+            # handler and distributed_shape can resolve through them.
+            for outer_node, ph_node in placeholders.items():
+                if "lifted" not in ph_node.meta:
+                    ph_node.meta["lifted"] = outer_node
+
+            ph_init_args = [placeholders[a] for a in else_return_args]
+            ph_captures = [placeholders[c] for c in original_implicit_captures]
+
+            # Copy the loop body
+            body_graph, body_node_map = graph_copy(body_source_graph)
+            body_name = f"{custom_iterate.subgraph_name}_{suffix}"
+
+            if not hasattr(cond_sg, "subgraphs"):
+                cond_sg.subgraphs = {}
+            cond_sg.subgraphs[body_name] = body_graph
+
+            # Create iterate inside the conditional subgraph
+            inner_iter_node = Iterate(
+                custom_iterate.axis,
+                init_args=ph_init_args,
+                step=custom_iterate.step,
+                subgraph_name=body_name,
+                implicit_captures=ph_captures,
+            ).add_to_graph(cond_sg, type=custom_iterate.type, loc=location)
+
+            body_graph.parent_op = inner_iter_node
+            inner_custom = get_custom(inner_iter_node)
+            inner_custom.index = custom_iterate.index
+            inner_custom.count = custom_iterate.count
+
+            # Fix "lifted" metadata on the copied body's capture
+            # placeholders so the iterate codegen handler can bind them
+            # to their outer values.  graph_copy does not preserve meta.
+            captured_body_vars = [
+                n
+                for n in body_graph.nodes
+                if isinstance(get_custom(n), Placeholder)
+                and not isinstance(get_custom(n), IterArg)
+            ]
+            for body_var, cond_ph in zip(captured_body_vars, ph_captures):
+                body_var.meta["lifted"] = cond_ph
+
+            # GetResult + Output so the conditional can yield values
+            get_results = []
+            for i in range(len(ph_init_args)):
+                gr = GetResult(inner_iter_node, i).add_to_graph(
+                    cond_sg,
+                    type=(
+                        ph_init_args[i].type
+                        if hasattr(ph_init_args[i], "type")
+                        else None
+                    ),
+                    loc=location,
+                )
+                get_results.append(gr)
+
+            Output(get_results).add_to_graph(cond_sg, loc=location)
+
+            # Register subgraphs with the trace and root graph
+            kernel_trace.add_subgraph(body_name, body_graph)
+            kernel_trace.add_subgraph(cond_sg_name, cond_sg)
+            root_graph = kernel_trace.get_root_graph()
+            root_graph.subgraphs[body_name] = body_graph
+            root_graph.subgraphs[cond_sg_name] = cond_sg
+            if not hasattr(main_graph, "subgraphs"):
+                main_graph.subgraphs = {}
+            main_graph.subgraphs[cond_sg_name] = cond_sg
+
+            # Create the Conditional node in the main graph
+            with main_graph.inserting_before(iterate_node):
+                cond_op = Conditional(
+                    condition_node,
+                    subgraph_name=cond_sg_name,
+                    implicit_captures=implicit_captures,
+                    else_return=list(else_return_args),
+                ).add_to_graph(main_graph, type=custom_iterate.type, loc=location)
+
+            cond_sg.parent_op = cond_op
+
+            # Extract results via GetResult in the main graph
+            cond_results = []
+            with main_graph.inserting_before(iterate_node):
+                for i in range(len(else_return_args)):
+                    r = GetResult(cond_op, i).add_to_graph(
+                        main_graph,
+                        type=(
+                            else_return_args[i].type
+                            if hasattr(else_return_args[i], "type")
+                            else None
+                        ),
+                        loc=location,
+                    )
+                    cond_results.append(r)
+
+            return inner_iter_node, cond_results, body_node_map
+
+        # ----- wave_lo conditional -----
+        lo_iterate, lo_results, lo_node_map = _wrap_iterate_in_conditional(
+            is_wave_lo, "wave_lo", original_subgraph, original_init_args
+        )
+
+        # ----- wave_hi conditional (chains from wave_lo results) -----
+        hi_iterate, hi_results, hi_node_map = _wrap_iterate_in_conditional(
+            is_wave_hi, "wave_hi", original_subgraph, lo_results
+        )
+
+        # ----- mark copied nodes with wave_variant metadata -----
+        for _orig, copy in lo_node_map.items():
+            copy.meta["wave_variant"] = 0
+        for _orig, copy in hi_node_map.items():
+            copy.meta["wave_variant"] = 1
+
+        # ----- update tracked lists in-place -----
+        # Replace kernel nodes with their wave_lo + wave_hi copies so
+        # that subsequent filter_nodes(list, subgraph=KERNEL_0) works.
+        from .._support.tracing import ScheduleContext
+
+        ctx = ScheduleContext.current()
+        pipelined_loop = getattr(ctx, "pipelined_loop", None) if ctx else None
+
+        if pipelined_loop is not None:
+            for tracked_list in pipelined_loop._tracked_lists.values():
+                new_items = []
+                for node in tracked_list:
+                    if node in lo_node_map:
+                        new_items.append(lo_node_map[node])
+                        new_items.append(hi_node_map[node])
+                    else:
+                        new_items.append(node)
+                tracked_list.clear()
+                tracked_list.extend(new_items)
+
+            # Set KERNEL_0 / KERNEL_1 on the PipelinedLoop
+            pipelined_loop._KERNEL_0 = WaveVariantStageRef(lo_iterate, wave_variant=0)
+            pipelined_loop._KERNEL_1 = WaveVariantStageRef(hi_iterate, wave_variant=1)
+
+        # ----- rewire: replace original iterate's results with hi_results -----
+        original_get_results = [
+            user
+            for user in list(iterate_node.users)
+            if isinstance(get_custom(user), GetResult)
+        ]
+
+        for orig_gr in original_get_results:
+            idx = get_custom(orig_gr).res_idx
+            orig_gr.replace_all_uses_with(hi_results[idx])
+
+        # Erase the original GetResult nodes (now unused)
+        for orig_gr in original_get_results:
+            orig_gr.graph.erase_node(orig_gr)
+
+        # Remove the original iterate node from the graph WITHOUT
+        # cascading into its subgraph (which is still needed by
+        # pipeline_loop.PROLOGUE / EPILOGUE for reorder_graph).
+        iterate_node.graph.erase_node(iterate_node)
+
+        logger.info(
+            f"Split loop into wave_lo / wave_hi conditional variants "
+            f"(mid_wave={mid_wave}, waves_per_block={hw.waves_per_block})"
+        )
+
+        return ConditionalLoopResult(
+            wave_lo=[lo_iterate],
+            wave_hi=[hi_iterate],
+            wave_lo_node_map=lo_node_map,
+            wave_hi_node_map=hi_node_map,
+        )
