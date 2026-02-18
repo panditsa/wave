@@ -294,12 +294,13 @@ def get_preshuffle_kernel():
         },
     )
 
+    # TODO: preshuffle merge doesn't work with shared address space yet.
     @tkw.wave(constraints)
     def mxfp4_gemm_preshuffle(
         a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
-        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
@@ -327,7 +328,7 @@ def get_preshuffle_kernel():
 def run_all_tests():
     """Run both vanilla and pre-shuffled tests and compare results."""
     m, n, k = 512, 512, 2048
-    block_m, block_n, block_k = 128, 128, 128
+    block_m, block_n, block_k = 128, 128, 256
 
     print("=" * 70)
     print("MXFP4 GEMM COMPREHENSIVE TEST SUITE")
