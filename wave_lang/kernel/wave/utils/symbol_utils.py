@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 from copy import deepcopy
+from functools import lru_cache
 from typing import Optional
 
 import sympy
@@ -18,6 +19,116 @@ from ..._support.indexing import (
     subs_idxc,  # noqa
     is_literal,  # noqa
 )
+
+
+####################################################################
+# Interval-arithmetic simplification for floor/Mod expressions.
+####################################################################
+
+
+@lru_cache(maxsize=1024)
+def expr_bounds(expr: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Compute (lo, hi) bounds for a sympy expression via interval arithmetic.
+
+    Free symbols are assumed to be non-negative integers (hardware indices).
+    Returns (lo, hi) or None if bounds cannot be determined.
+    """
+    if expr.is_Integer or expr.is_Rational:
+        return (expr, expr)
+    if expr.is_Symbol:
+        return (sympy.Integer(0), sympy.oo) if expr.is_nonnegative else None
+    if isinstance(expr, sympy.Mod):
+        p, q = expr.args
+        if q.is_positive and q.is_number:
+            p_bounds = expr_bounds(p)
+            if p_bounds and p_bounds[0] >= 0 and p_bounds[1] < q:
+                return p_bounds
+            return (sympy.Integer(0), q - 1)
+        return None
+    if isinstance(expr, sympy.floor):
+        inner_bounds = expr_bounds(expr.args[0])
+        if inner_bounds:
+            return (sympy.floor(inner_bounds[0]), sympy.floor(inner_bounds[1]))
+        return None
+    if isinstance(expr, sympy.Add):
+        bounds = [expr_bounds(a) for a in expr.args]
+        if all(b is not None for b in bounds):
+            return (sum(b[0] for b in bounds), sum(b[1] for b in bounds))
+        return None
+    if isinstance(expr, sympy.Mul):
+        if not expr.args:
+            return (sympy.Integer(1), sympy.Integer(1))
+        bounds = [expr_bounds(a) for a in expr.args]
+        if all(b is not None for b in bounds):
+            # Bail out if any bound is infinite (0 * oo = NaN).
+            if any(sympy.oo in b or -sympy.oo in b for b in bounds):
+                return None
+            lo, hi = bounds[0]
+            for b in bounds[1:]:
+                corners = [lo * b[0], lo * b[1], hi * b[0], hi * b[1]]
+                lo, hi = min(corners), max(corners)
+            return (lo, hi)
+        return None
+    return None
+
+
+@lru_cache(maxsize=1024)
+def simplify(expr: sympy.Expr) -> sympy.Expr:
+    """Simplify a sympy expression using interval arithmetic and sympy.simplify.
+
+    Extends sympy.simplify with bounds-based reasoning that can resolve
+    floor/Mod sub-expressions (e.g. floor(Mod(x,16)/16) -> 0) that standard
+    sympy cannot handle.  Iterates to a fixed point.
+    """
+    if not isinstance(expr, sympy.Basic):
+        return expr
+    for _ in range(5):
+        new_expr = _bounds_simplify_once(expr)
+        new_expr = sympy.simplify(new_expr)
+        if new_expr == expr:
+            break
+        expr = new_expr
+    return expr
+
+
+def _bounds_simplify_once(expr: sympy.Expr) -> sympy.Expr:
+    """Single bottom-up pass of bounds-based simplification.
+
+    Mod nodes are handled specially to avoid a sympy auto-evaluation bug
+    where Mod(k*Mod(x,n), m) produces incorrect symbolic results.
+    See https://github.com/sympy/sympy/issues/28744.
+    """
+    if not isinstance(expr, sympy.Basic) or expr.is_Atom:
+        return expr
+
+    simplified_args = [_bounds_simplify_once(a) for a in expr.args]
+
+    # Handle Mod before reconstruction to avoid triggering the sympy bug.
+    if isinstance(expr, sympy.Mod):
+        p, q = simplified_args
+        if q.is_positive and q.is_number:
+            p_bounds = expr_bounds(p)
+            if p_bounds and p_bounds[0] >= 0 and p_bounds[1] < q:
+                return p
+        # Keep Mod but prevent buggy auto-evaluation.
+        return sympy.Mod(p, q, evaluate=False)
+
+    # Reconstruct (safe for non-Mod nodes).
+    expr = expr.func(*simplified_args)
+
+    if isinstance(expr, sympy.floor):
+        bounds = expr_bounds(expr.args[0])
+        if (
+            bounds
+            and bounds[0] != sympy.oo
+            and bounds[1] != sympy.oo
+            and sympy.floor(bounds[0]) == sympy.floor(bounds[1])
+        ):
+            return sympy.Integer(int(sympy.floor(bounds[0])))
+    return expr
+
+
+####################################################################
 
 
 def get_min_expr(
