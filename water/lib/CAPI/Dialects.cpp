@@ -136,6 +136,28 @@ MlirStringRef mlirWaveIterSymbolAttrGetName(MlirAttribute attr) {
 }
 
 //===---------------------------------------------------------------------===//
+// WaveOperandAttr
+//===---------------------------------------------------------------------===//
+
+bool mlirAttributeIsAWaveOperandAttr(MlirAttribute attr) {
+  return llvm::isa<wave::WaveOperandAttr>(unwrap(attr));
+}
+
+MlirAttribute mlirWaveOperandAttrGet(MlirContext mlirCtx,
+                                     unsigned operandNumber) {
+  MLIRContext *ctx = unwrap(mlirCtx);
+  return wrap(wave::WaveOperandAttr::get(ctx, operandNumber));
+}
+
+MlirTypeID mlirWaveOperandAttrGetTypeID() {
+  return wrap(TypeID::get<wave::WaveOperandAttr>());
+}
+
+unsigned mlirWaveOperandAttrGetOperandNumber(MlirAttribute attr) {
+  return llvm::cast<wave::WaveOperandAttr>(unwrap(attr)).getOperandNumber();
+}
+
+//===---------------------------------------------------------------------===//
 // WaveIndexSymbolAttr
 //===---------------------------------------------------------------------===//
 
@@ -358,12 +380,13 @@ MlirAttribute mlirWaveExprListAttrGet(MlirAttribute *symbolNames,
       llvm::make_range(symbolNames, symbolNames + numSymbols),
       [](MlirAttribute attr) { return unwrap(attr); });
 
-  assert(llvm::all_of(
-             symbolAttrs,
-             llvm::IsaPred<wave::WaveSymbolAttr, wave::WaveIndexSymbolAttr,
-                           wave::WaveIterSymbolAttr>) &&
-         "expected mapping to contain only WaveSymbolAttr, "
-         "WaveIndexSymbolAttr or WaveIterSymbolAttr attributes");
+  assert(
+      llvm::all_of(
+          symbolAttrs,
+          llvm::IsaPred<wave::WaveSymbolAttr, wave::WaveIndexSymbolAttr,
+                        wave::WaveIterSymbolAttr, wave::WaveOperandAttr>) &&
+      "expected mapping to contain only WaveSymbolAttr, "
+      "WaveIndexSymbolAttr, WaveIterSymbolAttr or WaveOperandAttr attributes");
 
   return wrap(wave::WaveExprListAttr::get(ctx, symbolAttrs, unwrap(map)));
 }

@@ -7,13 +7,14 @@ mlir operations of wave and other dialects.
 """
 
 from __future__ import annotations
-import dill
-import torch.fx as fx
-import sys
-from typing import TYPE_CHECKING, Sequence
-import sympy
 import argparse
+import dill
+import sys
+import torch.fx as fx
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Sequence
+
+import sympy
 
 if __name__ == "__main__":
     # Add parent directory to sys.path to enable relative imports when running standalone
@@ -30,6 +31,7 @@ if __name__ == "__main__":
 from attr_type_converter import (
     convert_index_mapping_array_to_sympy,
     dtype_to_mlir_scalar_type,
+    get_operand_symbol_placeholders,
     preprocess_symbols,
     symbol_name_to_attribute,
 )
@@ -60,6 +62,7 @@ from wave_lang.kernel.wave.utils.symbol_utils import (
 
 from wave_lang.kernel.ops.wave_ops import (
     Allocate,
+    ApplyExpr,
     Extract,
     ExtractSlice,
     get_custom,
@@ -101,6 +104,7 @@ try:
     from water_mlir.water_mlir import ir
     from water_mlir.water_mlir.dialects.wave import (
         AddOp,
+        ApplyExprOp,
         SubOp,
         AllocateOp,
         CastOp,
@@ -149,6 +153,7 @@ except Exception as e:
 # Mapping from tkw_op_name to actual op constructors
 WAVE_OP_CONSTRUCTORS = {
     "add": AddOp,
+    "apply_expr": ApplyExprOp,
     "sub": SubOp,
     "allocate": AllocateOp,
     "cast": CastOp,
@@ -741,6 +746,33 @@ def _emit_ops_from_graph(
                     mlir_op = op_builder(
                         result_type, *create_mlir_operands(), offset, width, mode
                     )
+                elif isinstance(node, ApplyExpr):
+                    reg = node.register_
+                    if not isinstance(reg, Sequence):
+                        reg = [reg]
+
+                    placeholders = get_operand_symbol_placeholders(len(reg))
+                    sympy_expr = node.expr(*list(placeholders.keys()))
+
+                    # Sort all free_symbols by name for deterministic symbol order in the expr_list.
+                    ordered_symbols = sorted(
+                        sympy_expr.free_symbols, key=lambda s: s.name
+                    )
+                    symbol_mapping = preprocess_symbols(ordered_symbols)
+                    affine_map = _convert_sympy_expr_to_affine_map(
+                        sympy_expr, symbol_mapping
+                    )
+                    symbol_attrs = [
+                        (
+                            placeholders[orig_sym]
+                            if orig_sym in placeholders
+                            else symbol_name_to_attribute(new_sym.name)
+                        )
+                        for orig_sym, new_sym in symbol_mapping.items()
+                    ]
+                    expr_attr = WaveExprListAttr.get(symbol_attrs, affine_map)
+                    operands = [get_single_mapped_value(arg) for arg in reg]
+                    mlir_op = op_builder(result_type, operands, expr_attr)
                 else:
                     try:
                         mlir_op = op_builder(result_type, *create_mlir_operands())
