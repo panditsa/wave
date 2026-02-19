@@ -325,7 +325,8 @@ KernelGenerator::emitScaledMFMA(Operation *scaledOp, llvm::StringRef mnemonic) {
     cbsz = cbszAttr.getInt();
   if (auto blgpAttr = scaledOp->getAttrOfType<IntegerAttr>("blgp"))
     blgp = blgpAttr.getInt();
-  line += " cbsz:" + std::to_string(cbsz) + " blgp:" + std::to_string(blgp);
+  line += " op_sel_hi:[0,0,0] cbsz:" + std::to_string(cbsz) +
+          " blgp:" + std::to_string(blgp);
   return line;
 }
 
@@ -604,7 +605,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 auto [dstPhys, dstIsSGPR] = getPhysRegInfo(body.getArgument(i));
 
                 if (srcPhys >= 0 && dstPhys >= 0 && srcPhys != dstPhys) {
-                  pendingCopies.push_back({dstPhys, srcPhys, isSGPR});
+                  int64_t width = getRegSize(body.getArgument(i).getType());
+                  for (int64_t r = 0; r < width; ++r) {
+                    pendingCopies.push_back({dstPhys + r, srcPhys + r, isSGPR});
+                  }
                 }
               }
 
