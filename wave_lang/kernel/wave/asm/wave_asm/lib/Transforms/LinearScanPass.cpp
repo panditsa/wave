@@ -181,8 +181,10 @@ private:
           collectFailed = true;
           return;
         }
-        if ((isVGPRType(acc.getType()) && isVGPRType(op->getResult(0).getType())) ||
-            (isAGPRType(acc.getType()) && isAGPRType(op->getResult(0).getType()))) {
+        if ((isVGPRType(acc.getType()) &&
+             isVGPRType(op->getResult(0).getType())) ||
+            (isAGPRType(acc.getType()) &&
+             isAGPRType(op->getResult(0).getType()))) {
           // Result should be allocated to same physical register as accumulator
           tiedPairs[op->getResult(0)] = acc;
         }
@@ -191,6 +193,10 @@ private:
 
     if (collectFailed)
       return failure();
+
+    // Compute liveness to check for live range overlaps when deciding
+    // whether to tie condition iter_args to block args.
+    auto liveness = computeLiveness(program);
 
     // Add tied constraints for loop ops: block args share registers with
     // init args, and condition iter_args share registers with block args.
@@ -228,11 +234,26 @@ private:
           tiedPairs[blockArg] = initArg;
         }
 
-        // Tie condition iter_arg to block arg (skip if MFMA already tied it)
+        // Tie condition iter_arg to block arg, UNLESS the iter_arg is
+        // produced by a VMEM load (buffer_load). VMEM loads write their
+        // result ~200 cycles after issue; if tied to the same register as
+        // the block arg, the load overwrites data that MFMAs are still
+        // reading (WAR hazard). For non-VMEM iter_args (ds_read results,
+        // address computations, etc.), tying is safe because their results
+        // are available immediately or through lgkmcnt waits.
         if (i < condOp.getIterArgs().size()) {
           Value iterArg = condOp.getIterArgs()[i];
           if (!tiedPairs.contains(iterArg)) {
-            tiedPairs[iterArg] = blockArg;
+            bool isVmemLoad = false;
+            if (auto *defOp = iterArg.getDefiningOp()) {
+              isVmemLoad = isa<BUFFER_LOAD_DWORD, BUFFER_LOAD_DWORDX2,
+                               BUFFER_LOAD_DWORDX3, BUFFER_LOAD_DWORDX4,
+                               BUFFER_LOAD_UBYTE, BUFFER_LOAD_SBYTE,
+                               BUFFER_LOAD_USHORT, BUFFER_LOAD_SSHORT>(defOp);
+            }
+            if (!isVmemLoad) {
+              tiedPairs[iterArg] = blockArg;
+            }
           }
         }
 

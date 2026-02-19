@@ -113,9 +113,10 @@ llvm::SmallVector<std::string> MetadataEmitter::emitPrologue() {
   return lines;
 }
 
-llvm::SmallVector<std::string>
-MetadataEmitter::emitEpilogue(int64_t peakVGPRs, int64_t peakSGPRs,
-                              int64_t peakAGPRs, int64_t ldsSize) {
+llvm::SmallVector<std::string> MetadataEmitter::emitEpilogue(int64_t peakVGPRs,
+                                                             int64_t peakSGPRs,
+                                                             int64_t peakAGPRs,
+                                                             int64_t ldsSize) {
   llvm::SmallVector<std::string> lines;
 
   // Kernel descriptor
@@ -710,7 +711,8 @@ KernelGenerator::emitScaledMFMA(Operation *scaledOp, llvm::StringRef mnemonic) {
     cbsz = cbszAttr.getInt();
   if (auto blgpAttr = scaledOp->getAttrOfType<IntegerAttr>("blgp"))
     blgp = blgpAttr.getInt();
-  line += " cbsz:" + std::to_string(cbsz) + " blgp:" + std::to_string(blgp);
+  line += " op_sel_hi:[0,0,0] cbsz:" + std::to_string(cbsz) +
+          " blgp:" + std::to_string(blgp);
   return line;
 }
 
@@ -873,8 +875,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
 
       // Wave priority
       .Case<S_SETPRIO>([&](S_SETPRIO prioOp) {
-        return std::string("  s_setprio ") +
-               std::to_string(prioOp.getCount());
+        return std::string("  s_setprio ") + std::to_string(prioOp.getCount());
       })
 
       // Barrier and endpgm
@@ -916,15 +917,15 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
               for (int64_t i = 0; i < size; ++i) {
                 if (!lines.empty())
                   lines += "\n";
-                lines += "  v_accvgpr_write_b32 a" + std::to_string(baseIdx + i) +
-                         ", " + writeSrc;
+                lines += "  v_accvgpr_write_b32 a" +
+                         std::to_string(baseIdx + i) + ", " + writeSrc;
               }
             } else {
               for (int64_t i = 0; i < size; ++i) {
                 if (i > 0)
                   lines += "\n";
-                lines += "  v_mov_b32 v" + std::to_string(baseIdx + i) + ", " +
-                         src;
+                lines +=
+                    "  v_mov_b32 v" + std::to_string(baseIdx + i) + ", " + src;
               }
             }
             return lines;
@@ -1049,7 +1050,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 auto [dstPhys, dstIsSGPR] = getPhysRegInfo(body.getArgument(i));
 
                 if (srcPhys >= 0 && dstPhys >= 0 && srcPhys != dstPhys) {
-                  pendingCopies.push_back({dstPhys, srcPhys, isSGPR});
+                  int64_t width = getRegSize(body.getArgument(i).getType());
+                  for (int64_t r = 0; r < width; ++r) {
+                    pendingCopies.push_back({dstPhys + r, srcPhys + r, isSGPR});
+                  }
                 }
               }
 
@@ -1106,8 +1110,8 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                     peakSGPRs = std::max(peakSGPRs, tmp + 1);
                     os << "  s_mov_b32 s" << tmp << ", s" << chain[0] << "\n";
                     for (size_t k = 0; k + 1 < chain.size(); ++k) {
-                      os << "  s_mov_b32 s" << chain[k] << ", s"
-                         << chain[k + 1] << "\n";
+                      os << "  s_mov_b32 s" << chain[k] << ", s" << chain[k + 1]
+                         << "\n";
                     }
                     os << "  s_mov_b32 s" << chain.back() << ", s" << tmp
                        << "\n";
@@ -1116,8 +1120,8 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                     peakVGPRs = std::max(peakVGPRs, tmp + 1);
                     os << "  v_mov_b32 v" << tmp << ", v" << chain[0] << "\n";
                     for (size_t k = 0; k + 1 < chain.size(); ++k) {
-                      os << "  v_mov_b32 v" << chain[k] << ", v"
-                         << chain[k + 1] << "\n";
+                      os << "  v_mov_b32 v" << chain[k] << ", v" << chain[k + 1]
+                         << "\n";
                     }
                     os << "  v_mov_b32 v" << chain.back() << ", v" << tmp
                        << "\n";
@@ -1244,7 +1248,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         if (mnemonic.starts_with("v_cmp_")) {
           std::string mnem64 = (mnemonic + "_e64").str();
           llvm::SmallVector<std::string> operands;
-          operands.push_back("vcc");  // Explicit VCC destination for VOP3
+          operands.push_back("vcc"); // Explicit VCC destination for VOP3
           for (Value operand : defaultOp->getOperands()) {
             operands.push_back(resolveValue(operand));
           }
@@ -1405,7 +1409,7 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
   {
     std::string scratchReg = formatVGPRRange(kScratchVGPR, 1);
     lines.push_back("  v_mov_b32 " + scratchReg + ", " +
-                     std::to_string(literalValue));
+                    std::to_string(literalValue));
 
     llvm::SmallVector<std::string> operands;
     for (Value result : op->getResults()) {

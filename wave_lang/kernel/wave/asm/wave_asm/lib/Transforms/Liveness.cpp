@@ -176,6 +176,13 @@ LivenessInfo computeLiveness(ProgramOp program) {
     // Without this extension, the block_arg would be freed one point before
     // the loop result re-claims the register, causing a re-allocation that
     // leads to register pressure inflation from fragmentation.
+    //
+    // NOTE: This is conservative — it prevents mid-iteration register reuse
+    // (ping-pong buffering) because loop-carried data registers stay locked
+    // for the entire iteration even after their last use. Enabling ping-pong
+    // reuse requires the allocator's tied-constraint re-reservation (lines
+    // 147-157 of LinearScanRegAlloc.cpp) to handle conflicts when mid-loop
+    // values have already claimed the block arg's register.
     if (auto blockArg = dyn_cast<BlockArgument>(value)) {
       Operation *parentOp = blockArg.getOwner()->getParentOp();
       if (parentOp && isa<LoopOp>(parentOp)) {
@@ -188,13 +195,6 @@ LivenessInfo computeLiveness(ProgramOp program) {
           }
         }
 
-        // Extend to the next sibling op after the LoopOp. This bridges
-        // the gap between the block_arg (which ends at the terminator)
-        // and the loop_result (which starts at the next sibling). Since
-        // they're tied, the physical register is shared and this doesn't
-        // actually increase physical register usage. Without this, the
-        // register is freed and immediately re-reserved, which causes
-        // fragmentation and allocation failure.
         Operation *nextSibling = parentOp->getNextNode();
         if (nextSibling) {
           auto nextIt = opToIdx.find(nextSibling);
@@ -285,10 +285,28 @@ LivenessInfo computeLiveness(ProgramOp program) {
     }
   }
 
+  // Pass 2c: Extend source live ranges for ExtractOp aliasing.
+  // ExtractOp is a no-op in assembly — its result aliases source_physreg +
+  // offset (assigned post-hoc in LinearScanPass). The source's physical
+  // register must stay allocated as long as any derived extract result is
+  // alive, otherwise the register gets freed and reassigned to a different
+  // value, which the post-hoc alias then conflicts with.
+  for (int64_t idx = 0; idx < static_cast<int64_t>(ops.size()); ++idx) {
+    if (auto extractOp = dyn_cast<ExtractOp>(ops[idx])) {
+      Value source = extractOp.getVector();
+      Value result = extractOp.getResult();
+      auto srcIt = info.ranges.find(source);
+      auto resIt = info.ranges.find(result);
+      if (srcIt != info.ranges.end() && resIt != info.ranges.end()) {
+        srcIt->second.end = std::max(srcIt->second.end, resIt->second.end);
+      }
+    }
+  }
+
   // Note: Pass 3 (CFG-based backward dataflow liveness extension) has been
   // removed. It was needed for the old label-based control flow path where
   // loop back-edges were represented as explicit branch instructions. With
-  // region-based control flow (LoopOp/IfOp), Pass 2 and Pass 2b above
+  // region-based control flow (LoopOp/IfOp), Pass 2, 2b, and 2c above
   // already handle all necessary live range extensions by directly inspecting
   // the region structure.
 
