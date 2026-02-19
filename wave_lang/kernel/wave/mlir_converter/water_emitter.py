@@ -76,7 +76,6 @@ from wave_lang.kernel.ops.wave_ops import (
     Placeholder,
     Placeholder,
     ReduceOp as Reduce,
-    SelectOp,
     SelfIndex,
     SharedMemoryBarrier,
     ShuffleOp as Shuffle,
@@ -123,6 +122,7 @@ try:
         MulOp,
         ReadOp,
         RegisterOp,
+        SelectOp,
         SelfIndexOp,
         ShuffleOp,
         SumOp,
@@ -193,6 +193,7 @@ DATATYPE_MAP: dict[str, Callable[[], ir.Type]] = {
     "f32": ir.F32Type.get,
     "f64": ir.F64Type.get,
     "i1": lambda: ir.IntegerType.get_signless(1),
+    # 'bool' is an alias for 'i1'.
     "bool": lambda: ir.IntegerType.get_signless(1),
     "i8": lambda: ir.IntegerType.get_signless(8),
     "i16": lambda: ir.IntegerType.get_signless(16),
