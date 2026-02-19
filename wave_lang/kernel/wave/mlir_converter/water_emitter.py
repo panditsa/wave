@@ -108,6 +108,7 @@ try:
         ApplyExprOp,
         SubOp,
         AllocateOp,
+        BroadcastOp,
         CastOp,
         DivOp,
         ReciprocalOp,
@@ -156,6 +157,7 @@ except Exception as e:
 WAVE_OP_CONSTRUCTORS = {
     "add": AddOp,
     "apply_expr": ApplyExprOp,
+    "broadcast": BroadcastOp,
     "sub": SubOp,
     "allocate": AllocateOp,
     "cast": CastOp,
