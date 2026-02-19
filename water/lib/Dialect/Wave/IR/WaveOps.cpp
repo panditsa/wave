@@ -1729,13 +1729,6 @@ LogicalResult ExtractOp::verify() {
     return success();
   }
 
-  auto resultTensorType = cast<WaveTensorType>(getResult().getType());
-  if (!resultTensorType.getFullySpecified() ||
-      resultTensorType.getRank() != 1) {
-    return emitOpError() << "result must be a 1-dimensional tensor, got "
-                         << resultTensorType;
-  }
-
   auto sourceTensorType = dyn_cast<WaveTensorType>(getSource().getType());
   // For mixed types, cannot do anything here.
   if (!sourceTensorType)
@@ -1744,10 +1737,22 @@ LogicalResult ExtractOp::verify() {
   if (!sourceTensorType.getFullySpecified())
     return emitOpError() << "source tensor type must be fully specified";
 
-  if (!llvm::is_contained(sourceTensorType.getShape(),
-                          resultTensorType.getShape()[0])) {
-    return emitOpError() << "source tensor type dimensions must contain the "
-                            "result tensor type dimension";
+  auto resultTensorType = cast<WaveTensorType>(getResult().getType());
+
+  if (!resultTensorType.getFullySpecified())
+    return emitOpError() << "target tensor type must be fully specified";
+
+  if (resultTensorType.getRank() + 1 != sourceTensorType.getRank()) {
+    return emitOpError()
+           << "result tensor must have one less dimension than source";
+  }
+
+  for (WaveSymbolAttr dim : resultTensorType.getShape()) {
+    if (!llvm::is_contained(sourceTensorType.getShape(), dim)) {
+      return emitOpError() << "source tensor type dimensions must contain the "
+                              "result tensor type dimension "
+                           << dim;
+    }
   }
 
   return success();
