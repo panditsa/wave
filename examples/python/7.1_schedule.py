@@ -128,9 +128,7 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
     is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
 ):
     """Asymmetric MXFP4 GEMM with preshuffled B data and B scales."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
-        shape, block, wave_shape=(1, 4)
-    )
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
     options.minimize_shared_allocs = True
     options.linearize_shared_access = True
     options.use_buffer_ops = True
