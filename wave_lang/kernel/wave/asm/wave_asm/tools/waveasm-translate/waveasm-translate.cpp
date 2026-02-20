@@ -96,12 +96,6 @@ static llvm::cl::opt<bool> runMemoryOffsetOpt(
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
-    runMVE("waveasm-mve",
-           llvm::cl::desc("Modulo Variable Expansion: eliminate v_mov register "
-                          "rotation at loop back-edges"),
-           llvm::cl::init(false));
-
-static llvm::cl::opt<bool>
     emitAssembly("emit-assembly",
                  llvm::cl::desc("Emit AMDGCN assembly instead of MLIR"),
                  llvm::cl::init(false));
@@ -275,12 +269,6 @@ int main(int argc, char **argv) {
     // typesCompatible() instead of exact type equality, then re-enable the
     // interleaved verifier.
     pm.enableVerifier(false);
-  }
-
-  // MVE runs after register allocation (needs physical register types)
-  // and before waitcnt/hazard (which depend on final instruction order).
-  if (runMVE) {
-    pm.addPass(waveasm::createWAVEASMMVEPass());
   }
 
   // Waitcnt insertion should run before hazard mitigation

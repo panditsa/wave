@@ -57,9 +57,6 @@ std::unique_ptr<mlir::Pass> createWAVEASMPeepholePass();
 /// Create the memory offset optimization pass
 std::unique_ptr<mlir::Pass> createWAVEASMMemoryOffsetOptPass();
 
-/// Create the modulo variable expansion pass (eliminates back-edge v_mov)
-std::unique_ptr<mlir::Pass> createWAVEASMMVEPass();
-
 //===----------------------------------------------------------------------===//
 // Pass Registration
 //===----------------------------------------------------------------------===//
