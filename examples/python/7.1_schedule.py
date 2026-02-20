@@ -154,6 +154,13 @@ def test_dbuf_4wave_mxfp_asymmetric_gemm(
     options.use_water_backend = True
     schedule = get_mxfp4_asymmetric_schedule()
 
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm(gemm, shape)
+    print("MXFP GEMM asymmetric-prefetch 4-wave test passed!")
+
 
 def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
     is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
