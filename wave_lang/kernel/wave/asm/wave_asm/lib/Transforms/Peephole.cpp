@@ -1020,7 +1020,7 @@ struct PeepholePass
     // limit.  Adding loop-carried VGPRs causes register overflow.
     // Enable when VGPR pressure is reduced (e.g. by eliminating the
     // B-data v_mov register rotation).
-    if (false)
+    if (true)
       module.walk([](LoopOp loopOp) {
         Block &body = loopOp.getBodyBlock();
         Region *loopRegion = &loopOp.getBodyRegion();

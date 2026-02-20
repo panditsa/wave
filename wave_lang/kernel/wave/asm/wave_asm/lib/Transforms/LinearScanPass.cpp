@@ -307,6 +307,7 @@ private:
     // to loop result types and init arg types.
     program.walk([&](LoopOp loopOp) {
       Block &bodyBlock = loopOp.getBodyBlock();
+      constexpr bool kForceVMEMBlockArgToIterArgType = false;
 
       // Get the condition op (terminator of body)
       auto condOp = dyn_cast<ConditionOp>(bodyBlock.getTerminator());
@@ -322,6 +323,24 @@ private:
         BlockArgument blockArg = bodyBlock.getArgument(i);
         Type ty = blockArg.getType();
         int64_t physReg = mapping.getPhysReg(blockArg);
+
+        if (kForceVMEMBlockArgToIterArgType &&
+            i < condOp.getIterArgs().size()) {
+          Value iterArg = condOp.getIterArgs()[i];
+          if (auto *defOp = iterArg.getDefiningOp()) {
+            bool isVmemLoad =
+                isa<BUFFER_LOAD_DWORD, BUFFER_LOAD_DWORDX2, BUFFER_LOAD_DWORDX3,
+                    BUFFER_LOAD_DWORDX4, BUFFER_LOAD_UBYTE, BUFFER_LOAD_SBYTE,
+                    BUFFER_LOAD_USHORT, BUFFER_LOAD_SSHORT>(defOp);
+            if (isVmemLoad) {
+              Type condType = iterArg.getType();
+              if (isa<PVRegType>(condType) || isa<PSRegType>(condType)) {
+                blockArg.setType(condType);
+                continue;
+              }
+            }
+          }
+        }
 
         if (physReg >= 0) {
           blockArg.setType(makePhysicalType(loopOp->getContext(), ty, physReg));
