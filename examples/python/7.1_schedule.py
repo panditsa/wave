@@ -155,23 +155,6 @@ def test_dbuf_4wave_mxfp_asymmetric_gemm(
     schedule = get_mxfp4_asymmetric_schedule()
 
 
-def test_dbuf_4wave_mxfp_hipblaslt_gemm(
-    is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
-):
-    """Double-buffered MXFP4 GEMM, 4 waves (Python ASM backend)."""
-    gemm, options, schedule = _get_hipblaslt_kernel_and_schedule(shape, block)
-
-    options.use_buffer_ops = True
-    options.linearize_shared_access = True
-    options.use_water_backend = True
-    options.print_ir_after = "all" if is_debug else []
-    options = set_default_run_config(options)
-    gemm = wave_compile(options, gemm, schedule)
-
-    _run_mxfp_gemm(gemm, shape)
-    print("MXFP GEMM asymmetric-prefetch 4-wave test passed!")
-
-
 def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
     is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
 ):
@@ -191,10 +174,10 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
     print("MXFP GEMM preshuffle-B 4-wave test passed!")
 
 
-def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
+def test_dbuf_4wave_mxfp_asymmetric_gemm_cpp(
     is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
 ):
-    """Double-buffered MXFP4 GEMM, 4 waves (C++ WaveASM backend)."""
+    """Asymmetric MXFP4 GEMM (no preshuffle), 4 waves (C++ WaveASM backend)."""
     import sys, os
 
     sys.path.insert(
@@ -210,7 +193,10 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
         run_with_wave_runtime,
     )
 
-    gemm, options, schedule = _get_hipblaslt_kernel_and_schedule(shape, block)
+    gemm, options = get_tagged_mxfp4_gemm(
+        shape, block, wave_shape=(1, 4), b_address_space=GLOBAL_ADDRESS_SPACE
+    )
+    schedule = get_mxfp4_asymmetric_schedule()
     options.backend = "asm"
     options.wave_runtime = True
     options.print_ir_after = "all" if is_debug else []
@@ -218,7 +204,7 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
 
     kernel_info = capture_wave_kernel_info(options, gemm, schedule=schedule)
 
-    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_hipblaslt_cpp.mlir"
+    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_asymmetric_cpp.mlir"
     with open(options.print_mlir_file, "w") as f:
         f.write(kernel_info.mlir_text)
 
@@ -228,7 +214,7 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
         raise RuntimeError(f"C++ ASM compilation failed: {result.error_message}")
 
     if result.asm_text:
-        asm_path = "build/intermediates/hipblaslt_cpp.s"
+        asm_path = "build/intermediates/asymmetric_cpp.s"
         os.makedirs(os.path.dirname(asm_path), exist_ok=True)
         with open(asm_path, "w") as f:
             f.write(result.asm_text)
@@ -246,6 +232,89 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
     run_with_wave_runtime(
         binary_path=result.binary_path,
         inputs=[x, x_scales, w.T.contiguous(), w_scales],
+        outputs=[out],
+        grid=kernel_info.grid_size,
+        block=kernel_info.workgroup_size,
+        shared_memory_bytes=kernel_info.lds_size,
+        func_name=kernel_name,
+    )
+
+    out_cpu = out.cpu()
+    ref = torch_out if not torch_out.is_cuda else torch_out.cpu()
+    mismatch = ~torch.isclose(ref, out_cpu, atol=1e-2, rtol=1e-2)
+    num_mismatch = mismatch.sum().item()
+    if num_mismatch > 0:
+        M, N = ref.shape
+        print(f"\nMISMATCH: {num_mismatch}/{M*N} = {100*num_mismatch/(M*N):.1f}%")
+        idx = torch.where(mismatch)
+        for i in range(min(10, len(idx[0]))):
+            r, c = idx[0][i].item(), idx[1][i].item()
+            print(f"  [{r},{c}] ref={ref[r,c]:.4f} got={out_cpu[r,c]:.4f}")
+        raise RuntimeError(f"Mismatch: {num_mismatch}/{M*N} elements differ")
+    print("Asymmetric MXFP4 GEMM (no preshuffle) C++ backend test passed!")
+
+
+def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
+):
+    """Double-buffered MXFP4 GEMM with preshuffle B, 4 waves (C++ WaveASM backend)."""
+    import sys, os
+
+    sys.path.insert(
+        0,
+        os.path.join(
+            os.path.dirname(__file__),
+            "../../wave_lang/kernel/wave/asm/wave_asm/test/e2e",
+        ),
+    )
+    from waveasm_e2e import (
+        capture_wave_kernel_info,
+        WaveASMCompiler,
+        run_with_wave_runtime,
+    )
+
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    schedule = get_mxfp4_asymmetric_schedule()
+    options.backend = "asm"
+    options.wave_runtime = True
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+
+    kernel_info = capture_wave_kernel_info(options, gemm, schedule=schedule)
+
+    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_preshuffle_b_cpp.mlir"
+    with open(options.print_mlir_file, "w") as f:
+        f.write(kernel_info.mlir_text)
+
+    compiler = WaveASMCompiler(target="gfx950", keep_temp_files=True)
+    result = compiler.compile_full(kernel_info.mlir_text, kernel_info.workgroup_size)
+    if not result.success:
+        raise RuntimeError(f"C++ ASM compilation failed: {result.error_message}")
+
+    if result.asm_text:
+        asm_path = "build/intermediates/preshuffle_b_cpp.s"
+        os.makedirs(os.path.dirname(asm_path), exist_ok=True)
+        with open(asm_path, "w") as f:
+            f.write(result.asm_text)
+        print(
+            f"C++ ASM written to {asm_path} ({len(result.asm_text.splitlines())} lines)"
+        )
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    w_t = w.T.contiguous()
+    w_t_ps = b_preshuffle(w_t)
+    w_scales_ps = e8m0_shuffle(w_scales)
+
+    x, w_t_ps = x.cuda(), w_t_ps.cuda()
+    x_scales, w_scales_ps = x_scales.cuda(), w_scales_ps.cuda()
+    out = torch.zeros(shape[0], shape[1], dtype=torch.float32).cuda()
+
+    kernel_name = result.get_kernel_name() or kernel_info.kernel_name
+    run_with_wave_runtime(
+        binary_path=result.binary_path,
+        inputs=[x, x_scales, w_t_ps, w_scales_ps],
         outputs=[out],
         grid=kernel_info.grid_size,
         block=kernel_info.workgroup_size,
@@ -402,7 +471,7 @@ def test_dbuf_4wave_mxfp_hipblaslt_gemm_cpp(
 
         raise AssertionError(f"Mismatch: {num_mismatch}/{M*N} elements differ")
 
-    print("MXFP GEMM double-buffer 4-wave HIPBLASLT (C++ backend) test passed!")
+    print("MXFP GEMM double-buffer 4-wave preshuffle-B (C++ backend) test passed!")
 
 
 if __name__ == "__main__":
