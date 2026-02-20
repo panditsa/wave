@@ -23,9 +23,12 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Debug.h"
 
 using namespace mlir;
 using namespace waveasm;
+
+#define DEBUG_TYPE "waveasm-linear-scan"
 
 /// Convert a virtual register type to a physical register type.
 /// Returns the original type unchanged if it's not a virtual register type
@@ -200,11 +203,35 @@ private:
 
     // Add tied constraints for loop ops: block args share registers with
     // init args, and condition iter_args share registers with block args.
+    // Prototype knob: force VMEM iter_arg ties to evaluate whether pure
+    // allocator coalescing can remove loop back-edge v_mov clusters.
+    // If this causes correctness issues, this path confirms we need a
+    // dedicated phase-aware transform instead of allocator-only tying.
+    constexpr bool kAggressiveTieVMEMIterArgs = false;
+
+    struct VMemTieStats {
+      int64_t seen = 0;
+      int64_t tied = 0;
+      int64_t skippedNoDefOp = 0;
+      int64_t skippedDefOutsideLoopBody = 0;
+      int64_t skippedRangeOverlap = 0;
+      int64_t skippedHazardUseAfterDef = 0;
+    } vmemTieStats;
+
     program.walk([&](LoopOp loopOp) {
       Block &bodyBlock = loopOp.getBodyBlock();
       auto condOp = dyn_cast<ConditionOp>(bodyBlock.getTerminator());
       if (!condOp)
         return;
+
+      // Build a linearized op index for this loop body (including nested ops)
+      // so we can conservatively reject VMEM ties when a block arg is still
+      // used after the VMEM write in the same iteration.
+      llvm::SmallVector<Operation *> bodyOps;
+      collectOpsRecursive(bodyBlock, bodyOps);
+      llvm::DenseMap<Operation *, int64_t> bodyOpToIdx;
+      for (int64_t idx = 0; idx < static_cast<int64_t>(bodyOps.size()); ++idx)
+        bodyOpToIdx[bodyOps[idx]] = idx;
 
       // Track which init arg values have been used, to detect duplicates.
       // If multiple block args are tied to the same init arg (e.g., after
@@ -234,13 +261,20 @@ private:
           tiedPairs[blockArg] = initArg;
         }
 
-        // Tie condition iter_arg to block arg, UNLESS the iter_arg is
-        // produced by a VMEM load (buffer_load). VMEM loads write their
-        // result ~200 cycles after issue; if tied to the same register as
-        // the block arg, the load overwrites data that MFMAs are still
-        // reading (WAR hazard). For non-VMEM iter_args (ds_read results,
-        // address computations, etc.), tying is safe because their results
-        // are available immediately or through lgkmcnt waits.
+        // Tie condition iter_arg to block arg so they share a physical
+        // register, eliminating the v_mov at the loop back-edge.
+        //
+        // VMEM loads (buffer_load) are excluded: the asynchronous write
+        // can overwrite the register while MFMAs are still reading.
+        // The software-pipelined schedule issues buffer_loads early and
+        // uses vmcnt to control when results are consumed, but the
+        // block arg may still be live (read by MFMAs) when a coalesced
+        // buffer_load from a later iteration writes the same register.
+        //
+        // Eliminating the v_mov requires a full MVE (Modular Variable
+        // Expansion) pass that assigns distinct physical register sets
+        // to each unrolled half, ensuring loads and MFMAs never share
+        // registers within the same half.
         if (i < condOp.getIterArgs().size()) {
           Value iterArg = condOp.getIterArgs()[i];
           if (!tiedPairs.contains(iterArg)) {
@@ -253,6 +287,54 @@ private:
             }
             if (!isVmemLoad) {
               tiedPairs[iterArg] = blockArg;
+            } else {
+              ++vmemTieStats.seen;
+              if (kAggressiveTieVMEMIterArgs) {
+                tiedPairs[iterArg] = blockArg;
+                ++vmemTieStats.tied;
+                continue;
+              }
+              Operation *defOp = iterArg.getDefiningOp();
+              if (!defOp) {
+                ++vmemTieStats.skippedNoDefOp;
+                continue;
+              }
+
+              auto defIt = bodyOpToIdx.find(defOp);
+              if (defIt == bodyOpToIdx.end()) {
+                ++vmemTieStats.skippedDefOutsideLoopBody;
+                continue;
+              }
+
+              // Additional conservative liveness guard: if the ranges overlap,
+              // coalescing can only be safe when all blockArg uses are before
+              // the VMEM defining op in this iteration.
+              if (const LiveRange *iterRange = liveness.getRange(iterArg)) {
+                if (const LiveRange *blockRange = liveness.getRange(blockArg)) {
+                  if (iterRange->overlaps(*blockRange))
+                    ++vmemTieStats.skippedRangeOverlap;
+                }
+              }
+
+              int64_t defIdx = defIt->second;
+              int64_t lastUseIdx = -1;
+              for (int64_t idx = 0; idx < static_cast<int64_t>(bodyOps.size());
+                   ++idx) {
+                Operation *op = bodyOps[idx];
+                for (Value operand : op->getOperands()) {
+                  if (operand == blockArg)
+                    lastUseIdx = std::max(lastUseIdx, idx);
+                }
+              }
+
+              // Unsafe if block arg is still consumed after VMEM write op.
+              if (lastUseIdx > defIdx) {
+                ++vmemTieStats.skippedHazardUseAfterDef;
+                continue;
+              }
+
+              tiedPairs[iterArg] = blockArg;
+              ++vmemTieStats.tied;
             }
           }
         }
@@ -263,6 +345,18 @@ private:
           tiedPairs[loopOp->getResult(i)] = blockArg;
         }
       }
+    });
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "[waveasm-linear-scan] VMEM iter-arg tie stats: seen="
+                   << vmemTieStats.seen << ", tied=" << vmemTieStats.tied
+                   << ", skippedNoDefOp=" << vmemTieStats.skippedNoDefOp
+                   << ", skippedDefOutsideLoopBody="
+                   << vmemTieStats.skippedDefOutsideLoopBody
+                   << ", skippedRangeOverlap="
+                   << vmemTieStats.skippedRangeOverlap
+                   << ", skippedHazardUseAfterDef="
+                   << vmemTieStats.skippedHazardUseAfterDef << "\n";
     });
 
     // Create allocator with precolored values and tied operands
@@ -353,6 +447,7 @@ private:
     // to loop result types and init arg types.
     program.walk([&](LoopOp loopOp) {
       Block &bodyBlock = loopOp.getBodyBlock();
+      constexpr bool kForceVMEMBlockArgToIterArgType = false;
 
       // Get the condition op (terminator of body)
       auto condOp = dyn_cast<ConditionOp>(bodyBlock.getTerminator());
@@ -368,6 +463,24 @@ private:
         BlockArgument blockArg = bodyBlock.getArgument(i);
         Type ty = blockArg.getType();
         int64_t physReg = mapping.getPhysReg(blockArg);
+
+        if (kForceVMEMBlockArgToIterArgType &&
+            i < condOp.getIterArgs().size()) {
+          Value iterArg = condOp.getIterArgs()[i];
+          if (auto *defOp = iterArg.getDefiningOp()) {
+            bool isVmemLoad =
+                isa<BUFFER_LOAD_DWORD, BUFFER_LOAD_DWORDX2, BUFFER_LOAD_DWORDX3,
+                    BUFFER_LOAD_DWORDX4, BUFFER_LOAD_UBYTE, BUFFER_LOAD_SBYTE,
+                    BUFFER_LOAD_USHORT, BUFFER_LOAD_SSHORT>(defOp);
+            if (isVmemLoad) {
+              Type condType = iterArg.getType();
+              if (isa<PVRegType>(condType) || isa<PSRegType>(condType)) {
+                blockArg.setType(condType);
+                continue;
+              }
+            }
+          }
+        }
 
         if (physReg >= 0) {
           blockArg.setType(makePhysicalType(loopOp->getContext(), ty, physReg));
