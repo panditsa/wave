@@ -647,8 +647,8 @@ def get_mxfp4_dbuf_hipblaslt_schedule():
 
         epi_clusters = epilogue_clusters_itr0 + prologue_clusters
         tkw.reorder_graph(pipeline_loop.EPILOGUE, epi_clusters)
-        # # Unroll factor requires per-GEMM tuning:
-        # unroll_factor = 2
-        # tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
+        # Unroll factor requires per-GEMM tuning:
+        unroll_factor = 2
+        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
     return mxfp4_dbuf_schedule
