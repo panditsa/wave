@@ -26,6 +26,7 @@ add_mlir_dialect_library(MLIRWaveASMTransforms
   RegionBuilder.cpp
   ScopedCSE.cpp
   Peephole.cpp
+  LoopAddressPromotion.cpp
   MemoryOffsetOptimization.cpp
   BufferLoadStrengthReduction.cpp
   ${HANDLERS_FULL_PATHS}

@@ -98,6 +98,10 @@ static llvm::cl::opt<bool> runMemoryOffsetOpt(
 static llvm::cl::opt<bool> runBufferLoadStrengthReduction(
     "waveasm-buffer-load-strength-reduction",
     llvm::cl::desc("Run buffer load strength reduction pass"),
+
+static llvm::cl::opt<bool> disableLoopAddressPromotion(
+    "waveasm-loop-address-promotion-disable",
+    llvm::cl::desc("Disable loop address promotion pass (enabled by default)"),
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
@@ -234,8 +238,14 @@ int main(int argc, char **argv) {
   }
 
   // Peephole optimizations run after CSE but before waitcnt/hazard.
+  // Peephole optimizations run after CSE.
   if (runPeephole) {
     pm.addPass(waveasm::createWAVEASMPeepholePass());
+  }
+
+  // Loop/region structural transforms (enabled by default).
+  if (!disableLoopAddressPromotion) {
+    pm.addPass(waveasm::createWAVEASMLoopAddressPromotionPass());
   }
 
   // Strength-reduce buffer_load address computation in loops: precompute
