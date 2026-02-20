@@ -292,6 +292,40 @@ def liveness_analysis(graph: fx.Graph) -> dict[fx.Node, int]:
     return num_rotating_registers
 
 
+def _has_consume_before_write_pattern(node: fx.Node) -> bool:
+    """
+    Check if all consumers (reads) of a shared memory write are at a later
+    pipeline stage than the write itself.
+
+    In a multi-stage software pipeline, the kernel body executes stages in
+    reverse order: higher stages (from earlier iterations) run BEFORE lower
+    stages (from the current iteration). If the write (g2s/buffer_load_lds)
+    is at stage 0 and all reads (ds_reads) are at stage 1+, the reads
+    execute before the write within each kernel iteration -- the buffer is
+    fully consumed before being refilled.
+
+    This allows reducing the buffer count by 1 (e.g., triple-buffer to
+    double-buffer) because the buffer is free for reuse one iteration
+    earlier than the raw lifetime suggests.
+    """
+    custom = get_custom(node)
+    if custom.scheduling_parameters is None:
+        return False
+
+    write_stage = custom.scheduling_parameters["stage"]
+
+    has_users = False
+    for user in custom.users:
+        if user.scheduling_parameters is None:
+            continue
+        has_users = True
+        read_stage = user.scheduling_parameters["stage"]
+        if read_stage <= write_stage:
+            return False
+
+    return has_users
+
+
 def compute_multi_buffer_count(
     graph: fx.Graph, initiation_interval: int, multi_buffer_count: Optional[int] = None
 ) -> dict[fx.Node, int]:
@@ -320,6 +354,20 @@ def compute_multi_buffer_count(
             #   111
             #     222
             buffer_count = ceildiv(lifetime[node] + 1, initiation_interval)
+
+            # If all reads from this buffer complete before the write within
+            # each initiation interval (consume-then-write pattern), the buffer
+            # is free for reuse one iteration earlier. This reduces triple-buffer
+            # to double-buffer when the schedule reads a buffer fully before
+            # refilling it.
+            if buffer_count >= 2 and _has_consume_before_write_pattern(node):
+                buffer_count -= 1
+                logger.debug(
+                    f"Node: {node}, Buffer count reduced to {buffer_count} "
+                    f"(consume-before-write: reads at later pipeline stage "
+                    f"than write)"
+                )
+
             logger.debug(f"Node: {node}, Buffer count: {buffer_count}")
             if buffer_count < 2:
                 continue
