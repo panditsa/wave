@@ -271,15 +271,10 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
   auto &builder = ctx.getBuilder();
   auto loc = op->getLoc();
 
-  // Extract M, N, K dimensions from attributes
   int64_t m = scaledMfmaOp.getM();
   int64_t n = scaledMfmaOp.getN();
   int64_t k = scaledMfmaOp.getK();
 
-  // Map operands: sourceA (data), sourceB (data), destC (acc), scaleA, scaleB
-  // Note: In amdgpu.scaled_mfma, operands are ordered differently than in the
-  // IR The Python implementation showed that operands come in this order: 0:
-  // sourceA (data), 1: sourceB (data), 2: destC (acc), 3: scaleA, 4: scaleB
   auto srcA = ctx.getMapper().getMapped(scaledMfmaOp.getSourceA());
   auto srcB = ctx.getMapper().getMapped(scaledMfmaOp.getSourceB());
   auto srcC = ctx.getMapper().getMapped(scaledMfmaOp.getDestC());
@@ -290,18 +285,35 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
     return op->emitError("Scaled MFMA operands not mapped");
   }
 
-  // For MXFP4 16x16x128: accumulator is 4 VGPRs
+  int32_t scalesIdxA = scaledMfmaOp.getScalesIdxA();
+  int32_t scalesIdxB = scaledMfmaOp.getScalesIdxB();
+
+  // When scalesIdx is non-zero, the scale operand is a packed 32-bit register
+  // with 4 e8m0 bytes. Extract the selected byte via v_bfe_u32 so the MFMA
+  // always uses byte 0 (op_sel_hi:[0,0,0]).
+  auto extractScaleByte = [&](Value scale, int32_t idx) -> Value {
+    auto vregType = ctx.createVRegType(1, 4);
+    int64_t bitOffset = idx * 8;
+    auto offsetImm = builder.getType<ImmType>(bitOffset);
+    auto offsetConst = ConstantOp::create(builder, loc, offsetImm, bitOffset);
+    auto widthImm = builder.getType<ImmType>(8);
+    auto widthConst = ConstantOp::create(builder, loc, widthImm, 8);
+    return V_BFE_U32::create(builder, loc, vregType, scale, offsetConst,
+                             widthConst);
+  };
+
+  Value effScaleA = *scaleA;
+  Value effScaleB = *scaleB;
+  if (scalesIdxA != 0)
+    effScaleA = extractScaleByte(*scaleA, scalesIdxA);
+  if (scalesIdxB != 0)
+    effScaleB = extractScaleByte(*scaleB, scalesIdxB);
+
   int64_t accSize = 4;
   if (m == 32 && n == 32) {
     accSize = 16;
   }
 
-  // Use the accumulator input's type to determine the output type.
-  // When the accumulator comes from a loop iter_arg initialized as an AGPR
-  // (by RegionBuilder for gfx950 ScaledMFMA patterns), the MFMA result
-  // should also be an AGPR to maintain the loop-carried type. Otherwise,
-  // use VGPRs. This avoids unnecessarily forcing AGPRs on standalone MFMAs
-  // (not inside a loop) where they cause accum_offset overhead.
   Type accRegType;
   if (isAGPRType(srcC->getType())) {
     accRegType = ctx.createARegType(accSize, 4);
@@ -310,13 +322,12 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
   }
   Value result;
 
-  // Generate the appropriate scaled MFMA instruction based on dimensions
   if (m == 16 && n == 16 && k == 128) {
     result = V_MFMA_SCALE_F32_16X16X128_F8F6F4::create(
-        builder, loc, accRegType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
+        builder, loc, accRegType, *srcA, *srcB, *srcC, effScaleA, effScaleB);
   } else if (m == 32 && n == 32 && k == 64) {
     result = V_MFMA_SCALE_F32_32X32X64_F8F6F4::create(
-        builder, loc, accRegType, *srcA, *srcB, *srcC, *scaleA, *scaleB);
+        builder, loc, accRegType, *srcA, *srcB, *srcC, effScaleA, effScaleB);
   } else {
     return op->emitError("Unsupported scaled MFMA dimensions: ")
            << m << "x" << n << "x" << k;
