@@ -1283,8 +1283,8 @@ def get_mxfp4_asymmetric_schedule():
         clusters += epilogue_clusters_itr0
         clusters += prologue_clusters
         tkw.reorder_graph(pipeline_loop.EPILOGUE, clusters)
-        # # Unroll factor requires per-GEMM tuning:
-        # unroll_factor = 2
-        # tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
+        # Unroll factor requires per-GEMM tuning:
+        unroll_factor = 2
+        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
     return mxfp4_dbuf_schedule
