@@ -21,6 +21,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -131,6 +132,26 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
       if (shiftAmount < 0 || shiftAmount > 31)
         return failure();
 
+      // If the shifted base is scalar (SGPR) and the result feeds into a
+      // buffer_load_lds voffset chain, skip fusion — let the
+      // BufferLoadLDSSoffsetPattern extract the shift into soffset instead.
+      if (isSGPRType(lshlOp.getSrc1().getType())) {
+        auto feedsBufferLoadLDS = [](Value v) {
+          for (auto *user : v.getUsers()) {
+            if (isa<BUFFER_LOAD_DWORDX4_LDS, BUFFER_LOAD_DWORD_LDS>(user))
+              return true;
+            if (auto add = dyn_cast<V_ADD_U32>(user)) {
+              for (auto *u2 : add.getResult().getUsers())
+                if (isa<BUFFER_LOAD_DWORDX4_LDS, BUFFER_LOAD_DWORD_LDS>(u2))
+                  return true;
+            }
+          }
+          return false;
+        };
+        if (feedsBufferLoadLDS(addOp.getResult()))
+          return failure();
+      }
+
       auto loc = addOp.getLoc();
 
       // Get the base value being shifted
@@ -153,6 +174,109 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
       return success();
     if (succeeded(checkOperand(addOp.getSrc1(), addOp.getSrc0())))
       return success();
+
+    return failure();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: extract SGPR shift from buffer_load_lds voffset into soffset
+//
+// Matches:
+//   %shifted = v_lshlrev_b32 <const>, <sgpr>    ; single-use
+//   %combined = v_add_u32 %shifted, %vgpr_base  ; or reversed operands
+//   %final = v_add_u32 %combined, %row          ; (optional second add)
+//   buffer_load_dword[x4]_lds %final, %srd, 0
+//
+// Rewrites to:
+//   %soff = s_lshl_b32 <sgpr>, <const>
+//   %voff = v_add_u32 %vgpr_base, %row          ; loop-invariant, hoistable
+//   buffer_load_dword[x4]_lds %voff, %srd, %soff
+//===----------------------------------------------------------------------===//
+
+template <typename BufferLoadOp>
+struct BufferLoadLDSSoffsetPattern : public OpRewritePattern<BufferLoadOp> {
+  using OpRewritePattern<BufferLoadOp>::OpRewritePattern;
+
+  BufferLoadLDSSoffsetPattern(MLIRContext *ctx)
+      : OpRewritePattern<BufferLoadOp>(ctx, /*benefit=*/20) {}
+
+  LogicalResult matchAndRewrite(BufferLoadOp loadOp,
+                                PatternRewriter &rewriter) const override {
+    // Only apply when soffset is currently 0.
+    auto soffsetConst =
+        loadOp.getSoffset().template getDefiningOp<ConstantOp>();
+    if (!soffsetConst || soffsetConst.getValue() != 0)
+      return failure();
+
+    Value voffset = loadOp.getVoffset();
+    auto outerAdd = voffset.template getDefiningOp<V_ADD_U32>();
+    if (!outerAdd)
+      return failure();
+
+    // Helper: check if a value is V_LSHLREV_B32(const, sgpr) with one use.
+    auto extractScalarShift =
+        [](Value v) -> std::optional<std::pair<Value, Value>> {
+      auto lshl = v.getDefiningOp<V_LSHLREV_B32>();
+      if (!lshl || !lshl.getResult().hasOneUse())
+        return std::nullopt;
+      if (!lshl.getSrc0().getDefiningOp<ConstantOp>())
+        return std::nullopt;
+      if (!isSGPRType(lshl.getSrc1().getType()))
+        return std::nullopt;
+      // Return (base_sgpr, shift_amt_const).
+      return std::make_pair(lshl.getSrc1(), lshl.getSrc0());
+    };
+
+    // Helper: try to find the shift in an add's operands.
+    // Returns (base_sgpr, shift_amt, other_operand).
+    auto findShiftInAdd =
+        [&](V_ADD_U32 add) -> std::optional<std::tuple<Value, Value, Value>> {
+      for (int i = 0; i < 2; ++i) {
+        Value op = i == 0 ? add.getSrc0() : add.getSrc1();
+        Value other = i == 0 ? add.getSrc1() : add.getSrc0();
+        if (auto shift = extractScalarShift(op))
+          return std::make_tuple(shift->first, shift->second, other);
+      }
+      return std::nullopt;
+    };
+
+    auto loc = loadOp.getLoc();
+
+    // Case 1: voffset = V_ADD_U32(row, V_LSHLREV_B32(const, sgpr))
+    if (auto found = findShiftInAdd(outerAdd)) {
+      auto [base, shiftAmt, other] = *found;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(other);
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
+
+    // Case 2: voffset = V_ADD_U32(row, V_ADD_U32(thread, V_LSHLREV_B32(...)))
+    for (int i = 0; i < 2; ++i) {
+      Value candidate = i == 0 ? outerAdd.getSrc0() : outerAdd.getSrc1();
+      Value row = i == 0 ? outerAdd.getSrc1() : outerAdd.getSrc0();
+      auto innerAdd = candidate.template getDefiningOp<V_ADD_U32>();
+      if (!innerAdd)
+        continue;
+      auto found = findShiftInAdd(innerAdd);
+      if (!found)
+        continue;
+
+      auto [base, shiftAmt, threadBase] = *found;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      auto newVoff = V_ADD_U32::create(
+          rewriter, loc, outerAdd.getResult().getType(), row, threadBase);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(newVoff.getResult());
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
 
     return failure();
   }
@@ -614,8 +738,8 @@ struct FoldMovConstIntoAddPattern : public OpRewritePattern<V_ADD_U32> {
       // Replace: v_add_u32(v_mov_b32(CONST), X) -> v_add_u32(CONST, X)
       auto loc = addOp.getLoc();
       auto resultType = addOp.getResult().getType();
-      auto newAdd = V_ADD_U32::create(rewriter, loc, resultType,
-                                      movOp.getSrc(), other);
+      auto newAdd =
+          V_ADD_U32::create(rewriter, loc, resultType, movOp.getSrc(), other);
       rewriter.replaceOp(addOp, newAdd.getResult());
       return success();
     };
@@ -654,8 +778,8 @@ struct FoldMovConstIntoSubPattern : public OpRewritePattern<V_SUB_U32> {
         return failure();
       auto loc = subOp.getLoc();
       auto resultType = subOp.getResult().getType();
-      auto newSub = V_SUB_U32::create(rewriter, loc, resultType,
-                                      movOp.getSrc(), subOp.getSrc1());
+      auto newSub = V_SUB_U32::create(rewriter, loc, resultType, movOp.getSrc(),
+                                      subOp.getSrc1());
       rewriter.replaceOp(subOp, newSub.getResult());
       return success();
     };
@@ -711,7 +835,7 @@ struct FoldMovConstIntoLshlPattern : public OpRewritePattern<V_LSHLREV_B32> {
     auto loc = lshlOp.getLoc();
     auto resultType = lshlOp.getResult().getType();
     auto newLshl = V_LSHLREV_B32::create(rewriter, loc, resultType,
-                                          movOp.getSrc(), lshlOp.getSrc1());
+                                         movOp.getSrc(), lshlOp.getSrc1());
     rewriter.replaceOp(lshlOp, newLshl.getResult());
     return success();
   }
@@ -738,7 +862,7 @@ struct FoldMovConstIntoLshrPattern : public OpRewritePattern<V_LSHRREV_B32> {
     auto loc = lshrOp.getLoc();
     auto resultType = lshrOp.getResult().getType();
     auto newLshr = V_LSHRREV_B32::create(rewriter, loc, resultType,
-                                          movOp.getSrc(), lshrOp.getSrc1());
+                                         movOp.getSrc(), lshrOp.getSrc1());
     rewriter.replaceOp(lshrOp, newLshr.getResult());
     return success();
   }
@@ -765,8 +889,8 @@ struct FoldMovConstIntoAndPattern : public OpRewritePattern<V_AND_B32> {
 
       auto loc = andOp.getLoc();
       auto resultType = andOp.getResult().getType();
-      auto newAnd = V_AND_B32::create(rewriter, loc, resultType,
-                                      movOp.getSrc(), other);
+      auto newAnd =
+          V_AND_B32::create(rewriter, loc, resultType, movOp.getSrc(), other);
       rewriter.replaceOp(andOp, newAnd.getResult());
       return success();
     };
@@ -807,6 +931,8 @@ struct PeepholePass
         // clang-format off
         AddNegToSubPattern,
         AddZeroPattern,
+        BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORD_LDS>,
+        BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORDX4_LDS>,
         FoldMovConstIntoAddPattern,
         FoldMovConstIntoAndPattern,
         FoldMovConstIntoLshlPattern,
@@ -853,8 +979,8 @@ struct PeepholePass
 
       // Check if an op is a VALU (address computation) that's safe to hoist
       auto isHoistableVALU = [](Operation *op) -> bool {
-        return isa<V_LSHLREV_B32, V_ADD_U32, V_MUL_LO_U32, V_AND_B32,
-                   V_OR_B32, V_LSHL_ADD_U32, V_LSHRREV_B32>(op);
+        return isa<V_LSHLREV_B32, V_ADD_U32, V_MUL_LO_U32, V_AND_B32, V_OR_B32,
+                   V_LSHL_ADD_U32, V_LSHRREV_B32>(op);
       };
 
       // Iteratively collect and hoist: after hoisting a batch, new ops
@@ -882,6 +1008,232 @@ struct PeepholePass
         }
       }
     });
+
+    // Loop-carried address promotion: when a V_ADD_U32 inside a loop adds
+    // a loop-invariant VGPR to a rotating SGPR block arg (e.g. triple-
+    // buffer LDS base offsets), pre-compute all N address variants before
+    // the loop and carry them as VGPR loop-carried values that rotate in
+    // lockstep.  This eliminates per-iteration VALU adds for LDS read
+    // addresses, matching the aiter pattern.
+    //
+    // NOTE: Currently disabled -- the GEMM kernel is at the 256 VGPR
+    // limit.  Adding loop-carried VGPRs causes register overflow.
+    // Enable when VGPR pressure is reduced (e.g. by eliminating the
+    // B-data v_mov register rotation).
+    if (false)
+      module.walk([](LoopOp loopOp) {
+        Block &body = loopOp.getBodyBlock();
+        Region *loopRegion = &loopOp.getBodyRegion();
+        auto condOp = cast<ConditionOp>(body.getTerminator());
+        ValueRange condIterArgs = condOp.getIterArgs();
+        auto blockArgs = body.getArguments();
+        unsigned numArgs = blockArgs.size();
+
+        if (numArgs == 0 || condIterArgs.size() != numArgs)
+          return;
+
+        auto dominatesLoop = [&](Value val) -> bool {
+          if (auto *defOp = val.getDefiningOp())
+            return defOp->getParentRegion() != loopRegion;
+          if (auto ba = dyn_cast<BlockArgument>(val))
+            return ba.getOwner()->getParentOp() != loopOp.getOperation();
+          return false;
+        };
+
+        // --- Step 1: detect rotation groups among SGPR block args ----------
+        // A rotation group is a cycle in the permutation defined by
+        // condIterArgs[i] == blockArg[sigma(i)].
+        SmallVector<int> sigma(numArgs, -1);
+        for (unsigned i = 0; i < numArgs; ++i) {
+          for (unsigned j = 0; j < numArgs; ++j) {
+            if (condIterArgs[i] == blockArgs[j]) {
+              sigma[i] = j;
+              break;
+            }
+          }
+        }
+
+        llvm::DenseSet<unsigned> visited;
+        SmallVector<SmallVector<unsigned>> rotationGroups;
+        for (unsigned i = 0; i < numArgs; ++i) {
+          if (visited.count(i) || sigma[i] < 0)
+            continue;
+          if (!isSGPRType(blockArgs[i].getType()))
+            continue;
+          // Follow the cycle.
+          SmallVector<unsigned> group;
+          unsigned cur = i;
+          while (!visited.count(cur)) {
+            visited.insert(cur);
+            group.push_back(cur);
+            cur = sigma[cur];
+          }
+          if (group.size() > 1 && cur == i) // completed a non-trivial cycle
+            rotationGroups.push_back(std::move(group));
+        }
+
+        if (rotationGroups.empty())
+          return;
+
+        // --- Step 2: find promotable V_ADD_U32 ops -------------------------
+        struct Promotable {
+          V_ADD_U32 addOp;
+          Value invariantVGPR;
+          unsigned groupIdx;   // index into rotationGroups
+          unsigned posInGroup; // which position in the group the add uses
+        };
+        SmallVector<Promotable> promotable;
+
+        // Only promote adds whose result is used as an LDS read address.
+        auto isLDSReadOp = [](Operation *op) -> bool {
+          return isa<DS_READ_B128, DS_READ_B64, DS_READ_B32, DS_READ_U8,
+                     DS_READ_I8, DS_READ_U16, DS_READ_I16>(op);
+        };
+        auto feedsLDSRead = [&](Value v) -> bool {
+          for (auto *user : v.getUsers())
+            if (isLDSReadOp(user))
+              return true;
+          return false;
+        };
+
+        for (Operation &op : body) {
+          auto addOp = dyn_cast<V_ADD_U32>(&op);
+          if (!addOp)
+            continue;
+          if (!feedsLDSRead(addOp.getResult()))
+            continue;
+
+          for (int swap = 0; swap < 2; ++swap) {
+            Value maybeVGPR = swap == 0 ? addOp.getSrc0() : addOp.getSrc1();
+            Value maybeSGPR = swap == 0 ? addOp.getSrc1() : addOp.getSrc0();
+
+            if (!dominatesLoop(maybeVGPR))
+              continue;
+            auto ba = dyn_cast<BlockArgument>(maybeSGPR);
+            if (!ba || ba.getOwner() != &body)
+              continue;
+            if (!isSGPRType(ba.getType()))
+              continue;
+
+            unsigned argIdx = ba.getArgNumber();
+            for (unsigned gi = 0; gi < rotationGroups.size(); ++gi) {
+              auto &grp = rotationGroups[gi];
+              for (unsigned pi = 0; pi < grp.size(); ++pi) {
+                if (grp[pi] == argIdx) {
+                  promotable.push_back({addOp, maybeVGPR, gi, pi});
+                  goto nextOp;
+                }
+              }
+            }
+          }
+        nextOp:;
+        }
+
+        if (promotable.empty())
+          return;
+
+        // --- Step 3: pre-compute all variants before the loop --------------
+        OpBuilder builder(loopOp);
+        auto loc = loopOp.getLoc();
+        ValueRange initArgs = loopOp.getInitArgs();
+
+        // For each promotable add, emit N v_add_u32 ops (one per rotation
+        // position), ordered so that position 0 = the one the add currently
+        // uses.
+        struct NewCarried {
+          SmallVector<Value> precomputed; // size == rotation group size
+          unsigned groupIdx;
+          unsigned posInGroup;
+        };
+        SmallVector<NewCarried> newCarrieds;
+
+        for (auto &pa : promotable) {
+          auto &grp = rotationGroups[pa.groupIdx];
+          NewCarried nc;
+          nc.groupIdx = pa.groupIdx;
+          nc.posInGroup = pa.posInGroup;
+          // Rotate group so that pa.posInGroup is first.
+          for (unsigned k = 0; k < grp.size(); ++k) {
+            unsigned rotIdx = (pa.posInGroup + k) % grp.size();
+            Value sInit = initArgs[grp[rotIdx]];
+            auto preAdd =
+                V_ADD_U32::create(builder, loc, pa.addOp.getResult().getType(),
+                                  pa.invariantVGPR, sInit);
+            nc.precomputed.push_back(preAdd.getResult());
+          }
+          newCarrieds.push_back(std::move(nc));
+        }
+
+        // --- Step 4: rebuild the LoopOp with expanded iter args ------------
+        SmallVector<Value> expandedInit(initArgs.begin(), initArgs.end());
+        for (auto &nc : newCarrieds)
+          expandedInit.append(nc.precomputed.begin(), nc.precomputed.end());
+
+        auto newLoop = LoopOp::create(builder, loc, expandedInit);
+        Block &newBody = newLoop.getBodyBlock();
+
+        // Build mapping: old block args → new block args
+        IRMapping mapping;
+        for (unsigned i = 0; i < numArgs; ++i)
+          mapping.map(blockArgs[i], newBody.getArgument(i));
+
+        // Map promoted V_ADD_U32 results → new block args (position 0 = cur)
+        unsigned newArgBase = numArgs;
+        for (unsigned pi = 0; pi < promotable.size(); ++pi) {
+          auto &pa = promotable[pi];
+          mapping.map(pa.addOp.getResult(), newBody.getArgument(newArgBase));
+          newArgBase += rotationGroups[pa.groupIdx].size();
+        }
+
+        // Clone body ops (except ConditionOp) into new body
+        OpBuilder bodyBuilder = OpBuilder::atBlockBegin(&newBody);
+        for (Operation &op : body) {
+          if (isa<ConditionOp>(&op))
+            continue;
+          bool isPromoted = false;
+          for (auto &pa : promotable) {
+            if (&op == pa.addOp.getOperation()) {
+              isPromoted = true;
+              break;
+            }
+          }
+          if (isPromoted)
+            continue;
+          bodyBuilder.clone(op, mapping);
+        }
+
+        // --- Step 5: build new ConditionOp with expanded iter_args ---------
+        // Original condition and iter_args (remapped)
+        Value newCond = mapping.lookup(condOp.getCondition());
+        SmallVector<Value> newCondIterArgs;
+        for (Value v : condIterArgs)
+          newCondIterArgs.push_back(mapping.lookup(v));
+
+        // New VGPR iter_args: follow the same rotation as the SGPR group.
+        // For each newCarried, the iter_args should rotate so that the
+        // "next" pre-computed address becomes "current" next iteration.
+        newArgBase = numArgs;
+        for (unsigned pi = 0; pi < promotable.size(); ++pi) {
+          auto &grp = rotationGroups[promotable[pi].groupIdx];
+          unsigned N = grp.size();
+          // The new block args [newArgBase .. newArgBase+N) are ordered as
+          // [cur, next, nnext, ...].  After one iteration, cur should become
+          // what was next, next becomes nnext, etc.  So yield:
+          // [newBlockArg[base+1], newBlockArg[base+2], ...,
+          // newBlockArg[base+0]]
+          for (unsigned k = 1; k <= N; ++k)
+            newCondIterArgs.push_back(
+                newBody.getArgument(newArgBase + (k % N)));
+          newArgBase += N;
+        }
+
+        ConditionOp::create(bodyBuilder, loc, newCond, newCondIterArgs);
+
+        // --- Step 6: replace old loop results and erase --------------------
+        for (unsigned i = 0; i < numArgs; ++i)
+          loopOp.getResult(i).replaceAllUsesWith(newLoop.getResult(i));
+        loopOp.erase();
+      });
 
     // After LICM and pattern-based optimizations, eliminate redundant M0
     // writes. Track the last M0 source value and skip writes that set M0
