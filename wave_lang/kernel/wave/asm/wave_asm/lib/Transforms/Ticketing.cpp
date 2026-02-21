@@ -298,26 +298,28 @@ private:
   bool handleBarrier(Operation *op, WaitcntState &st) {
     if (!isa<S_BARRIER>(op))
       return false;
+    // start
+    //  bool needVmem = st.ticketing.hasOutstandingVmem();
+    //  bool needLgkm = st.ticketing.hasOutstandingLgkm();
 
-    bool needVmem = st.ticketing.hasOutstandingVmem();
-    bool needLgkm = st.ticketing.hasOutstandingLgkm();
+    // if (needVmem || needLgkm) {
+    //   OpBuilder builder(op->getContext());
+    //   builder.setInsertionPoint(op);
+    //   if (needVmem && needLgkm) {
+    //     S_WAITCNT::create(builder, op->getLoc(),
+    //     builder.getI32IntegerAttr(0),
+    //                       builder.getI32IntegerAttr(0), IntegerAttr());
+    //   } else if (needVmem) {
+    //     S_WAITCNT_VMCNT::create(builder, op->getLoc(), 0);
+    //   } else {
+    //     S_WAITCNT_LGKMCNT::create(builder, op->getLoc(), 0);
+    //   }
+    //   numWaitcntInserted++;
+    // }
 
-    if (needVmem || needLgkm) {
-      OpBuilder builder(op->getContext());
-      builder.setInsertionPoint(op);
-      if (needVmem && needLgkm) {
-        S_WAITCNT::create(builder, op->getLoc(), builder.getI32IntegerAttr(0),
-                          builder.getI32IntegerAttr(0), IntegerAttr());
-      } else if (needVmem) {
-        S_WAITCNT_VMCNT::create(builder, op->getLoc(), 0);
-      } else {
-        S_WAITCNT_LGKMCNT::create(builder, op->getLoc(), 0);
-      }
-      numWaitcntInserted++;
-    }
-
-    st.ticketing.observeVmemWait(0);
-    st.ticketing.observeLgkmWait(0);
+    // st.ticketing.observeVmemWait(0);
+    // st.ticketing.observeLgkmWait(0);
+    // end
     return true;
   }
 
@@ -490,22 +492,36 @@ private:
     llvm::SmallVector<Operation *> allOps;
     collectOpsRecursive(program.getBodyBlock(), allOps);
 
+    // EXPERIMENT: Prologue-only ticketing.
+    //
+    // The kernel loop and epilogue use manually-placed barriers/waitcnts
+    // from the schedule. However the prologue has buffer_load_dword ->
+    // v_bfe_u32 (B-scale unpacking) data dependencies that the schedule
+    // does not cover with per-instruction vmcnt waits. On GFX9/CDNA
+    // (no hardware VMEM scoreboard), these need explicit s_waitcnt.
+    //
+    // Strategy: run full ticketing (insert vmcnt for data deps) up to
+    // the first LoopOp, then switch to observe-only for the rest.
+    bool inPrologue = true;
     for (Operation *op : allOps) {
-      ++st.opIndex;
+      // if (isa<LoopOp>(op))
+      //   inPrologue = false;
 
-      if (observeExistingWaitcnt(op, st))
-        continue;
-      if (handleBarrier(op, st))
-        continue;
-
-      MemOpKind kind = classifyMemOp(op);
-      if (kind != MemOpKind::None) {
-        handleMemoryOp(op, kind, st);
-        continue;
-      }
-
-      handleNonMemoryOp(op, st);
-      handleLoopBoundary(op, st);
+      // if (inPrologue) {
+      //   st.opIndex++;
+      //   if (observeExistingWaitcnt(op, st))
+      //     continue;
+      //   if (handleBarrier(op, st))
+      //     continue;
+      //   MemOpKind kind = classifyMemOp(op);
+      //   if (kind != MemOpKind::None) {
+      //     handleMemoryOp(op, kind, st);
+      //     continue;
+      //   }
+      //   handleNonMemoryOp(op, st);
+      // } else {
+      observeExistingWaitcnt(op, st);
+      //}
     }
 
     combineAdjacentWaitcnts(program);

@@ -109,6 +109,66 @@ def _walk_operations(op):
     yield op
 
 
+def _is_scale_extract(op):
+    """Check if op is an extract_strided_slice from a vector<4xi8> source."""
+    if not hasattr(op, "name") or op.name != "vector.extract_strided_slice":
+        return False
+    source_type = op.operands[0].type
+    if not isinstance(source_type, VectorType):
+        return False
+    return source_type.rank == 1 and source_type.shape[0] == 4
+
+
+def sink_scale_extracts_to_yield(module: Module):
+    """Move extract_strided_slice(vector<4xi8>) ops to just before scf.yield.
+
+    EXPERIMENT: On GFX9/CDNA (no hardware VMEM scoreboard), buffer_load_dword
+    results consumed by v_bfe_u32 (extract_strided_slice lowering) require an
+    explicit s_waitcnt vmcnt. The pipeline places these extracts right after
+    the buffer_load (before any barrier), creating a hazard.
+
+    This pass moves each extract_strided_slice of a vector<4xi8> that feeds
+    a scf.yield to just before the yield op, which is after all barriers.
+    The extract then reads a stable VGPR value (barrier-protected), not a
+    pending VMEM result.
+    """
+    mlir_ctx = module.operation.context
+    with mlir_ctx, Location.unknown():
+        moved = 0
+        for op in list(_walk_operations(module.operation)):
+            if not hasattr(op, "name") or op.name != "scf.for":
+                continue
+
+            for_op = op
+            body_block = for_op.regions[0].blocks[0]
+
+            yield_op = None
+            for child_op in body_block:
+                if child_op.name == "scf.yield":
+                    yield_op = child_op
+                    break
+
+            if yield_op is None:
+                continue
+
+            extracts_to_move = []
+            for child_op in body_block:
+                if child_op == yield_op:
+                    break
+                if _is_scale_extract(child_op):
+                    result = child_op.results[0]
+                    only_feeds_yield = all(use.owner == yield_op for use in result.uses)
+                    if only_feeds_yield:
+                        extracts_to_move.append(child_op)
+
+            for extract_op in extracts_to_move:
+                extract_op.move_before(yield_op)
+                moved += 1
+
+        if moved > 0:
+            logger.debug(f"Sunk {moved} extract_strided_slice ops to before scf.yield")
+
+
 def apply_opsel_scaled_mfma(module: Module):
     """Walk the MLIR module and apply the opsel optimization to scaled_mfma ops.
 

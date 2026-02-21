@@ -204,6 +204,20 @@ class WaveASMCompiler:
             "--waveasm-hazard-mitigation",  # Handle hazards
             "--emit-assembly",  # Emit AMDGCN assembly
         ]
+        # Check for minimal pipeline mode
+        import os
+
+        if os.environ.get("WAVEASM_MINIMAL_PIPELINE"):
+            cmd = [
+                str(self.waveasm_translate),
+                f"--target={self.target}",
+                "--waveasm-linear-scan",
+                "--max-vgprs=512",
+                "--max-agprs=512",
+                "--waveasm-insert-waitcnt",
+                "--waveasm-hazard-mitigation",
+                "--emit-assembly",
+            ]
 
         # Add workgroup size if specified
         if workgroup_size:
