@@ -62,7 +62,11 @@ from ...ops.wave_ops import (
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
 from ...wave.utils.mapping_utils import transform_index_on_mapping
-from ...wave.utils.symbol_utils import safe_subs
+from ...wave.utils.symbol_utils import (
+    decompose_affine_by_uniformity,
+    safe_subs,
+    simplify as bounds_simplify,
+)
 from .emitter import (
     WaveEmitter,
     add_emitter_subs,
@@ -105,68 +109,108 @@ def _simplify(expr):
     return sympy.simplify(expr)
 
 
+_WG_SYMS = {WORKGROUP_0, WORKGROUP_1, WORKGROUP_2}
+
+
 def _split_index(src: IndexExpr | int) -> tuple[IndexExpr, IndexExpr]:
+    """Split index expr into workgroup and thread-dependent parts.
+
+    Thin wrapper around :func:`decompose_affine_by_uniformity` with a
+    single symbol class (workgroup symbols).
     """
-    Split index expr into thread-dependent and thread-independent parts
+    parts = decompose_affine_by_uniformity(src, [_WG_SYMS])
+    return parts[0], parts[1]
+
+
+def _should_pre_linearize(
+    emitter: "WaveEmitter",
+    kb_ir_type,
+    stride_values: list,
+    induction_vars: set,
+    index: dict,
+) -> bool:
+    """Return True when pre-linearizing at the sympy level is beneficial.
+
+    Fires when linearization would cancel Mod/floor atoms.  This covers:
+    - Loop body preshuffle reads (cross-class floordiv with IV + thread)
+    - Prologue preshuffle reads (floordiv from 2D→1D mapping)
+    Simple linear indices (e.g. asymmetric B-data) are left on the
+    standard path because linearization wouldn't reduce their complexity.
     """
-    subs_wg = {WORKGROUP_0: 0, WORKGROUP_1: 0, WORKGROUP_2: 0}
-    # Replace all wg symbols with 0s to get thread-dependent index.
-    # All dynamic values will also be part of thread-index.
-    thread_dependent_index = safe_subs(src, subs_wg)
+    is_global_mem = kb_ir_type.memory_space is None
+    has_int_strides = all(isinstance(s, int) for s in stride_values)
+    if not (is_global_mem and has_int_strides):
+        return False
 
-    # Compute thread-independent index as `orig_index - thread_dependent_index`
-    # All thread symbols and dynamic should cancel-out in the result.
-    thread_independent_index = _simplify(src - thread_dependent_index)
-    if thread_independent_index.free_symbols - set(subs_wg.keys()):
-        # If we have any symbols besides wg symbols, means some thread or
-        # dynamic symbols were not canceled out, use the entire index as
-        # thread dependent index.
-        thread_independent_index = sympy.sympify(0)
-        thread_dependent_index = src
+    orig_atoms = set()
+    for expr in index.values():
+        start = expr.start if isinstance(expr, IndexSequence) else expr
+        if isinstance(start, sympy.Basic):
+            orig_atoms |= start.atoms(sympy.Mod) | start.atoms(sympy.floor)
+    if not orig_atoms:
+        return False
 
-    return thread_independent_index, thread_dependent_index
+    linear = _pre_linearize_index(index, stride_values)
+    linear_expr = list(linear.values())[0].start
+    new_atoms = set()
+    if isinstance(linear_expr, sympy.Basic):
+        new_atoms = linear_expr.atoms(sympy.Mod) | linear_expr.atoms(sympy.floor)
+
+    return len(new_atoms) < len(orig_atoms)
 
 
-def _split_index_three_way(
-    src: IndexExpr | int, uniform_syms: set
-) -> tuple[IndexExpr, IndexExpr, IndexExpr]:
+def _cancel_mod_floor(expr: sympy.Expr) -> sympy.Expr:
+    """Cancel complementary Mod/floor pairs in an additive expression.
+
+    Uses the identity ``Mod(x, m) = x - m * floor(x / m)`` to replace
+    all Mod nodes, then lets sympy cancel the resulting terms.  This
+    handles the pattern ``a * Mod(x, m) + a * m * floor(x / m) = a * x``
+    that arises when linearizing preshuffle 2D addresses.
     """
-    Split index expr into workgroup, uniform (e.g. loop induction), and
-    thread-dependent parts.  Keeping the uniform part separate from the
-    thread part allows the backend to place the uniform contribution in
-    the buffer-load soffset field instead of a VALU add.
+    mods = list(expr.atoms(sympy.Mod))
+    if not mods:
+        return expr
+    subs = {}
+    for mod in mods:
+        x, m = mod.args
+        subs[mod] = x - m * sympy.floor(x / m)
+    result = expr.xreplace(subs)
+    return sympy.expand(result)
+
+
+def _pre_linearize_index(
+    index: dict[IndexExpr, "IndexSequence | IndexExpr"],
+    stride_values: list[int],
+) -> dict[str, IndexSequence]:
+    """Linearize N-d index into a single 1D IndexSequence.
+
+    Produces ``row * stride_row + col * stride_col + ...`` at the sympy
+    level so that cross-class floordiv terms cancel before decomposition.
     """
-    if isinstance(src, int):
-        return sympy.sympify(0), sympy.sympify(0), sympy.sympify(src)
-
-    subs_wg = {WORKGROUP_0: 0, WORKGROUP_1: 0, WORKGROUP_2: 0}
-    subs_all_uniform = {**subs_wg, **{s: 0 for s in uniform_syms}}
-
-    # Thread-only: zero out all uniform symbols (WG + induction vars).
-    thread_index = safe_subs(src, subs_all_uniform)
-
-    # No-WG: zero out only WG symbols (keeps induction vars + thread).
-    no_wg = safe_subs(src, subs_wg)
-
-    # Uniform part = no_wg - thread_only (induction-var-dependent terms).
-    uniform_index = _simplify(no_wg - thread_index)
-
-    # WG part = src - no_wg.
-    wg_index = _simplify(src - no_wg)
-
-    # Validate WG part contains only WG symbols.
-    if wg_index.free_symbols - set(subs_wg.keys()):
-        wg_index = sympy.sympify(0)
-        no_wg = src
-        uniform_index = _simplify(no_wg - thread_index)
-
-    # Validate uniform part has no thread-dependent symbols.
-    thread_syms = {THREAD_0, THREAD_1, THREAD_2}
-    if uniform_index.free_symbols & thread_syms:
-        thread_index = no_wg
-        uniform_index = sympy.sympify(0)
-
-    return wg_index, uniform_index, thread_index
+    linear_expr = None
+    for expr, stride in zip(index.values(), stride_values):
+        start = expr.start if isinstance(expr, IndexSequence) else expr
+        term = start * stride
+        linear_expr = term if linear_expr is None else linear_expr + term
+    for _ in range(3):
+        prev = linear_expr
+        linear_expr = _cancel_mod_floor(linear_expr)
+        linear_expr = bounds_simplify(linear_expr)
+        if linear_expr == prev:
+            break
+    thread_bounds = {THREAD_0: 64, THREAD_1: 4, THREAD_2: 1}
+    for sym, bound in thread_bounds.items():
+        if sym not in linear_expr.free_symbols:
+            continue
+        for fl in list(linear_expr.atoms(sympy.floor)):
+            inner = fl.args[0]
+            if sym not in inner.free_symbols:
+                continue
+            test = inner.subs(sym, bound - 1)
+            if test.is_number and test < 1 and test >= 0:
+                linear_expr = linear_expr.subs(fl, 0)
+    linear_expr = sympy.expand(linear_expr)
+    return {"linearized": IndexSequence(linear_expr, 1)}
 
 
 def _extract0(src):
@@ -193,26 +237,80 @@ def _build_start_indices(
     emitter: WaveEmitter,
     src_indices: dict[IndexExpr, IndexSequence | IndexExpr],
     dynamic_values: dict[IndexExpr, Any] = {},
-    uniform_syms: set | None = None,
-) -> (
-    tuple[list[OpResult], list[OpResult], list[OpResult]]
-    | tuple[list[OpResult], list[OpResult], list[OpResult], list[OpResult]]
-):
+    uniform_sym_classes: list[set] | None = None,
+) -> tuple:
+    """Build MLIR index values with N-way uniformity decomposition.
+
+    When *uniform_sym_classes* is ``None`` (default), performs the legacy
+    two-way split (workgroup / thread) and returns a 3-tuple::
+
+        (full_indices, wg_indices, thread_indices)
+
+    When *uniform_sym_classes* is a list of symbol sets (ordered
+    most-uniform first, e.g. ``[induction_var_syms]``), prepends the
+    workgroup class automatically and returns an ``(n + 2)``-tuple::
+
+        (full_indices, wg_indices, class_0_indices, ..., thread_indices)
+    """
     start_indices = _get_start_indices(src_indices)
     subs = add_emitter_subs(emitter, dynamic_values)
     indices = [gen_sympy_index(subs, i) for i in start_indices]
 
-    if uniform_syms:
-        split_indices = [_split_index_three_way(i, uniform_syms) for i in start_indices]
-        indices_wg = [gen_sympy_index(subs, i[0]) for i in split_indices]
-        indices_unif = [gen_sympy_index(subs, i[1]) for i in split_indices]
-        indices_th = [gen_sympy_index(subs, i[2]) for i in split_indices]
-        return indices, indices_wg, indices_unif, indices_th
+    classes = [_WG_SYMS] + (uniform_sym_classes or [])
+    decomposed = [decompose_affine_by_uniformity(i, classes) for i in start_indices]
 
-    split_indices = [_split_index(i) for i in start_indices]
-    indices_wg = [gen_sympy_index(subs, i[0]) for i in split_indices]
-    indices_th = [gen_sympy_index(subs, i[1]) for i in split_indices]
-    return indices, indices_wg, indices_th
+    n_parts = len(classes) + 1  # one per class + remainder
+    parts: list[list[OpResult]] = []
+    for k in range(n_parts):
+        parts.append([gen_sympy_index(subs, d[k]) for d in decomposed])
+
+    if not uniform_sym_classes:
+        return indices, parts[0], parts[1]
+
+    return (indices,) + tuple(parts)
+
+
+def _compute_linear_offset(
+    indices: list[Value | int],
+    strides: list[Value],
+) -> Value | None:
+    """Linearize per-dimension index values with strides into a scalar offset.
+
+    Returns *None* when ``indices`` is empty.
+    """
+    overflow_flags = arith_d.IntegerOverflowFlags.nsw
+    offset = None
+    for idx, stride in zip(indices, strides):
+        if isinstance(idx, int):
+            idx = arith_d.constant(IndexType.get(), idx)
+        off = arith_d.muli(idx, stride, overflow_flags=overflow_flags)
+        if offset is None:
+            offset = off
+        else:
+            offset = arith_d.addi(offset, off, overflow_flags=overflow_flags)
+    return offset
+
+
+def _apply_uniform_offsets(
+    offset_th: Value,
+    uniform_parts: list[list[Value]],
+    strides: list[Value],
+) -> Value:
+    """Add uniform (SGPR-eligible) contributions to the thread offset.
+
+    Each entry in *uniform_parts* is a list of per-dimension index values
+    for one uniformity class.  They are linearized with *strides* and
+    added to *offset_th* as separate ``arith.addi`` ops so the backend
+    can keep them in SGPRs (e.g. fold into ``buffer_load`` soffset).
+    """
+    overflow_flags = arith_d.IntegerOverflowFlags.nsw
+    for unif_indices in uniform_parts:
+        unif_offset = _compute_linear_offset(unif_indices, strides)
+        if unif_offset is not None and _get_constant_value(unif_offset) != 0:
+            offset_th = arith_d.addi(
+                offset_th, unif_offset, overflow_flags=overflow_flags
+            )
+    return offset_th
 
 
 def _get_symbolic_shape(node: fx.Node) -> tuple[IndexExpr]:
@@ -522,6 +620,8 @@ def _create_vec_read_write(
     memory: CustomOp,
     mask: Optional[Value],
     node_index: Optional[IndexSequence] = None,
+    uniform_parts: list[list[Value]] | None = None,
+    pre_linearized: bool = False,
 ) -> Optional[Value]:
     is_read = value is None
     uint32 = IntegerType.get_signless(32)
@@ -546,7 +646,7 @@ def _create_vec_read_write(
     has_int_strides = all(isinstance(s, int) for s in stride_values)
     strides = [gen_sympy_index(add_emitter_subs(emitter), s) for s in stride_values]
 
-    no_masked_load_store_ops = buffer_ops_enabled
+    no_masked_load_store_ops = buffer_ops_enabled or pre_linearized
 
     mask_splat = _get_splat_input(mask)
     splatted_mask = mask_splat is not None
@@ -555,16 +655,29 @@ def _create_vec_read_write(
         vector_type = value.type
 
     element_type = vector_type.element_type
+
+    unit_strides = [gen_sympy_index(add_emitter_subs(emitter), 1)]
+
     # Case 1: Generate load/stores with no mask and no offset
     if mask is None:
         offset_th = None
-        if buffer_ops_enabled:
-            # TODO: If strides cannot be converted into integers, means they are dynamic
-            # and linearize breaks, need to investigate later.
-            mem, offset_th = _linearize_memref(
-                mem, start_indices_wg, start_indices_th, strides
+        if pre_linearized or buffer_ops_enabled:
+            if pre_linearized:
+                mem, offset_th = _linearize_memref(
+                    mem, start_indices_wg, start_indices_th, unit_strides
+                )
+            else:
+                mem, offset_th = _linearize_memref(
+                    mem, start_indices_wg, start_indices_th, strides
+                )
+            encode_strides = unit_strides if pre_linearized else strides
+            mem = _cast_buffer_and_encode_stride(
+                mem, encode_strides, element_type, emitter
             )
-            mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+            if uniform_parts:
+                offset_th = _apply_uniform_offsets(
+                    offset_th, uniform_parts, encode_strides
+                )
         if linearize_shared_mem:
             mem = _linearize_shared_mem(mem)
             linearized_index = {
@@ -572,7 +685,9 @@ def _create_vec_read_write(
             }
             start_indices, _, _ = _build_start_indices(emitter, linearized_index)
 
-        indices = [offset_th] if buffer_ops_enabled else start_indices
+        indices = (
+            [offset_th] if (buffer_ops_enabled or pre_linearized) else start_indices
+        )
         if is_read:
             return vector_d.load(vector_type, mem, indices)
         else:
@@ -596,13 +711,21 @@ def _create_vec_read_write(
         offsets_vec_type, DenseElementsAttr.get(vals, offsets_vec_type)
     )
 
-    if buffer_ops_enabled:
-        mem, offset_th = _linearize_memref(
-            mem, start_indices_wg, start_indices_th, strides
-        )
-        mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+    if pre_linearized or buffer_ops_enabled:
+        if pre_linearized:
+            mem, offset_th = _linearize_memref(
+                mem, start_indices_wg, start_indices_th, unit_strides
+            )
+        else:
+            mem, offset_th = _linearize_memref(
+                mem, start_indices_wg, start_indices_th, strides
+            )
+        encode_strides = unit_strides if pre_linearized else strides
+        mem = _cast_buffer_and_encode_stride(mem, encode_strides, element_type, emitter)
+        if uniform_parts:
+            offset_th = _apply_uniform_offsets(offset_th, uniform_parts, encode_strides)
 
-    indices = [offset_th] if buffer_ops_enabled else start_indices
+    indices = [offset_th] if (buffer_ops_enabled or pre_linearized) else start_indices
 
     if no_masked_load_store_ops:
         # find the index at which memory out of bounds of buffer
@@ -764,9 +887,48 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     else:
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    start_indices, start_indices_wg, start_indices_th = _build_start_indices(
-        emitter, index, dynamic_vals_map_start
+    induction_vars = set(emitter.get_induction_vars_and_syms()[1])
+    uniform_parts: list[list[Value]] = []
+
+    stride_values = strides_from_symbolic_shape(
+        IndexingContext.current(), input_shape, allow_mixed_shapes=True
     )
+    pre_linearized = _should_pre_linearize(
+        emitter, kb_ir_type, stride_values, induction_vars, index
+    )
+    if pre_linearized:
+        linearized_index = _pre_linearize_index(index, stride_values)
+        start_indices, start_indices_wg, *uniform_parts, start_indices_th = (
+            _build_start_indices(
+                emitter,
+                linearized_index,
+                dynamic_vals_map_start,
+                uniform_sym_classes=[induction_vars],
+            )
+        )
+        overflow_flags = arith_d.IntegerOverflowFlags.nsw
+        for wg_idx in start_indices_wg:
+            if _get_constant_value(wg_idx) != 0:
+                start_indices_th = [
+                    arith_d.addi(
+                        start_indices_th[0], wg_idx, overflow_flags=overflow_flags
+                    )
+                ]
+        subs = add_emitter_subs(emitter, dynamic_vals_map_start)
+        start_indices_wg = [gen_sympy_index(subs, sympy.Integer(0))]
+    elif induction_vars:
+        start_indices, start_indices_wg, *uniform_parts, start_indices_th = (
+            _build_start_indices(
+                emitter,
+                index,
+                dynamic_vals_map_start,
+                uniform_sym_classes=[induction_vars],
+            )
+        )
+    else:
+        start_indices, start_indices_wg, start_indices_th = _build_start_indices(
+            emitter, index, dynamic_vals_map_start
+        )
 
     use_llvm_load = flags != MemoryAccessFlags.NONE
     if use_llvm_load:
@@ -791,6 +953,8 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             get_custom(memory),
             mask,
             node_index=index,
+            uniform_parts=uniform_parts or None,
+            pre_linearized=pre_linearized,
         )
 
     emitter.bind_node_proxy(node, IRProxyValue(result))
@@ -855,9 +1019,49 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
     else:
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    start_indices, start_indices_wg, start_indices_th = _build_start_indices(
-        emitter, index, dynamic_vals_map_start
+    induction_vars = set(emitter.get_induction_vars_and_syms()[1])
+    uniform_parts: list[list[Value]] = []
+
+    stride_values = strides_from_symbolic_shape(
+        IndexingContext.current(), output_shape, allow_mixed_shapes=True
     )
+    pre_linearized = _should_pre_linearize(
+        emitter, kb_ir_type, stride_values, induction_vars, index
+    )
+
+    if pre_linearized:
+        linearized_index = _pre_linearize_index(index, stride_values)
+        start_indices, start_indices_wg, *uniform_parts, start_indices_th = (
+            _build_start_indices(
+                emitter,
+                linearized_index,
+                dynamic_vals_map_start,
+                uniform_sym_classes=[induction_vars],
+            )
+        )
+        overflow_flags = arith_d.IntegerOverflowFlags.nsw
+        for wg_idx in start_indices_wg:
+            if _get_constant_value(wg_idx) != 0:
+                start_indices_th = [
+                    arith_d.addi(
+                        start_indices_th[0], wg_idx, overflow_flags=overflow_flags
+                    )
+                ]
+        subs = add_emitter_subs(emitter, dynamic_vals_map_start)
+        start_indices_wg = [gen_sympy_index(subs, sympy.Integer(0))]
+    elif induction_vars:
+        start_indices, start_indices_wg, *uniform_parts, start_indices_th = (
+            _build_start_indices(
+                emitter,
+                index,
+                dynamic_vals_map_start,
+                uniform_sym_classes=[induction_vars],
+            )
+        )
+    else:
+        start_indices, start_indices_wg, start_indices_th = _build_start_indices(
+            emitter, index, dynamic_vals_map_start
+        )
 
     use_llvm_store = flags != MemoryAccessFlags.NONE
     if use_llvm_store:
@@ -878,6 +1082,8 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
             get_custom(memory),
             mask,
             node_index=index,
+            uniform_parts=uniform_parts or None,
+            pre_linearized=pre_linearized,
         )
 
 
@@ -1125,16 +1331,13 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
 
     induction_vars = set(emitter.get_induction_vars_and_syms()[1])
 
-    # Three-way split: separate induction-variable (uniform) offsets from
-    # per-lane thread offsets so the backend can place the uniform part in
-    # the buffer-load soffset field instead of emitting a VALU add.
-    src_index_iv = None
+    uniform_parts: list[list[Value]] = []
     if induction_vars:
-        src_index, src_index_wg, src_index_iv, src_index_th = _build_start_indices(
+        src_index, src_index_wg, *uniform_parts, src_index_th = _build_start_indices(
             emitter,
             new_src_idx,
             src_dynamic_vals_map_start,
-            uniform_syms=induction_vars,
+            uniform_sym_classes=[induction_vars],
         )
     else:
         src_index, src_index_wg, src_index_th = _build_start_indices(
@@ -1170,24 +1373,8 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     src, offset_th = _linearize_memref(src, src_index_wg, src_index_th, strides)
     src = _cast_buffer_and_encode_stride(src, strides, element_type, emitter)
 
-    # Add uniform (induction-variable) contribution as a separate SGPR offset.
-    # Keeping it as a distinct arith.addi (VGPR + SGPR) lets the AMDGPU
-    # backend's SIFoldOperands fold the SGPR into the buffer_load soffset.
-    if src_index_iv is not None:
-        overflow_flags = arith_d.IntegerOverflowFlags.nsw
-        offset_iv = None
-        for iv_idx, stride in zip(src_index_iv, strides):
-            if isinstance(iv_idx, int):
-                iv_idx = arith_d.constant(IndexType.get(), iv_idx)
-            off = arith_d.muli(iv_idx, stride, overflow_flags=overflow_flags)
-            if offset_iv is None:
-                offset_iv = off
-            else:
-                offset_iv = arith_d.addi(offset_iv, off, overflow_flags=overflow_flags)
-        if offset_iv is not None and _get_constant_value(offset_iv) != 0:
-            offset_th = arith_d.addi(
-                offset_th, offset_iv, overflow_flags=overflow_flags
-            )
+    if uniform_parts:
+        offset_th = _apply_uniform_offsets(offset_th, uniform_parts, strides)
 
     # We previously checked mask is same for all elements, so we can use
     # elements_per_thread=1 to build the mask.
