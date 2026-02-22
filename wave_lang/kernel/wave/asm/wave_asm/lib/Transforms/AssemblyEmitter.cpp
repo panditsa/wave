@@ -308,8 +308,7 @@ KernelGenerator::emitScaledMFMA(Operation *scaledOp, llvm::StringRef mnemonic) {
     cbsz = cbszAttr.getInt();
   if (auto blgpAttr = scaledOp->getAttrOfType<IntegerAttr>("blgp"))
     blgp = blgpAttr.getInt();
-  line += " op_sel_hi:[0,0,0] cbsz:" + std::to_string(cbsz) +
-          " blgp:" + std::to_string(blgp);
+  line += " cbsz:" + std::to_string(cbsz) + " blgp:" + std::to_string(blgp);
   return line;
 }
 
