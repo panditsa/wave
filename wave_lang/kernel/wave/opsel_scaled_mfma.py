@@ -26,7 +26,10 @@ The extract_strided_slice, per-element bitcast and vector.extract are
 dead-code eliminated by a subsequent canonicalization pass.
 """
 
+import array as _array_mod
+
 from iree.compiler.ir import (
+    DenseElementsAttr,
     Float8E8M0FNUType,
     InsertionPoint,
     IntegerAttr,
@@ -37,6 +40,7 @@ from iree.compiler.ir import (
 )
 from iree.compiler.dialects import (
     amdgpu as amdgpu_d,
+    arith as arith_d,
     vector as vector_d,
 )
 
@@ -45,7 +49,7 @@ from wave_lang.support.logging import get_logger
 logger = get_logger("wave.opsel_scaled_mfma")
 
 
-def _trace_scale_chain(scale_value):
+def _trace_scale_chain(scale_value, iter_arg_entries=None):
     """Trace a scaled_mfma scale operand back through the extract+bitcast chain.
 
     Returns (source_vector_4xi8, byte_offset) if the pattern matches,
@@ -58,6 +62,12 @@ def _trace_scale_chain(scale_value):
         <- vector.extract_strided_slice {offsets=[N], sizes=[1], strides=[1]}
                                : vector<4xi8> -> vector<1xi8>
         <- source             : vector<4xi8>  (typically a vector.load)
+
+    When the normal path fails (e.g. the bitcast source is a block argument
+    or scf.for result rather than an extract_strided_slice), the function
+    falls back to *iter_arg_entries* -- a precomputed list produced by
+    ``_build_iter_arg_scale_map`` that maps each vector<1xi8> block-arg /
+    for-result to a reconstructed vector<4xi8> and its byte offset.
     """
     extract_op = scale_value.owner
     if not hasattr(extract_op, "name") or extract_op.name != "vector.extract":
@@ -82,22 +92,30 @@ def _trace_scale_chain(scale_value):
         return None
 
     slice_op = bitcast_source.owner
-    if not hasattr(slice_op, "name") or slice_op.name != "vector.extract_strided_slice":
-        return None
 
-    offsets = slice_op.attributes["offsets"]
-    offset = IntegerAttr(offsets[0]).value
+    # Normal path: extract_strided_slice from vector<4xi8>.
+    if hasattr(slice_op, "name") and slice_op.name == "vector.extract_strided_slice":
+        offsets = slice_op.attributes["offsets"]
+        offset = IntegerAttr(offsets[0]).value
 
-    slice_source = slice_op.operands[0]
-    slice_source_type = slice_source.type
-    if not isinstance(slice_source_type, VectorType):
-        return None
-    # Only apply opsel optimization to vector<4xi8> sources.
-    # The amdgpu.scaled_mfma operation requires vector<4xf8E8M0FNU> scale operands.
-    if slice_source_type.rank != 1 or slice_source_type.shape[0] != 4:
-        return None
+        slice_source = slice_op.operands[0]
+        slice_source_type = slice_source.type
+        if not isinstance(slice_source_type, VectorType):
+            return None
+        if slice_source_type.rank != 1 or slice_source_type.shape[0] != 4:
+            return None
 
-    return (slice_source, offset)
+        return (slice_source, offset)
+
+    # Extended path: bitcast_source is a block-arg or scf.for result whose
+    # init value traces back to extract_strided_slice(vector<4xi8>).
+    # Look it up in the precomputed map.
+    if iter_arg_entries:
+        for entry_val, reconstructed_vec4, byte_offset in iter_arg_entries:
+            if entry_val == bitcast_source:
+                return (reconstructed_vec4, byte_offset)
+
+    return None
 
 
 def _walk_operations(op):
@@ -169,6 +187,108 @@ def sink_scale_extracts_to_yield(module: Module):
             logger.debug(f"Sunk {moved} extract_strided_slice ops to before scf.yield")
 
 
+def _build_iter_arg_scale_map(module):
+    """Identify groups of scf.for iter_args that carry individual bytes from
+    the same vector<4xi8> B-scale load (via extract_strided_slice in the
+    prologue).  For each complete group (offsets 0-3), insert
+    vector.insert_strided_slice ops to reconstruct the vector<4xi8>:
+      - inside the loop body  (from block args)
+      - after the scf.for     (from for-op results, for epilogue MFMAs)
+
+    Returns a list of (original_value, reconstructed_vec4, byte_offset)
+    entries.  ``original_value`` is the vector<1xi8> block-arg or
+    for-result so that _trace_scale_chain can match it.
+    """
+    i8 = IntegerType.get_signless(8)
+    vec4_i8 = VectorType.get([4], i8)
+
+    entries = []
+
+    for op in list(_walk_operations(module.operation)):
+        if not hasattr(op, "name") or op.name != "scf.for":
+            continue
+
+        for_op = op
+        body_block = for_op.regions[0].blocks[0]
+
+        # --- group iter-args by their prologue source vector<4xi8> ---
+        source_groups: dict[int, dict] = {}
+        n_iter_args = len(body_block.arguments) - 1
+        for i in range(n_iter_args):
+            block_arg = body_block.arguments[i + 1]
+
+            if not isinstance(block_arg.type, VectorType):
+                continue
+            if block_arg.type.rank != 1 or block_arg.type.shape[0] != 1:
+                continue
+
+            init_val = for_op.operands[i + 3]
+            init_owner = init_val.owner
+            if not hasattr(init_owner, "name"):
+                continue
+            if init_owner.name != "vector.extract_strided_slice":
+                continue
+
+            source = init_owner.operands[0]
+            source_type = source.type
+            if not isinstance(source_type, VectorType):
+                continue
+            if source_type.rank != 1 or source_type.shape[0] != 4:
+                continue
+
+            offset = IntegerAttr(init_owner.attributes["offsets"][0]).value
+            key = source.owner
+            source_groups.setdefault(key, {})[offset] = {
+                "block_arg": block_arg,
+                "for_result": for_op.results[i],
+            }
+
+        # --- for each complete {0,1,2,3} group, reconstruct vec4 ---
+        for offset_map in source_groups.values():
+            if len(offset_map) != 4 or set(offset_map.keys()) != {0, 1, 2, 3}:
+                continue
+
+            def _make_zero():
+                return arith_d.constant(
+                    vec4_i8,
+                    value=DenseElementsAttr.get(
+                        _array_mod.array("b", [0, 0, 0, 0]), type=vec4_i8
+                    ),
+                )
+
+            # -- reconstruct inside the loop body --
+            first_op = next(iter(body_block))
+            with InsertionPoint(first_op):
+                cur = _make_zero()
+                for off in range(4):
+                    ba = offset_map[off]["block_arg"]
+                    cur = vector_d.insert_strided_slice(
+                        ba, cur, offsets=[off], strides=[1]
+                    )
+            loop_vec4 = cur
+            for off in range(4):
+                entries.append((offset_map[off]["block_arg"], loop_vec4, off))
+
+            # -- reconstruct after the for-op (epilogue) --
+            with InsertionPoint.after(for_op):
+                epi_cur = _make_zero()
+                for off in range(4):
+                    res = offset_map[off]["for_result"]
+                    epi_cur = vector_d.insert_strided_slice(
+                        res, epi_cur, offsets=[off], strides=[1]
+                    )
+            epi_vec4 = epi_cur
+            for off in range(4):
+                entries.append((offset_map[off]["for_result"], epi_vec4, off))
+
+    if entries:
+        logger.debug(
+            f"Reconstructed {len(entries) // 4} scale vector groups "
+            f"({len(entries)} iter-arg entries)"
+        )
+    return entries
+
+
 def apply_opsel_scaled_mfma(module: Module):
     """Walk the MLIR module and apply the opsel optimization to scaled_mfma ops.
 
@@ -182,6 +302,10 @@ def apply_opsel_scaled_mfma(module: Module):
 
     with mlir_ctx, Location.unknown():
         f8e8m0 = Float8E8M0FNUType.get()
+
+        # Pre-compute reconstructed scale vectors for iter-arg groups so
+        # that _trace_scale_chain can handle block-arg / for-result scales.
+        iter_arg_entries = _build_iter_arg_scale_map(module)
 
         scaled_mfma_ops = []
         for op in _walk_operations(module.operation):
@@ -204,11 +328,11 @@ def apply_opsel_scaled_mfma(module: Module):
             new_scale_b = None
             new_idx_b = idx_b
 
-            chain_a = _trace_scale_chain(mfma_op.scalesA)
+            chain_a = _trace_scale_chain(mfma_op.scalesA, iter_arg_entries)
             if chain_a is not None:
                 new_scale_a, new_idx_a = chain_a
 
-            chain_b = _trace_scale_chain(mfma_op.scalesB)
+            chain_b = _trace_scale_chain(mfma_op.scalesB, iter_arg_entries)
             if chain_b is not None:
                 new_scale_b, new_idx_b = chain_b
 
