@@ -18,10 +18,12 @@ from ..._support.indexing import IndexSequence, IndexSymbol
 from ..._support.tracing import CapturedTrace
 from ...lang.global_symbols import *
 from ...ops.wave_ops import (
+    BitcastOp,
     CustomOp,
     ExtractSlice,
     Read,
     Reshape,
+    ScaledMMA,
     SelfIndex,
     Write,
     get_custom,
@@ -623,9 +625,33 @@ def partition_gather_like_ops(
 
         return False
 
+    def _feeds_scaled_mma_scale(node: fx.Node) -> bool:
+        """Check if a Read feeds a ScaledMMA scale operand (through BitcastOp).
+
+        Scale reads should keep their vector width (ept=4) so they flow as
+        vector<4xf8E8M0FNU> to amdgpu.scaled_mfma with opsel, matching the
+        AITER buffer_load_dword pattern.
+        """
+        for user in node.users:
+            user_custom = get_custom(user)
+            if isinstance(user_custom, BitcastOp):
+                for bitcast_user in user.users:
+                    bc_user = get_custom(bitcast_user)
+                    if isinstance(bc_user, ScaledMMA):
+                        if bc_user.lhs_scale == user or bc_user.rhs_scale == user:
+                            return True
+            elif isinstance(user_custom, ScaledMMA):
+                if user_custom.lhs_scale == node or user_custom.rhs_scale == node:
+                    return True
+        return False
+
     strided_operators = trace.walk(has_gather_mapping)
     for operator in strided_operators:
         custom = get_custom(operator)
+
+        if isinstance(custom, Read) and _feeds_scaled_mma_scale(operator):
+            continue
+
         index = custom.index
         fastest_index = get_fastest_index(index)
         elements_per_thread = subs_idxc(custom.elements_per_thread)
