@@ -485,6 +485,19 @@ def emit_wmma_scaled(
     return result
 
 
+def _cast_mfma_scale(emitter: WaveEmitter, value):
+    """Cast a scale operand for CDNA scaled MFMA.
+
+    Accepts vector<4xf8E8M0FNU> (opsel DWORD, preferred) or falls back to
+    extracting a scalar for vector<1> or already-scalar values.
+    """
+    proxy_value = cast_py_value(emitter, value)
+    ir_val = proxy_value.ir_value
+    if isinstance(ir_val.type, VectorType) and ir_val.type.shape[0] == 4:
+        return ir_val
+    return cast_scalar(emitter, value)
+
+
 @handle_op(scaled_mma)
 def handle_scaled_mma(emitter: WaveEmitter, node: fx.Node):
     try:
@@ -515,7 +528,7 @@ def handle_scaled_mma(emitter: WaveEmitter, node: fx.Node):
         scales = [cast_vector(emitter, val) for val in [lhs_scale, rhs_scale]]
         result = emit_wmma_scaled(m, n, k, acc, values, scales)
     else:
-        scales = [cast_scalar(emitter, val) for val in [lhs_scale, rhs_scale]]
+        scales = [_cast_mfma_scale(emitter, val) for val in [lhs_scale, rhs_scale]]
         result = emit_mfma_scaled(m, n, k, acc, values, scales)
 
     emitter.bind_node_proxy(node, IRProxyValue(result))
