@@ -873,6 +873,283 @@ def get_mxfp4_dbuf_mixed_pingpong_schedule(use_stagger: bool = True):
     return mxfp4_dbuf_schedule
 
 
+def get_mxfp4_asymmetric_128x256_schedule():
+    """Return an asymmetric-prefetch MXFP4 schedule for 128x256 GEMM.
+
+    Asymmetric data paths (same as 256x256):
+      - A (data + scale): global -> LDS -> VGPRs, prefetch depth 2
+        (triple-buffered in LDS).
+      - B (data + scale): global -> VGPRs directly (no LDS).
+
+    3-stage pipeline:
+      Stage 0: Async global-to-LDS prefetch for A and A_scale.
+      Stage 1: Global-to-VGPR loads for B and B_scale;
+               LDS-to-VGPR loads for first M-partition of A.
+      Stage 2: LDS-to-VGPR loads for second M-partition of A;
+               bitcasts; scaled MMA accumulation.
+
+    Compared to the 256x256 schedule:
+      - Half the M-tiles per wave (1 per M-partition instead of 2),
+        yielding 32 MFMAs per M-partition instead of 64.
+      - B loads are split by N dimension (4+4) across the two
+        M-partition halves to avoid saturating interleave slots.
+      - A1 LDS reads use interval=2 (vs 4) for denser interleaving.
+      - Unroll factor is 4 (vs 2) to maintain 256 MFMAs per outer loop.
+
+    Reference: aiter f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256.s
+    """
+    M = tkl.sym.M
+    N = tkl.sym.N
+
+    @wave_schedule.wave_schedule()
+    def mxfp4_dbuf_schedule():
+        # =====================================================================
+        # Get tagged nodes from the kernel
+        # =====================================================================
+        k_loop = tkw.get_node_by_tag("k_loop")
+
+        # Matrix A data - GatherToLDS (global->shared) + Read (shared load)
+        all_read_a = tkw.get_node_by_tag("read_a")
+        g2s_a = tkw.filter_nodes(all_read_a, node_type=tkw.GatherToLDS)
+        s2v_a = tkw.filter_nodes(all_read_a, node_type=tkw.Read)
+
+        # Matrix A scale
+        all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
+        g2s_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.GatherToLDS)
+        s2v_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
+
+        # partition s2v_a by M
+        s2v_a_0, s2v_a_1 = tkw.partition_by_dim(s2v_a, dim=M, num_partitions=2)
+        s2v_a_scale_0, s2v_a_scale_1 = tkw.partition_by_dim(
+            s2v_a_scale, dim=M, num_partitions=2
+        )
+
+        # Matrix B data and B scale - Global to Vector
+        g2v_b = tkw.get_node_by_tag("read_b")
+        g2v_b_scale = tkw.get_node_by_tag("read_b_scale")
+
+        # Bitcast operations (needed alongside compute)
+        bitcast_a = tkw.get_node_by_tag("bitcast_a")
+        bitcast_a_scale = tkw.get_node_by_tag("bitcast_a_scale")
+        bitcast_b = tkw.get_node_by_tag("bitcast_b")
+        bitcast_b_scale = tkw.get_node_by_tag("bitcast_b_scale")
+
+        # Scaled MMA
+        scaled_mma = tkw.get_node_by_tag("scaled_mma")
+
+        # =====================================================================
+        # Create 3-stage pipeline (triple buffering for A in LDS)
+        # =====================================================================
+        pipeline_loop = tkw.pipeline(k_loop)
+
+        with pipeline_loop as pl:
+            pl.set_stage(
+                [
+                    (
+                        g2s_a,
+                        g2s_a_scale,
+                    ),
+                    (),
+                    (),
+                ],
+            )
+            pl.set_stage(
+                [
+                    (
+                        g2v_b,
+                        g2v_b_scale,
+                    ),
+                    (
+                        s2v_a_0,
+                        s2v_a_scale_0,
+                    ),
+                    (),
+                ],
+            )
+            pl.set_stage(
+                [
+                    (
+                        s2v_a_1,
+                        s2v_a_scale_1,
+                    ),
+                    (bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale),
+                    (scaled_mma,),
+                ],
+            )
+
+        num_m_partitions = 2
+        num_pf_iters = 2
+
+        # =====================================================================
+        # Prologue
+        # =====================================================================
+        prologue_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2s_a_scale = tkw.filter_nodes(
+            g2s_a_scale, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2v_b_scale = tkw.filter_nodes(
+            g2v_b_scale, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_s2v_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=pipeline_loop.PROLOGUE)
+        prologue_s2v_a_scale_0 = tkw.filter_nodes(
+            s2v_a_scale_0, subgraph=pipeline_loop.PROLOGUE
+        )
+
+        prologue_clusters = [
+            tkw.cluster(
+                [
+                    prologue_g2s_a,
+                    prologue_g2s_a_scale,
+                    prologue_g2v_b,
+                    tkw.SchedulingBarrier([]),
+                    prologue_g2v_b_scale,
+                    tkw.MemoryCounterWaitBarrier(load=10, ds=0),
+                    tkw.SchedulingBarrier([]),
+                    prologue_s2v_a_0,
+                    prologue_s2v_a_scale_0,
+                ],
+            )
+        ]
+
+        # =====================================================================
+        # KERNEL: Main loop body
+        # =====================================================================
+
+        loop_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.KERNEL)
+        loop_g2s_a_scale = tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.KERNEL)
+
+        loop_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.KERNEL)
+        loop_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.KERNEL)
+
+        loop_shared_load_a_0 = tkw.filter_nodes(s2v_a_0, subgraph=pipeline_loop.KERNEL)
+        loop_shared_load_a_scale_0 = tkw.filter_nodes(
+            s2v_a_scale_0, subgraph=pipeline_loop.KERNEL
+        )
+        loop_shared_load_a_1 = tkw.filter_nodes(s2v_a_1, subgraph=pipeline_loop.KERNEL)
+        loop_shared_load_a_scale_1 = tkw.filter_nodes(
+            s2v_a_scale_1, subgraph=pipeline_loop.KERNEL
+        )
+
+        loop_bitcast_a = tkw.filter_nodes(bitcast_a, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_a_scale = tkw.filter_nodes(
+            bitcast_a_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_bitcast_b = tkw.filter_nodes(bitcast_b, subgraph=pipeline_loop.KERNEL)
+        loop_bitcast_b_scale = tkw.filter_nodes(
+            bitcast_b_scale, subgraph=pipeline_loop.KERNEL
+        )
+        loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
+
+        # Partition MMA and A bitcasts by M dimension
+        loop_scaled_mma_0, loop_scaled_mma_1 = tkw.partition_by_dim(
+            loop_scaled_mma, dim=M, num_partitions=2
+        )
+        loop_bitcast_a_0, loop_bitcast_a_1 = tkw.partition_by_dim(
+            loop_bitcast_a, dim=M, num_partitions=2
+        )
+        loop_bitcast_a_scale_0, loop_bitcast_a_scale_1 = tkw.partition_by_dim(
+            loop_bitcast_a_scale, dim=M, num_partitions=2
+        )
+
+        # Split B loads by N dimension so each M-partition gets half.
+        # With 32 MFMAs per M-partition (vs 64 in 256x256), all 8 B loads
+        # at interval=4 would fill every slot, leaving no room for B_scale.
+        loop_g2v_b_0, loop_g2v_b_1 = tkw.partition_by_dim(
+            loop_g2v_b, dim=N, num_partitions=2
+        )
+        loop_g2v_b_scale_0, loop_g2v_b_scale_1 = tkw.partition_by_dim(
+            loop_g2v_b_scale, dim=N, num_partitions=2
+        )
+
+        # First M-partition: A1 LDS reads + first half of B loads.
+        # Pattern (matching reference asm):
+        #   shared_load_a_1 at interval=2 (positions 0,2,4,6)
+        #   g2v_b_0 at interval=4 (positions 1,5)
+        #   shared_load_a_scale_1 at interval=8 (position 7)
+        #   g2v_b_scale_0 at interval=8 (position 7, after a_scale)
+        interleaved_mma_0 = tkw.interleave_operations(
+            base_ops=loop_scaled_mma_0,
+            interleaved_ops=[
+                loop_shared_load_a_1,
+                loop_g2v_b_0,
+                loop_shared_load_a_scale_1,
+                loop_g2v_b_scale_0,
+            ],
+            intervals=[2, 4, 8, 8],
+            start_offsets=[0, 1, 7, 7],
+            start_after_groups=[[], [], [], [2]],
+        )
+
+        # Second M-partition: G2S for A + second half of B loads +
+        # next-iteration A0 LDS reads.
+        # Pattern (matching reference asm):
+        #   g2s_a at interval=4 early (positions 1,5,9)
+        #   shared_load_a_0 at interval=2 after g2s_a (positions 16,18,...,30)
+        #   shared_load_a_scale_0 at interval=8 (positions 23,31)
+        #   g2s_a_scale at interval=4 after g2s_a
+        #   g2v_b_1 at interval=4 after g2s_a (positions 13,17,21,25)
+        #   g2v_b_scale_1 at interval=8 after a_scale (position 31)
+        interleaved_mma_1 = tkw.interleave_operations(
+            base_ops=loop_scaled_mma_1,
+            interleaved_ops=[
+                loop_g2s_a,
+                loop_shared_load_a_0,
+                loop_shared_load_a_scale_0,
+                loop_g2s_a_scale,
+                loop_g2v_b_1,
+                loop_g2v_b_scale_1,
+            ],
+            intervals=[4, 2, 8, 4, 4, 8],
+            start_offsets=[1, 0, 7, 1, 1, 7],
+            start_after_groups=[[], [0], [], [0], [0], [2]],
+        )
+
+        clusters = [
+            tkw.cluster(
+                [
+                    loop_bitcast_a_0,
+                    loop_bitcast_a_scale_0,
+                    loop_bitcast_b,
+                    loop_bitcast_b_scale,
+                    tkw.SchedulingBarrier([]),
+                    interleaved_mma_0,
+                    tkw.SchedulingBarrier([]),
+                    tkw.MemoryCounterWaitBarrier(load=10, ds=0),
+                    tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    loop_bitcast_a_1,
+                    loop_bitcast_a_scale_1,
+                    tkw.SchedulingBarrier([]),
+                    interleaved_mma_1,
+                    loop_shared_load_a_0,
+                    loop_shared_load_a_scale_0,
+                    tkw.SchedulingBarrier([]),
+                    tkw.MemoryCounterWaitBarrier(load=5, ds=0),
+                    tkw.SchedulingBarrier([]),
+                ]
+            ),
+        ]
+
+        tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
+        tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
+
+        unroll_factor = 4
+        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
+
+        tkw.insert_at_start(
+            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=10, ds=0)
+        )
+        tkw.insert_after(
+            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
+        )
+
+    return mxfp4_dbuf_schedule
+
+
 def get_mxfp4_asymmetric_schedule():
     """Return an asymmetric-prefetch MXFP4 schedule for wave_compile().
 
@@ -1091,12 +1368,12 @@ def get_mxfp4_asymmetric_schedule():
             interleaved_ops=[
                 loop_g2v_b,
                 loop_shared_load_a_1,
-                loop_shared_load_a_scale_1,
                 loop_g2v_b_scale,
+                loop_shared_load_a_scale_1,
             ],
-            intervals=[4, 4, 2, 4],
-            start_offsets=[0, 3, 2, 0],
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[4, 4, 8, 8],
+            start_offsets=[1, 0, 7, 7],
+            start_after_groups=[[], [], [], []],
         )
 
         interleaved_mma_1 = tkw.interleave_operations(
@@ -1107,9 +1384,9 @@ def get_mxfp4_asymmetric_schedule():
                 loop_shared_load_a_scale_0,
                 loop_g2s_a_scale,
             ],
-            intervals=[4, 4, 2, 4],
-            start_offsets=[0, 3, 2, 0],
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[4, 2, 8, 8],
+            start_offsets=[1, 0, 7, 7],
+            start_after_groups=[[], [0], [], [0]],
         )
 
         clusters = [
