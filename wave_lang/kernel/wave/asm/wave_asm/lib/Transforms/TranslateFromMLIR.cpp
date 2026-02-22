@@ -399,6 +399,8 @@ LogicalResult handleVectorFma(Operation *op, TranslationContext &ctx);
 LogicalResult handleVectorReduction(Operation *op, TranslationContext &ctx);
 LogicalResult handleVectorExtractStridedSlice(Operation *op,
                                               TranslationContext &ctx);
+LogicalResult handleVectorInsertStridedSlice(Operation *op,
+                                             TranslationContext &ctx);
 
 } // namespace waveasm
 
@@ -1432,6 +1434,8 @@ void OpHandlerRegistry::registerDefaultHandlers(mlir::MLIRContext *ctx) {
   REGISTER_HANDLER(vector::StoreOp, handleVectorStore);
   REGISTER_HANDLER(vector::ExtractStridedSliceOp,
                    handleVectorExtractStridedSlice);
+  REGISTER_HANDLER(vector::InsertStridedSliceOp,
+                   handleVectorInsertStridedSlice);
   REGISTER_HANDLER(vector::BroadcastOp, handleVectorBroadcast);
   REGISTER_HANDLER(vector::ExtractOp, handleVectorExtract);
   REGISTER_HANDLER(vector::InsertOp, handleVectorInsert);

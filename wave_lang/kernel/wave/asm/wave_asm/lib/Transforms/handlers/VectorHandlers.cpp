@@ -264,4 +264,64 @@ LogicalResult handleVectorExtractStridedSlice(Operation *op,
   return success();
 }
 
+LogicalResult handleVectorInsertStridedSlice(Operation *op,
+                                             TranslationContext &ctx) {
+  auto insertOp = cast<vector::InsertStridedSliceOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  auto src = ctx.getMapper().getMapped(insertOp.getValueToStore());
+  if (!src) {
+    return op->emitError("insert_strided_slice source not mapped");
+  }
+
+  auto offsets = insertOp.getOffsets();
+  int64_t offset = 0;
+  if (!offsets.empty()) {
+    offset = cast<IntegerAttr>(offsets[0]).getInt();
+  }
+
+  // Sub-register packed insertion: e.g. inserting vector<1xi8> at offset N
+  // into vector<4xi8> (all packed in a single VGPR).
+  auto destVecType = dyn_cast<VectorType>(insertOp.getDest().getType());
+  if (destVecType) {
+    int64_t elemBitWidth = destVecType.getElementType().getIntOrFloatBitWidth();
+    int64_t numElems = destVecType.getNumElements();
+    int64_t totalBits = numElems * elemBitWidth;
+    int64_t destRegWidth = (totalBits + 31) / 32;
+
+    // offset == 0 with packed sub-register: the source byte goes into the
+    // low bits.  The dest is typically a zero constant — just pass src
+    // through (upper bits are already zero from the byte load).
+    if (destRegWidth < numElems && offset == 0) {
+      ctx.getMapper().mapValue(insertOp.getResult(), *src);
+      return success();
+    }
+
+    if (destRegWidth < numElems && offset > 0) {
+      // Need the dest register for the OR.
+      auto dest = ctx.getMapper().getMapped(insertOp.getDest());
+      if (!dest) {
+        return op->emitError("insert_strided_slice dest not mapped");
+      }
+      // v_lshl_or_b32 dst, src, shift, dest
+      int64_t bitOffset = offset * elemBitWidth;
+      auto vregType = ctx.createVRegType(1, 1);
+      auto shiftImm = builder.getType<ImmType>(bitOffset);
+      auto shiftConst = ConstantOp::create(builder, loc, shiftImm, bitOffset);
+      auto result = V_LSHL_OR_B32::create(builder, loc, vregType, *src,
+                                          shiftConst, *dest);
+      ctx.getMapper().mapValue(insertOp.getResult(), result);
+      return success();
+    }
+  }
+
+  // General case: register-granularity insert — map result to dest.
+  auto dest = ctx.getMapper().getMapped(insertOp.getDest());
+  if (dest) {
+    ctx.getMapper().mapValue(insertOp.getResult(), *dest);
+  }
+  return success();
+}
+
 } // namespace waveasm
