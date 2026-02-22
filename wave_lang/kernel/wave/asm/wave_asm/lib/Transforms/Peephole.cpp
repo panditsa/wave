@@ -188,6 +188,13 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
 //   %final = v_add_u32 %combined, %row          ; (optional second add)
 //   buffer_load_dword[x4]_lds %final, %srd, 0
 //
+// Also matches when LshlAddPattern has already fused a VGPR shift+add,
+// burying the scalar shift as the addend of v_lshl_add_u32:
+//   %shifted = v_lshlrev_b32 <const>, <sgpr>    ; single-use
+//   %fused = v_lshl_add_u32 %vgpr, <const2>, %shifted
+//   %final = v_add_u32 %fused, %row
+//   buffer_load_dword[x4]_lds %final, %srd, 0
+//
 // Rewrites to:
 //   %soff = s_lshl_b32 <sgpr>, <const>
 //   %voff = v_add_u32 %vgpr_base, %row          ; loop-invariant, hoistable
@@ -271,6 +278,36 @@ struct BufferLoadLDSSoffsetPattern : public OpRewritePattern<BufferLoadOp> {
           S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
       auto newVoff = V_ADD_U32::create(
           rewriter, loc, outerAdd.getResult().getType(), row, threadBase);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(newVoff.getResult());
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
+
+    // Case 3: voffset = V_ADD_U32(row, V_LSHL_ADD_U32(vgpr, const,
+    // V_LSHLREV_B32(const, sgpr))) LshlAddPattern may have fused a VGPR
+    // shift+add, burying the scalar shift as src2 (addend) of V_LSHL_ADD_U32.
+    // Decompose: extract the scalar shift into soffset, recreate the VGPR shift
+    // as voffset.
+    for (int i = 0; i < 2; ++i) {
+      Value candidate = i == 0 ? outerAdd.getSrc0() : outerAdd.getSrc1();
+      Value row = i == 0 ? outerAdd.getSrc1() : outerAdd.getSrc0();
+      auto fusedOp = candidate.template getDefiningOp<V_LSHL_ADD_U32>();
+      if (!fusedOp)
+        continue;
+      auto shift = extractScalarShift(fusedOp.getSrc2());
+      if (!shift)
+        continue;
+
+      auto [base, shiftAmt] = *shift;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      auto vregType = outerAdd.getResult().getType();
+      auto newShift = V_LSHLREV_B32::create(
+          rewriter, loc, vregType, fusedOp.getSrc1(), fusedOp.getSrc0());
+      auto newVoff =
+          V_ADD_U32::create(rewriter, loc, vregType, row, newShift.getResult());
       rewriter.modifyOpInPlace(loadOp, [&]() {
         loadOp.getVoffsetMutable().assign(newVoff.getResult());
         loadOp.getSoffsetMutable().assign(sLshl.getDst());
