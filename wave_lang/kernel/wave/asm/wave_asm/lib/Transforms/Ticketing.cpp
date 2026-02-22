@@ -299,26 +299,25 @@ private:
     if (!isa<S_BARRIER>(op))
       return false;
     // start
-    //  bool needVmem = st.ticketing.hasOutstandingVmem();
-    //  bool needLgkm = st.ticketing.hasOutstandingLgkm();
+    bool needVmem = st.ticketing.hasOutstandingVmem();
+    bool needLgkm = st.ticketing.hasOutstandingLgkm();
 
-    // if (needVmem || needLgkm) {
-    //   OpBuilder builder(op->getContext());
-    //   builder.setInsertionPoint(op);
-    //   if (needVmem && needLgkm) {
-    //     S_WAITCNT::create(builder, op->getLoc(),
-    //     builder.getI32IntegerAttr(0),
-    //                       builder.getI32IntegerAttr(0), IntegerAttr());
-    //   } else if (needVmem) {
-    //     S_WAITCNT_VMCNT::create(builder, op->getLoc(), 0);
-    //   } else {
-    //     S_WAITCNT_LGKMCNT::create(builder, op->getLoc(), 0);
-    //   }
-    //   numWaitcntInserted++;
-    // }
+    if (needVmem || needLgkm) {
+      OpBuilder builder(op->getContext());
+      builder.setInsertionPoint(op);
+      if (needVmem && needLgkm) {
+        S_WAITCNT::create(builder, op->getLoc(), builder.getI32IntegerAttr(0),
+                          builder.getI32IntegerAttr(0), IntegerAttr());
+      } else if (needVmem) {
+        S_WAITCNT_VMCNT::create(builder, op->getLoc(), 0);
+      } else {
+        S_WAITCNT_LGKMCNT::create(builder, op->getLoc(), 0);
+      }
+      numWaitcntInserted++;
+    }
 
-    // st.ticketing.observeVmemWait(0);
-    // st.ticketing.observeLgkmWait(0);
+    st.ticketing.observeVmemWait(0);
+    st.ticketing.observeLgkmWait(0);
     // end
     return true;
   }
@@ -504,24 +503,28 @@ private:
     // the first LoopOp, then switch to observe-only for the rest.
     bool inPrologue = true;
     for (Operation *op : allOps) {
-      // if (isa<LoopOp>(op))
-      //   inPrologue = false;
+      if (0) {
+        observeExistingWaitcnt(op, st);
+        continue;
+      }
+      if (isa<LoopOp>(op))
+        inPrologue = false;
 
-      // if (inPrologue) {
-      //   st.opIndex++;
-      //   if (observeExistingWaitcnt(op, st))
-      //     continue;
-      //   if (handleBarrier(op, st))
-      //     continue;
-      //   MemOpKind kind = classifyMemOp(op);
-      //   if (kind != MemOpKind::None) {
-      //     handleMemoryOp(op, kind, st);
-      //     continue;
-      //   }
-      //   handleNonMemoryOp(op, st);
-      // } else {
-      observeExistingWaitcnt(op, st);
-      //}
+      if (inPrologue) {
+        st.opIndex++;
+        if (observeExistingWaitcnt(op, st))
+          continue;
+        if (handleBarrier(op, st))
+          continue;
+        MemOpKind kind = classifyMemOp(op);
+        if (kind != MemOpKind::None) {
+          handleMemoryOp(op, kind, st);
+          continue;
+        }
+        handleNonMemoryOp(op, st);
+      } else {
+        observeExistingWaitcnt(op, st);
+      }
     }
 
     combineAdjacentWaitcnts(program);
