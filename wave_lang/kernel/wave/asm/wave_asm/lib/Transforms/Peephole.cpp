@@ -905,6 +905,99 @@ struct FoldMovConstIntoAndPattern : public OpRewritePattern<V_AND_B32> {
 };
 
 //===----------------------------------------------------------------------===//
+// Pattern: BFE byte extraction → LSHL_OR repack identity
+//
+// Detects the pattern where 4 bytes are extracted from a dword via v_bfe_u32
+// and then repacked into the same dword via a v_lshl_or_b32 chain:
+//
+//   %b0 = v_bfe_u32(%src, 0, 8)
+//   %b1 = v_bfe_u32(%src, 8, 8)
+//   %b2 = v_bfe_u32(%src, 16, 8)
+//   %b3 = v_bfe_u32(%src, 24, 8)
+//   %t1 = v_lshl_or_b32(%b1, 8, %b0)
+//   %t2 = v_lshl_or_b32(%b2, 16, %t1)
+//   %packed = v_lshl_or_b32(%b3, 24, %t2)
+//
+// Since %packed == %src, replace %packed with %src.
+// Common in epilogue code after ScalePackElimination hoists dwords
+// out of loops.
+//===----------------------------------------------------------------------===//
+
+struct BFEPackIdentityPattern : public OpRewritePattern<V_LSHL_OR_B32> {
+  using OpRewritePattern<V_LSHL_OR_B32>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(V_LSHL_OR_B32 outerOp,
+                                PatternRewriter &rewriter) const override {
+    // Outer: v_lshl_or_b32(byte3, 24, middle_result)
+    auto shiftOuter = getConstantValue(outerOp.getSrc1());
+    if (!shiftOuter || *shiftOuter != 24)
+      return failure();
+
+    auto bfe3 = outerOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe3)
+      return failure();
+
+    // Middle: v_lshl_or_b32(byte2, 16, inner_result)
+    auto middleOp = outerOp.getSrc2().getDefiningOp<V_LSHL_OR_B32>();
+    if (!middleOp)
+      return failure();
+
+    auto shiftMiddle = getConstantValue(middleOp.getSrc1());
+    if (!shiftMiddle || *shiftMiddle != 16)
+      return failure();
+
+    auto bfe2 = middleOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe2)
+      return failure();
+
+    // Inner: v_lshl_or_b32(byte1, 8, byte0)
+    auto innerOp = middleOp.getSrc2().getDefiningOp<V_LSHL_OR_B32>();
+    if (!innerOp)
+      return failure();
+
+    auto shiftInner = getConstantValue(innerOp.getSrc1());
+    if (!shiftInner || *shiftInner != 8)
+      return failure();
+
+    auto bfe1 = innerOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe1)
+      return failure();
+
+    auto bfe0 = innerOp.getSrc2().getDefiningOp<V_BFE_U32>();
+    if (!bfe0)
+      return failure();
+
+    // All 4 BFEs must extract from the same source with width 8
+    auto checkBFE = [](V_BFE_U32 bfe,
+                       int64_t expectedOffset) -> std::optional<Value> {
+      auto width = getConstantValue(bfe.getSrc2());
+      if (!width || *width != 8)
+        return std::nullopt;
+      auto offset = getConstantValue(bfe.getSrc1());
+      if (!offset || *offset != expectedOffset)
+        return std::nullopt;
+      return bfe.getSrc0();
+    };
+
+    auto src0 = checkBFE(bfe0, 0);
+    auto src1 = checkBFE(bfe1, 8);
+    auto src2 = checkBFE(bfe2, 16);
+    auto src3 = checkBFE(bfe3, 24);
+
+    if (!src0 || !src1 || !src2 || !src3)
+      return failure();
+
+    // All must extract from the same source register
+    if (*src0 != *src1 || *src0 != *src2 || *src0 != *src3)
+      return failure();
+
+    // The packed result equals the original source dword
+    rewriter.replaceOp(outerOp, *src0);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Peephole Optimization Pass
 //===----------------------------------------------------------------------===//
 
@@ -931,6 +1024,7 @@ struct PeepholePass
         // clang-format off
         AddNegToSubPattern,
         AddZeroPattern,
+        BFEPackIdentityPattern,
         BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORD_LDS>,
         BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORDX4_LDS>,
         FoldMovConstIntoAddPattern,
