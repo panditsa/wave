@@ -238,6 +238,21 @@ int main(int argc, char **argv) {
     pm.addPass(waveasm::createWAVEASMPeepholePass());
   }
 
+  // Eliminate BFE/LSHL_OR round-trips for B-scale iter_args.
+  // Runs after peephole (which creates lshl_or_b32 ops) and before
+  // loop address promotion (which modifies loop structure).
+  pm.addPass(waveasm::createWAVEASMScalePackEliminationPass());
+
+  // Re-run peephole after scale pack elimination to fold epilogue
+  // BFE→LSHL_OR identity chains created by the dword loop results.
+  if (runPeephole) {
+    pm.addPass(waveasm::createWAVEASMPeepholePass());
+  }
+
+  // Strength-reduce buffer_load address computation in loops: precompute
+  // voffsets and increment by constant stride each iteration.
+  pm.addPass(waveasm::createWAVEASMBufferLoadStrengthReductionPass());
+
   // Loop/region structural transforms (enabled by default).
   if (!disableLoopAddressPromotion) {
     pm.addPass(waveasm::createWAVEASMLoopAddressPromotionPass());
