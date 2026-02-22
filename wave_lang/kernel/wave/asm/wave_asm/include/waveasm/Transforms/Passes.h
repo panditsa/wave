@@ -60,6 +60,9 @@ std::unique_ptr<mlir::Pass> createWAVEASMLoopAddressPromotionPass();
 /// Create the scale pack elimination pass
 std::unique_ptr<mlir::Pass> createWAVEASMScalePackEliminationPass();
 
+/// Create the buffer load strength reduction pass
+std::unique_ptr<mlir::Pass> createWAVEASMBufferLoadStrengthReductionPass();
+
 /// Create the memory offset optimization pass
 std::unique_ptr<mlir::Pass> createWAVEASMMemoryOffsetOptPass();
 
