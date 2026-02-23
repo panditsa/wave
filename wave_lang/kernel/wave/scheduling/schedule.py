@@ -214,6 +214,7 @@ def build_guarded_pipeline_with_remainder(
     visualize: bool = False,
     use_scheduling_barriers: bool = False,
     multi_buffer_count: Optional[int] = None,
+    mfmas_in_kernel: bool = False,
 ):
     """
     Build conditional + pipelined loop + remainder loop for dynamic shapes.
@@ -312,6 +313,7 @@ def build_guarded_pipeline_with_remainder(
         visualize,
         use_scheduling_barriers,
         multi_buffer_count,
+        mfmas_in_kernel,
     )
 
     # Set the count for the pipelined loop
@@ -320,7 +322,12 @@ def build_guarded_pipeline_with_remainder(
     # data for the "next" iteration (offset by step), so we need to ensure
     # that stays within bounds.
     step = get_custom(pipelined_node).step
-    get_custom(pipelined_node).count = pipelined_iterations - (num_stages - 1) * step
+    if mfmas_in_kernel:
+        get_custom(pipelined_node).count = pipelined_iterations
+    else:
+        get_custom(pipelined_node).count = (
+            pipelined_iterations - (num_stages - 1) * step
+        )
 
     # Verify we have the right number of results
     assert len(final_results) == len(
@@ -414,6 +421,7 @@ def construct_pipelined_loop_adaptive(
     visualize: bool = False,
     use_scheduling_barriers: bool = False,
     multi_buffer_count: Optional[int] = None,
+    mfmas_in_kernel: bool = False,
 ):
     """
     Constructs a pipelined loop wrapped in a conditional, followed by a remainder loop.
@@ -450,12 +458,16 @@ def construct_pipelined_loop_adaptive(
             visualize,
             use_scheduling_barriers,
             multi_buffer_count,
+            mfmas_in_kernel,
         )
         if new_reduction:
             step = get_custom(new_reduction).step
-            get_custom(new_reduction).count = (
-                max_induction_variable - (num_stages - 1) * step
-            )
+            if mfmas_in_kernel:
+                get_custom(new_reduction).count = max_induction_variable
+            else:
+                get_custom(new_reduction).count = (
+                    max_induction_variable - (num_stages - 1) * step
+                )
         return new_reduction, node_mapping
 
     # For dynamic shapes, emit conditional + pipelined loop + remainder loop
@@ -471,6 +483,7 @@ def construct_pipelined_loop_adaptive(
         visualize,
         use_scheduling_barriers,
         multi_buffer_count,
+        mfmas_in_kernel,
     )
 
 
@@ -485,6 +498,7 @@ def apply_pipelined_schedule(
     scheduling_type: SchedulingType = SchedulingType.NONE,
     visualize: bool = False,
     multi_buffer_count: Optional[int] = None,
+    mfmas_in_kernel: bool = False,
 ) -> Optional[tuple[fx.Node, dict]]:
 
     # After scheduling has completed, we have enough information to decide
@@ -519,6 +533,7 @@ def apply_pipelined_schedule(
         visualize,
         use_scheduling_barriers,
         multi_buffer_count,
+        mfmas_in_kernel,
     )
 
 

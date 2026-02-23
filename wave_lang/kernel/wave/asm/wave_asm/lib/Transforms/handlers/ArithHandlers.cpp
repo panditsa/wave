@@ -106,6 +106,14 @@ LogicalResult handleArithXorI(Operation *op, TranslationContext &ctx) {
   return handleBinaryVALU<arith::XOrIOp, V_XOR_B32>(op, ctx);
 }
 
+LogicalResult handleArithMinSI(Operation *op, TranslationContext &ctx) {
+  return handleBinaryVALU<arith::MinSIOp, V_MIN_I32>(op, ctx);
+}
+
+LogicalResult handleArithMinUI(Operation *op, TranslationContext &ctx) {
+  return handleBinaryVALU<arith::MinUIOp, V_MIN_U32>(op, ctx);
+}
+
 //===----------------------------------------------------------------------===//
 // Shift Operations (reversed operand order - using template)
 //===----------------------------------------------------------------------===//

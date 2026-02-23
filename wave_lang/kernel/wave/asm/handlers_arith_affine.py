@@ -74,6 +74,12 @@ class _ArithAffineHandlers:
         """Handle arith.muli - track integer multiplication in index_env."""
         self._handle_arith_binop(operation, kernel_info, operator.mul)
 
+    def handle_arith_minsi_op(
+        self, operation: arith_d.MinSIOp, kernel_info: KernelInfo
+    ):
+        """Handle arith.minsi - track signed integer min in index_env."""
+        self._handle_arith_binop(operation, kernel_info, sympy.Min)
+
     def handle_arith_xori_op(self, operation: arith_d.XOrIOp, kernel_info: KernelInfo):
         """Handle arith.xori - track integer XOR in index_env."""
         from wave_lang.kernel._support.indexing import xor as sympy_xor
