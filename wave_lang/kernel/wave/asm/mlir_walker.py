@@ -114,6 +114,8 @@ class IRWalker:
             self.handlers.handle_arith_addi_op(operation, kernel_info)
         elif isinstance(operation, arith_d.MulIOp):
             self.handlers.handle_arith_muli_op(operation, kernel_info)
+        elif isinstance(operation, arith_d.MinSIOp):
+            self.handlers.handle_arith_minsi_op(operation, kernel_info)
         elif isinstance(operation, arith_d.XOrIOp):
             self.handlers.handle_arith_xori_op(operation, kernel_info)
         elif isinstance(operation, arith_d.IndexCastOp):

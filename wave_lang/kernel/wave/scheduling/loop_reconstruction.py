@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 from enum import Enum
 
+import sympy
 import torch.fx as fx
 
 from wave_lang.support.logging import get_logger
@@ -9,6 +10,7 @@ from ..._support.indexing import IndexSymbol, IndexSequence, IndexExpr
 from ..._support.tracing import CapturedTrace
 from ...ops.wave_ops import (
     CustomOp,
+    GatherToLDS,
     GetResult,
     IterArg,
     Iterate,
@@ -16,15 +18,19 @@ from ...ops.wave_ops import (
     NewRegister,
     Output,
     Placeholder,
+    Read,
     SchedulingGroupBarrier,
+    TensorLoadToLDS,
     get_custom,
 )
+from ...lang.global_symbols import GLOBAL_ADDRESS_SPACE
 from ..constraints import Constraint
 from ..utils.general_utils import (
     get_induction_variable,
     rotate_list,
     collect_shared_memory_operands,
 )
+from ..utils.symbol_utils import subs_idxc
 from ..utils.graph_utils import replace_uses_in
 from ..visualization import visualize_graph, visualize_mapped_graphs
 from .loop_reconstruction_utils import (
@@ -83,6 +89,47 @@ def update_node_index(
     update_loop_dependent_args_if_present(node, loop_dependent_args, subs)
 
 
+def _is_global_prefetch_op(node: "CustomOp") -> bool:
+    if isinstance(node, Read):
+        return subs_idxc(node.memory_type.address_space) == GLOBAL_ADDRESS_SPACE
+    return isinstance(node, (GatherToLDS, TensorLoadToLDS))
+
+
+def _apply_prefetch_clamp_to_zero(
+    node: "CustomOp",
+    induction_variable: IndexSymbol,
+    current_induction_variable: IndexExpr,
+    max_induction_variable: int | IndexExpr,
+):
+    """Clamp prefetch-stage induction variable so it never exceeds valid K range.
+
+    On the last loop iteration(s), prefetch stages address K blocks beyond the
+    matrix.  We clamp the IV with sympy.Min which lowers to arith.minsi →
+    s_min_i32 (scalar).  The fetched data is never consumed so the exact value
+    is irrelevant — we just need a valid address.
+    """
+    if max_induction_variable is None:
+        return
+
+    prefetch_offset = current_induction_variable - induction_variable
+    max_safe_iv = max_induction_variable - 1 - prefetch_offset
+    clamped_iv = sympy.Min(induction_variable, max_safe_iv)
+    subs = {induction_variable: clamped_iv}
+
+    if isinstance(node, Read):
+        if node.index:
+            node.index = update_index(node.index, subs)
+        return
+
+    if isinstance(node, GatherToLDS):
+        if node.src_index:
+            node.update_arg("src_index", update_index(node.src_index, subs))
+        return
+
+    if isinstance(node, TensorLoadToLDS) and node.global_tile_index:
+        node.update_arg("global_tile_index", update_index(node.global_tile_index, subs))
+
+
 def add_nodes_by_schedule(
     reduction: Iterate,
     reduction_graph: fx.Graph,
@@ -96,6 +143,8 @@ def add_nodes_by_schedule(
     pipelining_stage: PipelineStage = PipelineStage.KERNEL,
     use_scheduling_barriers: bool = False,
     node_mapping: dict[fx.Node, list[fx.Node]] = None,
+    mfmas_in_kernel: bool = False,
+    max_induction_variable: Optional[int | IndexExpr] = None,
 ):
     """
     Interleave the instructions in the partitioned graph by stage
@@ -166,6 +215,18 @@ def add_nodes_by_schedule(
             update_node_index(
                 new_node, induction_variable, current_induction_variables[iteration]
             )
+            if (
+                mfmas_in_kernel
+                and pipelining_stage == PipelineStage.KERNEL
+                and iteration > 0
+                and _is_global_prefetch_op(new_node)
+            ):
+                _apply_prefetch_clamp_to_zero(
+                    new_node,
+                    induction_variable,
+                    current_induction_variables[iteration],
+                    max_induction_variable,
+                )
             if custom_node.expanded_dims:
                 new_node.expanded_dims = custom_node.expanded_dims
             if custom_node.pre_expansion_id:
@@ -528,6 +589,8 @@ def construct_kernel(
     use_scheduling_barriers: bool = False,
     outer_vars: dict[fx.Node, list[fx.Node]] = {},
     node_mapping: dict[fx.Node, list[fx.Node]] = None,
+    mfmas_in_kernel: bool = False,
+    max_induction_variable: Optional[int | IndexExpr] = None,
 ) -> tuple[Iterate, fx.Graph]:
     """
     Construct the kernel of the pipelined loop.
@@ -610,6 +673,8 @@ def construct_kernel(
             PipelineStage.KERNEL,
             use_scheduling_barriers,
             node_mapping,
+            mfmas_in_kernel,
+            max_induction_variable,
         )
 
         # Create output node (last node in the graph).
@@ -823,6 +888,7 @@ def construct_pipelined_loop(
     visualize: bool = False,
     use_scheduling_barriers: bool = False,
     multi_buffer_count: Optional[int] = None,
+    mfmas_in_kernel: bool = False,
 ) -> tuple[fx.Node, dict[fx.Node, list[fx.Node]], list[fx.Node]]:
     """
     Given a graph annotated with scheduling parameters, construct a pipelined loop
@@ -887,34 +953,50 @@ def construct_pipelined_loop(
         use_scheduling_barriers,
         outer_vars=outer_vars,
         node_mapping=node_mapping,
+        mfmas_in_kernel=mfmas_in_kernel,
+        max_induction_variable=max_induction_variable,
     )
 
     pipelined_reduction_graph.parent_op = pipelined_reduction
     trace.add_subgraph(
         get_custom(pipelined_reduction).subgraph_name, pipelined_reduction_graph
     )
-    # Construct epilogue.
-    # The epilogue induction variables must account for the step size.
-    # With step > 1, each "iteration" covers step original iterations.
-    final_results = construct_epilogue(
-        graph,
-        reduction,
-        get_custom(pipelined_reduction),
-        partitioned_graph,
-        num_stages,
-        initiation_interval,
-        rotating_registers,
-        induction_variable,
-        [
-            max_induction_variable - num_stages * step + i * step
-            for i in range(num_stages)
-        ],
-        create_drain_stage_schedule(num_stages),
-        num_rotating_registers,
-        visualize,
-        outer_vars=outer_vars,
-        node_mapping=node_mapping,
-    )
+    if mfmas_in_kernel:
+        # Keep all MFMA work in the kernel loop and skip drain-stage MFMAs.
+        # In this mode, callers consume loop-carried results directly via GetResult.
+        # pipelined_reduction is an fx.Node; iterate over its fx-level users.
+        get_result_nodes = []
+        for user_node in pipelined_reduction.users:
+            custom_user = get_custom(user_node)
+            if isinstance(custom_user, GetResult):
+                get_result_nodes.append((custom_user.res_idx, user_node))
+        get_result_nodes.sort(key=lambda t: t[0])
+        final_results = [node for _, node in get_result_nodes][
+            : len(reduction.init_args)
+        ]
+    else:
+        # Construct epilogue.
+        # The epilogue induction variables must account for the step size.
+        # With step > 1, each "iteration" covers step original iterations.
+        final_results = construct_epilogue(
+            graph,
+            reduction,
+            get_custom(pipelined_reduction),
+            partitioned_graph,
+            num_stages,
+            initiation_interval,
+            rotating_registers,
+            induction_variable,
+            [
+                max_induction_variable - num_stages * step + i * step
+                for i in range(num_stages)
+            ],
+            create_drain_stage_schedule(num_stages),
+            num_rotating_registers,
+            visualize,
+            outer_vars=outer_vars,
+            node_mapping=node_mapping,
+        )
 
     # Remove the unpipelined reduction and the corresponding subgraph
     reduction.erase()

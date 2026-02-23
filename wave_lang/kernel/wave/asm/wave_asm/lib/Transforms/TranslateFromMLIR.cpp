@@ -373,6 +373,8 @@ LogicalResult handleArithIndexCast(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithAndI(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithOrI(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithXorI(Operation *op, TranslationContext &ctx);
+LogicalResult handleArithMinSI(Operation *op, TranslationContext &ctx);
+LogicalResult handleArithMinUI(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithShLI(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithShRUI(Operation *op, TranslationContext &ctx);
 LogicalResult handleArithShRSI(Operation *op, TranslationContext &ctx);
@@ -1478,6 +1480,8 @@ void OpHandlerRegistry::registerDefaultHandlers(mlir::MLIRContext *ctx) {
   REGISTER_HANDLER(arith::AndIOp, handleArithAndI);
   REGISTER_HANDLER(arith::OrIOp, handleArithOrI);
   REGISTER_HANDLER(arith::XOrIOp, handleArithXorI);
+  REGISTER_HANDLER(arith::MinSIOp, handleArithMinSI);
+  REGISTER_HANDLER(arith::MinUIOp, handleArithMinUI);
 
   // Arith dialect - shift operations
   REGISTER_HANDLER(arith::ShLIOp, handleArithShLI);

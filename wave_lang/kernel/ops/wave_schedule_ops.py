@@ -183,7 +183,7 @@ def reorder_graph(loop: Any, clusters: Any): ...
 
 
 @define_schedule_op
-def pipeline(iterate: Sequence[fx.Node]): ...
+def pipeline(iterate: Sequence[fx.Node], mfmas_in_kernel: bool = False): ...
 
 
 @define_schedule_op
@@ -801,10 +801,12 @@ class PipelinedLoop:
         iterate: Sequence[fx.Node],
         kernel_trace: "CapturedTrace",
         constraints: list[Constraint],
+        mfmas_in_kernel: bool = False,
     ):
         self.iterate = iterate
         self.kernel_trace = kernel_trace
         self.constraints = constraints
+        self.mfmas_in_kernel = mfmas_in_kernel
 
         # Access options from the current ScheduleContext
         from .._support.tracing import ScheduleContext
@@ -870,6 +872,7 @@ class PipelinedLoop:
             scheduling_type=SchedulingType.MANUAL,
             visualize=False,
             multi_buffer_count=None,
+            mfmas_in_kernel=self.mfmas_in_kernel,
         )
 
         # Store the pipelined iterate node and node mapping, then create proxies for the stages
@@ -1105,8 +1108,11 @@ class Pipeline(CustomScheduleOp):
         kernel_trace,
         constraints: list[Constraint],
         iterate: Sequence[fx.Node],
+        mfmas_in_kernel: bool = False,
     ):
-        real_pipelined_loop = PipelinedLoop(iterate, kernel_trace, constraints)
+        real_pipelined_loop = PipelinedLoop(
+            iterate, kernel_trace, constraints, mfmas_in_kernel
+        )
 
         # Return the real object directly (no proxy needed)
         return real_pipelined_loop

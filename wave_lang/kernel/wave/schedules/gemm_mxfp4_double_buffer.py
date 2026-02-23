@@ -75,7 +75,7 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         # =====================================================================
         # Create 2-stage pipeline (double buffering)
         # =====================================================================
-        pipeline_loop = tkw.pipeline(k_loop)
+        pipeline_loop = tkw.pipeline(k_loop, mfmas_in_kernel=True)
 
         with pipeline_loop as pl:
             # Stage 0: Global-to-shared prefetch via GatherToLDS (no fusion)
@@ -874,12 +874,14 @@ def get_mxfp4_dbuf_mixed_pingpong_schedule(use_stagger: bool = True):
 
 
 def get_mxfp4_asymmetric_128x256_schedule():
-    """Return an asymmetric-prefetch MXFP4 schedule for 128x256 GEMM.
+    """Return an asymmetric-prefetch MXFP4 schedule for 128M x 256N GEMM.
 
-    Asymmetric data paths (same as 256x256):
-      - A (data + scale): global -> LDS -> VGPRs, prefetch depth 2
-        (triple-buffered in LDS).
-      - B (data + scale): global -> VGPRs directly (no LDS).
+    Targets the AITER f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256 kernel.
+    4 waves x 64 threads, each wave owns 128M x 64N (32 output tiles of 16x16).
+
+    Asymmetric data paths:
+      - A (data + scale): global -> LDS (4-slot ring buffer) -> VGPRs
+      - B (data + scale): global -> VGPRs directly (double-buffered)
 
     3-stage pipeline:
       Stage 0: Async global-to-LDS prefetch for A and A_scale.
@@ -888,13 +890,17 @@ def get_mxfp4_asymmetric_128x256_schedule():
       Stage 2: LDS-to-VGPR loads for second M-partition of A;
                bitcasts; scaled MMA accumulation.
 
-    Compared to the 256x256 schedule:
-      - Half the M-tiles per wave (1 per M-partition instead of 2),
-        yielding 32 MFMAs per M-partition instead of 64.
-      - B loads are split by N dimension (4+4) across the two
-        M-partition halves to avoid saturating interleave slots.
-      - A1 LDS reads use interval=2 (vs 4) for denser interleaving.
-      - Unroll factor is 4 (vs 2) to maintain 256 MFMAs per outer loop.
+    Per K=256 block, 64 MFMAs split into two M-partitions of 32:
+      M-partition 0 (32 MFMAs, B_N01):
+        Interleaved with A_sub1 LDS reads (interval=2), B_N23 prefetch
+        (interval=4), A_scale (interval=8), B_scale (after group 2).
+      M-partition 1 (32 MFMAs, B_N23):
+        Interleaved with g2s_A prefetch (interval=4), next-iter A_sub0
+        reads (interval=2), g2s_A_scale, B_N01 prefetch (interval=4),
+        B_scale (after group 2).
+
+    Unroll factor = 2, producing 128 MFMAs per outer loop iteration.
+    AITER uses 4 LDS slots; our 3-stage pipeline gives 3 (triple buffer).
 
     Reference: aiter f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256.s
     """
@@ -940,7 +946,7 @@ def get_mxfp4_asymmetric_128x256_schedule():
         # =====================================================================
         # Create 3-stage pipeline (triple buffering for A in LDS)
         # =====================================================================
-        pipeline_loop = tkw.pipeline(k_loop)
+        pipeline_loop = tkw.pipeline(k_loop, mfmas_in_kernel=True)
 
         with pipeline_loop as pl:
             pl.set_stage(
@@ -1004,7 +1010,7 @@ def get_mxfp4_asymmetric_128x256_schedule():
                     prologue_g2v_b,
                     tkw.SchedulingBarrier([]),
                     prologue_g2v_b_scale,
-                    tkw.MemoryCounterWaitBarrier(load=10, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=22, ds=0),
                     tkw.SchedulingBarrier([]),
                     prologue_s2v_a_0,
                     prologue_s2v_a_scale_0,
@@ -1115,7 +1121,7 @@ def get_mxfp4_asymmetric_128x256_schedule():
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=10, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=18, ds=0),
                     tkw.SchedulingBarrier([]),
                 ],
             ),
@@ -1128,7 +1134,7 @@ def get_mxfp4_asymmetric_128x256_schedule():
                     loop_shared_load_a_0,
                     loop_shared_load_a_scale_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=5, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=18, ds=0),
                     tkw.SchedulingBarrier([]),
                 ]
             ),
@@ -1137,11 +1143,11 @@ def get_mxfp4_asymmetric_128x256_schedule():
         tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
         tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
 
-        unroll_factor = 4
+        unroll_factor = 2
         tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
         tkw.insert_at_start(
-            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=10, ds=0)
+            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=15, ds=5)
         )
         tkw.insert_after(
             pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
@@ -1213,6 +1219,7 @@ def get_mxfp4_asymmetric_schedule():
         # Create 2-stage pipeline (double buffering)
         # =====================================================================
         pipeline_loop = tkw.pipeline(k_loop)
+        pipeline_loop.mfmas_in_kernel = True
 
         with pipeline_loop as pl:
             pl.set_stage(
@@ -1449,110 +1456,116 @@ def get_mxfp4_asymmetric_schedule():
 
         epilogue_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.EPILOGUE)
 
-        def split_by_iteration(nodes, key="name"):
-            # TODO: Replace name-based splitting with a pipeline_drain_iteration
-            # attribute (analogous to unroll_iteration). expanded_dims can't be
-            # used here because loop_reconstruction copies them verbatim for
-            # both drain iterations.
-            itr0 = []
-            itr1 = []
-            for node in nodes:
-                value = getattr(node, key)
-                if "1_2" in value:
-                    itr0.append(node)
-                elif "2_2" in value:
-                    itr1.append(node)
-                else:
-                    raise ValueError(f"Unknown {key} for node: {value}")
-            return itr0, itr1
+        if epilogue_mma:
 
-        epilogue_mma_itr0, epilogue_mma_itr1 = split_by_iteration(epilogue_mma)
-        epilogue_s2v_a_1_itr0, epilogue_s2v_a_1_itr1 = split_by_iteration(
-            epilogue_s2v_a_1
-        )
-        epilogue_s2v_a_scale_1_itr0, epilogue_s2v_a_scale_1_itr1 = split_by_iteration(
-            epilogue_s2v_a_scale_1
-        )
-        epilogue_bitcast_a_itr0, epilogue_bitcast_a_itr1 = split_by_iteration(
-            epilogue_bitcast_a
-        )
-        epilogue_bitcast_a_scale_itr0, epilogue_bitcast_a_scale_itr1 = (
-            split_by_iteration(epilogue_bitcast_a_scale)
-        )
-        epilogue_bitcast_b_itr0, epilogue_bitcast_b_itr1 = split_by_iteration(
-            epilogue_bitcast_b
-        )
-        epilogue_bitcast_b_scale_itr0, epilogue_bitcast_b_scale_itr1 = (
-            split_by_iteration(epilogue_bitcast_b_scale)
-        )
+            def split_by_iteration(nodes, key="name"):
+                # TODO: Replace name-based splitting with a pipeline_drain_iteration
+                # attribute (analogous to unroll_iteration). expanded_dims can't be
+                # used here because loop_reconstruction copies them verbatim for
+                # both drain iterations.
+                itr0 = []
+                itr1 = []
+                for node in nodes:
+                    value = getattr(node, key)
+                    if "1_2" in value:
+                        itr0.append(node)
+                    elif "2_2" in value:
+                        itr1.append(node)
+                    else:
+                        raise ValueError(f"Unknown {key} for node: {value}")
+                return itr0, itr1
 
-        epilogue_mma_itr0_0, epilogue_mma_itr0_1 = tkw.partition_by_dim(
-            epilogue_mma_itr0, dim=M, num_partitions=2
-        )
-        epilogue_bitcast_a_itr0_0, epilogue_bitcast_a_itr0_1 = tkw.partition_by_dim(
-            epilogue_bitcast_a_itr0, dim=M, num_partitions=2
-        )
-        epilogue_bitcast_a_scale_itr0_0, epilogue_bitcast_a_scale_itr0_1 = (
-            tkw.partition_by_dim(epilogue_bitcast_a_scale_itr0, dim=M, num_partitions=2)
-        )
+            epilogue_mma_itr0, epilogue_mma_itr1 = split_by_iteration(epilogue_mma)
+            epilogue_s2v_a_1_itr0, epilogue_s2v_a_1_itr1 = split_by_iteration(
+                epilogue_s2v_a_1
+            )
+            epilogue_s2v_a_scale_1_itr0, epilogue_s2v_a_scale_1_itr1 = (
+                split_by_iteration(epilogue_s2v_a_scale_1)
+            )
+            epilogue_bitcast_a_itr0, epilogue_bitcast_a_itr1 = split_by_iteration(
+                epilogue_bitcast_a
+            )
+            epilogue_bitcast_a_scale_itr0, epilogue_bitcast_a_scale_itr1 = (
+                split_by_iteration(epilogue_bitcast_a_scale)
+            )
+            epilogue_bitcast_b_itr0, epilogue_bitcast_b_itr1 = split_by_iteration(
+                epilogue_bitcast_b
+            )
+            epilogue_bitcast_b_scale_itr0, epilogue_bitcast_b_scale_itr1 = (
+                split_by_iteration(epilogue_bitcast_b_scale)
+            )
 
-        epilogue_mma_itr1_0, epilogue_mma_itr1_1 = tkw.partition_by_dim(
-            epilogue_mma_itr1, dim=M, num_partitions=2
-        )
-        epilogue_bitcast_a_itr1_0, epilogue_bitcast_a_itr1_1 = tkw.partition_by_dim(
-            epilogue_bitcast_a_itr1, dim=M, num_partitions=2
-        )
-        epilogue_bitcast_a_scale_itr1_0, epilogue_bitcast_a_scale_itr1_1 = (
-            tkw.partition_by_dim(epilogue_bitcast_a_scale_itr1, dim=M, num_partitions=2)
-        )
+            epilogue_mma_itr0_0, epilogue_mma_itr0_1 = tkw.partition_by_dim(
+                epilogue_mma_itr0, dim=M, num_partitions=2
+            )
+            epilogue_bitcast_a_itr0_0, epilogue_bitcast_a_itr0_1 = tkw.partition_by_dim(
+                epilogue_bitcast_a_itr0, dim=M, num_partitions=2
+            )
+            epilogue_bitcast_a_scale_itr0_0, epilogue_bitcast_a_scale_itr0_1 = (
+                tkw.partition_by_dim(
+                    epilogue_bitcast_a_scale_itr0, dim=M, num_partitions=2
+                )
+            )
 
-        epilogue_clusters_itr0 = [
-            tkw.cluster(
-                [
-                    tkw.MemoryCounterWaitBarrier(load=0, ds=0),
-                    epilogue_bitcast_a_itr0_0,
-                    epilogue_bitcast_a_scale_itr0_0,
-                    epilogue_bitcast_b_itr0,
-                    epilogue_bitcast_b_scale_itr0,
-                    tkw.SchedulingBarrier([]),
-                    epilogue_mma_itr0_0,
-                    epilogue_g2v_b,
-                    epilogue_s2v_a_1_itr0,
-                    epilogue_g2v_b_scale,
-                    epilogue_s2v_a_scale_1_itr0,
-                    epilogue_bitcast_a_itr0_1,
-                    epilogue_bitcast_a_scale_itr0_1,
-                ],
-            ),
-            tkw.cluster(
-                [
-                    epilogue_mma_itr0_1,
-                    tkw.MemoryCounterWaitBarrier(load=0, ds=0),
-                    epilogue_s2v_a_0,
-                    epilogue_s2v_a_scale_0,
-                ],
-            ),
-            tkw.cluster(
-                [
-                    tkw.MemoryCounterWaitBarrier(load=0, ds=0),
-                    epilogue_bitcast_a_itr1_0,
-                    epilogue_bitcast_a_scale_itr1_0,
-                    epilogue_bitcast_b_itr1,
-                    epilogue_bitcast_b_scale_itr1,
-                    tkw.SchedulingBarrier([]),
-                    epilogue_mma_itr1_0,
-                    epilogue_s2v_a_1_itr1,
-                    epilogue_s2v_a_scale_1_itr1,
-                ],
-            ),
-            tkw.cluster(
-                [
-                    epilogue_bitcast_a_itr1_1,
-                    epilogue_bitcast_a_scale_itr1_1,
-                    epilogue_mma_itr1_1,
-                ],
-            ),
-        ]
+            epilogue_mma_itr1_0, epilogue_mma_itr1_1 = tkw.partition_by_dim(
+                epilogue_mma_itr1, dim=M, num_partitions=2
+            )
+            epilogue_bitcast_a_itr1_0, epilogue_bitcast_a_itr1_1 = tkw.partition_by_dim(
+                epilogue_bitcast_a_itr1, dim=M, num_partitions=2
+            )
+            epilogue_bitcast_a_scale_itr1_0, epilogue_bitcast_a_scale_itr1_1 = (
+                tkw.partition_by_dim(
+                    epilogue_bitcast_a_scale_itr1, dim=M, num_partitions=2
+                )
+            )
+
+            epilogue_clusters_itr0 = [
+                tkw.cluster(
+                    [
+                        tkw.MemoryCounterWaitBarrier(load=0, ds=0),
+                        epilogue_bitcast_a_itr0_0,
+                        epilogue_bitcast_a_scale_itr0_0,
+                        epilogue_bitcast_b_itr0,
+                        epilogue_bitcast_b_scale_itr0,
+                        tkw.SchedulingBarrier([]),
+                        epilogue_mma_itr0_0,
+                        epilogue_g2v_b,
+                        epilogue_s2v_a_1_itr0,
+                        epilogue_g2v_b_scale,
+                        epilogue_s2v_a_scale_1_itr0,
+                        epilogue_bitcast_a_itr0_1,
+                        epilogue_bitcast_a_scale_itr0_1,
+                    ],
+                ),
+                tkw.cluster(
+                    [
+                        epilogue_mma_itr0_1,
+                        tkw.MemoryCounterWaitBarrier(load=0, ds=0),
+                        epilogue_s2v_a_0,
+                        epilogue_s2v_a_scale_0,
+                    ],
+                ),
+                tkw.cluster(
+                    [
+                        tkw.MemoryCounterWaitBarrier(load=0, ds=0),
+                        epilogue_bitcast_a_itr1_0,
+                        epilogue_bitcast_a_scale_itr1_0,
+                        epilogue_bitcast_b_itr1,
+                        epilogue_bitcast_b_scale_itr1,
+                        tkw.SchedulingBarrier([]),
+                        epilogue_mma_itr1_0,
+                        epilogue_s2v_a_1_itr1,
+                        epilogue_s2v_a_scale_1_itr1,
+                    ],
+                ),
+                tkw.cluster(
+                    [
+                        epilogue_bitcast_a_itr1_1,
+                        epilogue_bitcast_a_scale_itr1_1,
+                        epilogue_mma_itr1_1,
+                    ],
+                ),
+            ]
 
         tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
         tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
@@ -1564,9 +1577,9 @@ def get_mxfp4_asymmetric_schedule():
         tkw.insert_at_start(
             pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=10, ds=0)
         )
-        tkw.insert_after(
-            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
-        )
+        # tkw.insert_after(
+        #     pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
+        # )
 
         # hacks
         # tkw.insert_at_start(pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0))
