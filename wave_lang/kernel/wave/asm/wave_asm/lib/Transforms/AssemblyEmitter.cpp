@@ -715,6 +715,22 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           return formatter.format(mnem64, operands);
         }
 
+        if (mnemonic == "v_cndmask_b32") {
+          llvm::SmallVector<std::string> operands;
+          for (Value result : defaultOp->getResults()) {
+            operands.push_back(resolveValue(result));
+          }
+          auto numOperands = defaultOp->getNumOperands();
+          for (unsigned i = 0; i < numOperands; ++i) {
+            if (i == numOperands - 1) {
+              operands.push_back("vcc");
+            } else {
+              operands.push_back(resolveValue(defaultOp->getOperand(i)));
+            }
+          }
+          return formatter.format("v_cndmask_b32_e64", operands);
+        }
+
         return emitDefaultFormat(defaultOp, mnemonic);
       });
 }
