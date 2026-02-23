@@ -86,9 +86,51 @@ def simplify(expr: sympy.Expr) -> sympy.Expr:
         new_expr = _bounds_simplify_once(expr)
         new_expr = sympy.simplify(new_expr)
         if new_expr == expr:
+            # If the expression still contains Mod inside an Add, expand
+            # using the identity Mod(x,M) = x - M*floor(x/M).  This lets
+            # floor terms from a Mod/floor decomposition (e.g. index mapping
+            # producing phys_K = Mod(flat,M) and phys_N = floor(flat/M))
+            # cancel algebraically when their sum reconstructs the original.
+            if _has_mod_in_add(new_expr):
+                expanded = _expand_mod(new_expr)
+                expanded = sympy.simplify(expanded)
+                if expanded != new_expr:
+                    expr = expanded
+                    continue
             break
         expr = new_expr
     return expr
+
+
+def _has_mod_in_add(expr: sympy.Expr) -> bool:
+    """Check if an Add expression (or any sub-Add) contains a Mod term."""
+    if isinstance(expr, sympy.Add):
+        if any(
+            isinstance(a, sympy.Mod)
+            or (
+                isinstance(a, sympy.Mul)
+                and any(isinstance(f, sympy.Mod) for f in a.args)
+            )
+            for a in expr.args
+        ):
+            return True
+    return any(_has_mod_in_add(a) for a in expr.args if isinstance(a, sympy.Basic))
+
+
+def _expand_mod(expr: sympy.Expr) -> sympy.Expr:
+    """Rewrite Mod(x, M) -> x - M*floor(x/M) throughout an expression.
+
+    This is a universally valid identity that enables cancellation when
+    an expression contains both Mod(x,M) and M*floor(x/M) terms (e.g.
+    from reconstructing a flat index out of row/column decomposition).
+    """
+    if not isinstance(expr, sympy.Basic) or expr.is_Atom:
+        return expr
+    if isinstance(expr, sympy.Mod):
+        p, q = expr.args
+        p = _expand_mod(p)
+        return p - q * sympy.floor(p / q)
+    return expr.func(*[_expand_mod(a) for a in expr.args])
 
 
 def _bounds_simplify_once(expr: sympy.Expr) -> sympy.Expr:
