@@ -339,6 +339,22 @@ def _valid_bytes_buffer(elem_type: IrType) -> int:
     return ans
 
 
+def _static_memref_valid_bytes(mem: Value, elem_type: IrType) -> Optional[int]:
+    """Return max valid byte offset for static memrefs, else None."""
+    if not isinstance(mem.type, MemRefType):
+        return None
+
+    memref_type = MemRefType(mem.type)
+    if not memref_type.has_static_shape:
+        return None
+
+    elem_bytes = elem_type.width // 8
+    total_elements = math.prod(memref_type.shape)
+    total_bytes = total_elements * elem_bytes
+    # valid_bytes is the maximum in-range starting byte offset.
+    return max(total_bytes - elem_bytes, 0)
+
+
 def _get_out_of_bounds_index(element_type: IrType) -> int:
     """
     returns the first index that's out of bounds of a buffer based on the element type and maximum bytes
@@ -366,14 +382,20 @@ def _get_constant_value(candidate: Value):
 
 
 def _cast_buffer_and_encode_stride(
-    ptr: Value, strides: tuple[Value], elem_type: IrType, emitter: WaveEmitter
+    ptr: Value,
+    strides: tuple[Value],
+    elem_type: IrType,
+    emitter: WaveEmitter,
+    valid_bytes_override: Optional[int] = None,
 ) -> Value:
     uint64 = IntegerType.get_signless(64)
     uint14 = IntegerType.get_signless(14)
 
-    valid_bytes = _valid_bytes_buffer(
-        elem_type
-    )  # max bytes that are in range to be addressed from a buffer
+    valid_bytes = (
+        min(_valid_bytes_buffer(elem_type), valid_bytes_override)
+        if valid_bytes_override is not None
+        else _valid_bytes_buffer(elem_type)
+    )
     valid_bytes_constant = get_constant_attr(valid_bytes, uint64)
     valid_bytes_constant = arith_d.constant(uint64, valid_bytes_constant)
     stride_rank = len(strides)
@@ -502,6 +524,7 @@ def _create_vec_read_write(
         vector_type = value.type
 
     element_type = vector_type.element_type
+    valid_bytes_override = _static_memref_valid_bytes(mem, element_type)
     # Case 1: Generate load/stores with no mask and no offset
     if mask is None:
         offset_th = None
@@ -512,6 +535,20 @@ def _create_vec_read_write(
                 mem, start_indices_wg, start_indices_th, strides
             )
             mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+            # mem = _cast_buffer_and_encode_stride(
+            #     mem,
+            #     strides,
+            #     element_type,
+            #     emitter,
+            #     valid_bytes_override=valid_bytes_override,
+            # )
+        # elif is_global_mem and not is_read:
+        #     # Linearize global writes to fold workgroup offsets into the memref
+        #     # base pointer, preventing voffset overflow for >4GB output buffers.
+        #     # Skip _cast_buffer_and_encode_stride (no fat_raw_buffer needed).
+        #     mem, offset_th = _linearize_memref(
+        #         mem, start_indices_wg, start_indices_th, strides
+        #     )
         if linearize_shared_mem:
             mem = _linearize_shared_mem(mem)
             linearized_index = {
@@ -543,11 +580,23 @@ def _create_vec_read_write(
         offsets_vec_type, DenseElementsAttr.get(vals, offsets_vec_type)
     )
 
+    offset_th = None
     if buffer_ops_enabled:
         mem, offset_th = _linearize_memref(
             mem, start_indices_wg, start_indices_th, strides
         )
         mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+    #     mem = _cast_buffer_and_encode_stride(
+    #         mem,
+    #         strides,
+    #         element_type,
+    #         emitter,
+    #         valid_bytes_override=valid_bytes_override,
+    #     )
+    # elif is_global_mem and not is_read:
+    #     mem, offset_th = _linearize_memref(
+    #         mem, start_indices_wg, start_indices_th, strides
+    #     )
 
     indices = [offset_th] if buffer_ops_enabled else start_indices
 
@@ -1102,8 +1151,15 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         for s in strides
     ]
 
+    valid_bytes_override = _static_memref_valid_bytes(src, element_type)
     src, offset_th = _linearize_memref(src, src_index_wg, src_index_th, strides)
-    src = _cast_buffer_and_encode_stride(src, strides, element_type, emitter)
+    src = _cast_buffer_and_encode_stride(
+        src,
+        strides,
+        element_type,
+        emitter,
+        valid_bytes_override=valid_bytes_override,
+    )
 
     # We previously checked mask is same for all elements, so we can use
     # elements_per_thread=1 to build the mask.
@@ -1114,11 +1170,45 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         bounds=src_bounds,
         dynamic_values=src_dynamic_vals_map_start,
     )
+
+    # We previously checked mask is same for all elements, so we can use
+    # elements_per_thread=1 to build the mask.
+    mask = _build_mask(
+        emitter,
+        src_idx,
+        elements_per_thread=1,
+        bounds=src_bounds,
+        dynamic_values=src_dynamic_vals_map_start,
+    )
+    # # Add uniform (induction-variable) contribution as a separate SGPR offset.
+    # # Keeping it as a distinct arith.addi (VGPR + SGPR) lets the AMDGPU
+    # # backend's SIFoldOperands fold the SGPR into the buffer_load soffset.
+    # if src_index_iv is not None:
+    #     overflow_flags = arith_d.IntegerOverflowFlags.nsw
+    #     offset_iv = None
+    #     for iv_idx, stride in zip(src_index_iv, strides):
+    #         if isinstance(iv_idx, int):
+    #             iv_idx = arith_d.constant(IndexType.get(), iv_idx)
+    #         off = arith_d.muli(iv_idx, stride, overflow_flags=overflow_flags)
+    #         if offset_iv is None:
+    #             offset_iv = off
+    #         else:
+    #             offset_iv = arith_d.addi(offset_iv, off, overflow_flags=overflow_flags)
+    #     if offset_iv is not None and _get_constant_value(offset_iv) != 0:
+    #         offset_th = arith_d.addi(
+    #             offset_th, offset_iv, overflow_flags=overflow_flags
+    #         )
+
     if mask:
         mask = vector_d.extract(mask, static_position=[0], dynamic_position=[])
-        oob_index_value = _get_out_of_bounds_index(element_type)
-        oob_index = arith_d.constant(IndexType.get(), oob_index_value)
-        offset_th = arith_d.select(mask, offset_th, oob_index)
+        # For gather_to_lds (buffer_load_lds), use offset 0 instead of the
+        # standard OOB index.  The mask/select must happen AFTER the IV
+        # contribution is added to offset_th, so the select replaces the
+        # entire combined offset (thread + IV) with 0.  This prevents
+        # LLVM's SIFoldOperands from splitting the IV into soffset before
+        # the masking takes effect.
+        safe_index = arith_d.constant(IndexType.get(), 0)
+        offset_th = arith_d.select(mask, offset_th, safe_index)
 
     src_index = [offset_th]
 

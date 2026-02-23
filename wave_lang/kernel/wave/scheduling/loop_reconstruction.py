@@ -1,7 +1,6 @@
 from collections import defaultdict, deque
 from enum import Enum
 
-import sympy
 import torch.fx as fx
 
 from wave_lang.support.logging import get_logger
@@ -18,12 +17,10 @@ from ...ops.wave_ops import (
     NewRegister,
     Output,
     Placeholder,
-    Read,
     SchedulingGroupBarrier,
     TensorLoadToLDS,
     get_custom,
 )
-from ...lang.global_symbols import GLOBAL_ADDRESS_SPACE
 from ..constraints import Constraint
 from ..utils.general_utils import (
     get_induction_variable,
@@ -90,8 +87,13 @@ def update_node_index(
 
 
 def _is_global_prefetch_op(node: "CustomOp") -> bool:
-    if isinstance(node, Read):
-        return subs_idxc(node.memory_type.address_space) == GLOBAL_ADDRESS_SPACE
+    """Identify ops that need OOB protection in mfmas_in_kernel mode.
+
+    GatherToLDS/TensorLoadToLDS use src_bounds masking (offset → 0 on OOB).
+    Global Read ops (B data/scale) rely on fat_raw_buffer boundsCheck with
+    a 2GB NUM_RECORDS; this handles most shapes but may fault when OOB
+    accesses cross GPU page boundaries on very large tensors.
+    """
     return isinstance(node, (GatherToLDS, TensorLoadToLDS))
 
 
@@ -101,33 +103,35 @@ def _apply_prefetch_clamp_to_zero(
     current_induction_variable: IndexExpr,
     max_induction_variable: int | IndexExpr,
 ):
-    """Clamp prefetch-stage induction variable so it never exceeds valid K range.
+    """Set bounds on prefetch ops so the codegen masks OOB accesses.
 
-    On the last loop iteration(s), prefetch stages address K blocks beyond the
-    matrix.  We clamp the IV with sympy.Min which lowers to arith.minsi →
-    s_min_i32 (scalar).  The fetched data is never consumed so the exact value
-    is irrelevant — we just need a valid address.
+    On the last loop iterations, prefetch stages address K-blocks beyond the
+    matrix.  We set bounds (src_bounds for GatherToLDS, bounds for Read) on
+    dimensions that depend on the induction variable.  The existing codegen
+    then generates: offset = select(index < bound, real_offset, safe_offset)
+    The prefetched data is never consumed by compute, so the fallback value
+    is harmless.
     """
     if max_induction_variable is None:
         return
 
-    prefetch_offset = current_induction_variable - induction_variable
-    max_safe_iv = max_induction_variable - 1 - prefetch_offset
-    clamped_iv = sympy.Min(induction_variable, max_safe_iv)
-    subs = {induction_variable: clamped_iv}
-
-    if isinstance(node, Read):
-        if node.index:
-            node.index = update_index(node.index, subs)
-        return
-
     if isinstance(node, GatherToLDS):
-        if node.src_index:
-            node.update_arg("src_index", update_index(node.src_index, subs))
+        if node.src_bounds is not None:
+            return
+        src_idx = node.src_index
+        if not src_idx:
+            return
+        bounds = {}
+        for dim, seq in src_idx.items():
+            start = seq.start if isinstance(seq, IndexSequence) else seq
+            if start.has(induction_variable):
+                bounds[dim] = subs_idxc(dim)
+        if bounds:
+            node.update_arg("src_bounds", bounds)
         return
 
     if isinstance(node, TensorLoadToLDS) and node.global_tile_index:
-        node.update_arg("global_tile_index", update_index(node.global_tile_index, subs))
+        return
 
 
 def add_nodes_by_schedule(
@@ -962,9 +966,6 @@ def construct_pipelined_loop(
         get_custom(pipelined_reduction).subgraph_name, pipelined_reduction_graph
     )
     if mfmas_in_kernel:
-        # Keep all MFMA work in the kernel loop and skip drain-stage MFMAs.
-        # In this mode, callers consume loop-carried results directly via GetResult.
-        # pipelined_reduction is an fx.Node; iterate over its fx-level users.
         get_result_nodes = []
         for user_node in pipelined_reduction.users:
             custom_user = get_custom(user_node)

@@ -75,7 +75,7 @@ def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
         # =====================================================================
         # Create 2-stage pipeline (double buffering)
         # =====================================================================
-        pipeline_loop = tkw.pipeline(k_loop, mfmas_in_kernel=True)
+        pipeline_loop = tkw.pipeline(k_loop)
 
         with pipeline_loop as pl:
             # Stage 0: Global-to-shared prefetch via GatherToLDS (no fusion)

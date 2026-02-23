@@ -134,18 +134,23 @@ void KernelGenerator::emitMaterializedLiteral(
                   std::to_string(literalValue));
 
   llvm::SmallVector<std::string> operands;
+  bool isCndmask = (mnemonic == "v_cndmask_b32");
   for (Value result : op->getResults()) {
     operands.push_back(resolveValue(result));
   }
-  for (int i = 0; i < static_cast<int>(op->getNumOperands()); ++i) {
-    if (i == literalOperandIdx) {
+  int numOperands = static_cast<int>(op->getNumOperands());
+  for (int i = 0; i < numOperands; ++i) {
+    if (isCndmask && i == numOperands - 1) {
+      operands.push_back("vcc");
+    } else if (i == literalOperandIdx) {
       operands.push_back(scratchReg);
     } else {
       operands.push_back(resolveValue(op->getOperand(i)));
     }
   }
 
-  lines.push_back(formatter.format(mnemonic, operands));
+  std::string finalMnemonic = isCndmask ? "v_cndmask_b32_e64" : mnemonic.str();
+  lines.push_back(formatter.format(finalMnemonic, operands));
   peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
 }
 
