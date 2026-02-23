@@ -440,6 +440,38 @@ def _get_physical_start(
     return {dim: custom.index[dim].start for dim in symbolic_dims}
 
 
+def _hw_simplified_diff(raw_diff, ept):
+    """Fallback contiguity check: strip non-lane symbols and re-simplify.
+
+    For two reads from the same thread/wave/workgroup/iteration, all
+    symbols except the lane id ($T0 = threadIdx.x) contribute identical
+    offsets and cancel in the diff.  Substituting them to 0 isolates the
+    lane-dependent part, which the bounds-based simplifier can resolve.
+    """
+    free = raw_diff.free_symbols
+    if not free:
+        return None
+    _LANE_SYM = "$T0"
+    lane_sym = None
+    subs = {}
+    for s in free:
+        if s.name == _LANE_SYM:
+            lane_sym = s
+        else:
+            subs[s] = 0
+    if lane_sym is None:
+        return None
+    expr = raw_diff.subs(subs)
+    if expr.free_symbols - {lane_sym}:
+        return None
+    reduced = sym_simplify(expr)
+    if reduced == ept:
+        return 1
+    if reduced == -ept:
+        return -1
+    return None
+
+
 def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
     """Single merge pass: merge adjacent pairs of same-ept reads.
 
@@ -523,7 +555,17 @@ def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
                     lo_custom, hi_custom = custom2, custom1
                     lo_node, hi_node = node2, node1
                 else:
-                    continue
+                    direction = _hw_simplified_diff(raw_diff, ept)
+                    if direction is None:
+                        continue
+                    if direction == 1:
+                        lo_phys, hi_phys = phys1, phys2
+                        lo_custom, hi_custom = custom1, custom2
+                        lo_node, hi_node = node1, node2
+                    else:
+                        lo_phys, hi_phys = phys2, phys1
+                        lo_custom, hi_custom = custom2, custom1
+                        lo_node, hi_node = node2, node1
 
                 # Find dimension that advances by ept.
                 merge_dim = None
@@ -536,7 +578,20 @@ def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
                         merge_dim = None
                         break
                 if merge_dim is None:
-                    continue
+                    # Fallback: if flat diff proves adjacency, infer the
+                    # stride-1 dimension as merge_dim.  Safe when ept is
+                    # smaller than every non-unit stride (no row crossing).
+                    unit_dim = None
+                    min_other_stride = float("inf")
+                    for dim, stride in zip(symbolic_dims, strides):
+                        if stride == 1:
+                            unit_dim = dim
+                        elif isinstance(stride, int):
+                            min_other_stride = min(min_other_stride, stride)
+                    if unit_dim is not None and ept < min_other_stride:
+                        merge_dim = unit_dim
+                    else:
+                        continue
 
                 # Respect hardware vector width limit.
                 new_ept = 2 * ept
