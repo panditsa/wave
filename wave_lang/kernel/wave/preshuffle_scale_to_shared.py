@@ -41,6 +41,7 @@ import torch.fx as fx
 from wave_lang.support.logging import get_logger
 
 from .._support.indexing import IndexSequence
+from .._support.tracing import CapturedTrace
 from ..ops.wave_ops import (
     ExtractSlice,
     GatherToLDS,
@@ -48,11 +49,10 @@ from ..ops.wave_ops import (
     Write,
     get_custom,
 )
-from .._support.tracing import CapturedTrace
 from .constraints import Constraint
 from .utils.general_utils import (
-    infer_dim,
     get_hardware_constraint,
+    infer_dim,
     make_index_uniform_per_wave,
     remove_global_indexing,
     remove_thread_indexing,
@@ -129,8 +129,8 @@ def _create_wide_read_1d(
         ).add_to_graph(sample_read.graph, loc=sample_read.location)
         wide_custom = get_custom(wide_read_node)
         wide_custom.index = {
-            dim_0: IndexSequence(flat_start, 4, 1),
-            dim_1: IndexSequence(0, 1, 1),
+            dim_0: IndexSequence(0, 1, 1),
+            dim_1: IndexSequence(flat_start, 4, 1),
         }
         if hasattr(earliest_node, "vector_shapes"):
             wide_read_node.vector_shapes = deepcopy(earliest_node.vector_shapes)
@@ -409,8 +409,8 @@ def _transform_scale_memory(
     for info in read_infos:
         node, read, flat_lds, cbase = info
         read.index = {
-            dim_0: IndexSequence(flat_lds, 1, 1),
-            dim_1: IndexSequence(0, 1, 1),
+            dim_0: IndexSequence(0, 1, 1),
+            dim_1: IndexSequence(flat_lds, 1, 1),
         }
         if read.mapping is not None:
             read.update_arg("mapping", None)
