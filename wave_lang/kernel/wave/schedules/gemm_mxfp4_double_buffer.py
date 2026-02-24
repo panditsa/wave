@@ -1279,8 +1279,8 @@ def get_mxfp4_asymmetric_schedule():
             ),
         ]
 
-        clusters += epilogue_clusters_itr0
-        clusters += prologue_clusters
-        tkw.reorder_graph(pipeline_loop.EPILOGUE, clusters)
+        tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
+        tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
+        tkw.reorder_graph(pipeline_loop.EPILOGUE, epilogue_clusters_itr0)
 
     return mxfp4_dbuf_schedule

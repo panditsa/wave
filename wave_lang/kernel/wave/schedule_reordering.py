@@ -4,6 +4,7 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ from .utils.general_utils import (
 )
 from .utils.symbol_utils import subs_idxc
 from .utils.classes import AttentionOperationType, GemmOperationType
+
+logger = logging.getLogger(__name__)
 
 
 ##############################################################
@@ -244,6 +247,10 @@ def reorder_graph(graph, clusters):
 
     # Get location of where cluster start and end.
     original_cluster_nodes = prune_reordering_nodes(flattened_cluster)
+    original_cluster_node_set = set(original_cluster_nodes)
+    if not original_cluster_nodes:
+        logger.warning("reorder_graph: no cluster nodes found after pruning")
+        return None
     ordered_cluster = sorted(original_cluster_nodes)
     earliest_cluster_node = ordered_cluster[0]
     latest_cluster_node = ordered_cluster[-1]
@@ -257,6 +264,9 @@ def reorder_graph(graph, clusters):
     # Exhaustive clustered nodes
     exhaustive_cluster_nodes = [
         x for x in node_list if x >= earliest_cluster_node and x <= latest_cluster_node
+    ]
+    missing_from_clusters = [
+        n for n in exhaustive_cluster_nodes if n not in original_cluster_node_set
     ]
 
     reordered_original_nodes = topological_sort_with_dependencies(
@@ -272,6 +282,26 @@ def reorder_graph(graph, clusters):
     # Sometime this could be impacted if use_scheduling_barriers=True,
     # since we get an unexpected workgroup barrier.
     if len(node_list) != total_reordered_node:
+        if missing_from_clusters:
+            preview = ", ".join(
+                f"{get_custom(n).name}:{type(get_custom(n)).__name__}"
+                for n in missing_from_clusters[:8]
+            )
+            logger.warning(
+                "reorder_graph: in-range nodes missing from clusters (count=%d): %s",
+                len(missing_from_clusters),
+                preview,
+            )
+        logger.warning(
+            "reorder_graph: node-count mismatch "
+            "(orig=%d, pre=%d, clustered=%d, post=%d, total=%d, insertion_points=%d)",
+            len(node_list),
+            len(pre_cluster_nodes),
+            len(reordered_original_nodes),
+            len(post_cluster_nodes),
+            total_reordered_node,
+            sum(1 for n in flattened_cluster if isinstance(n, InsertionPoint)),
+        )
         return None
 
     insertion_points = [

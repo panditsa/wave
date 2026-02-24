@@ -510,7 +510,7 @@ def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
                 off2, phys2, custom2, node2 = read_infos[j]
 
                 # Check both orderings: i before j and j before i.
-                raw_diff = off2 - off1
+                raw_diff = subs_idxc(off2 - off1)
                 diff = sym_simplify(raw_diff)
                 if diff == ept:
                     lo_phys, hi_phys = phys1, phys2
@@ -526,7 +526,7 @@ def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
                 # Find dimension that advances by ept.
                 merge_dim = None
                 for dim in symbolic_dims:
-                    raw_d = hi_phys[dim] - lo_phys[dim]
+                    raw_d = subs_idxc(hi_phys[dim] - lo_phys[dim])
                     d = sym_simplify(raw_d)
                     if d == ept:
                         merge_dim = dim
