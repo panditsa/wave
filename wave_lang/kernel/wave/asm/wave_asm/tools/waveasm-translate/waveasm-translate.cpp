@@ -101,6 +101,11 @@ static llvm::cl::opt<bool> runBufferLoadStrengthReduction(
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
+    runLoopAddressPromotion("waveasm-loop-address-promotion",
+                            llvm::cl::desc("Run loop address promotion pass"),
+                            llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
     emitAssembly("emit-assembly",
                  llvm::cl::desc("Emit AMDGCN assembly instead of MLIR"),
                  llvm::cl::init(false));
@@ -258,6 +263,12 @@ int main(int argc, char **argv) {
     if (runScopedCSE) {
       pm.addPass(waveasm::createWAVEASMScopedCSEPass());
     }
+  }
+
+  // Loop address promotion: replace per-iteration v_add_u32 LDS address
+  // computation with precomputed rotating VGPR iter_args.
+  if (runLoopAddressPromotion) {
+    pm.addPass(waveasm::createWAVEASMLoopAddressPromotionPass());
   }
 
   // Register allocation must run before waitcnt/hazard so that those passes
