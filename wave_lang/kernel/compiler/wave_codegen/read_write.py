@@ -337,6 +337,32 @@ def _linearize_memref(
     )
 
 
+def _linearize_uniform_offset(
+    indices_iv: list[OpResult | int],
+    strides: list[Value],
+) -> Value | None:
+    """Linearize the uniform (induction-variable) index components.
+
+    Returns a single scalar offset suitable for the buffer_load soffset
+    field, or None if all components are zero.  Keeping the uniform part
+    as a separate arith.addi operand lets the backend fold it into the
+    SGPR soffset instead of emitting a VALU add.
+    """
+    overflow_flags = arith_d.IntegerOverflowFlags.nsw
+    offset = None
+    for iv_idx, stride in zip(indices_iv, strides):
+        if isinstance(iv_idx, int):
+            iv_idx = arith_d.constant(IndexType.get(), iv_idx)
+        off = arith_d.muli(iv_idx, stride, overflow_flags=overflow_flags)
+        if offset is None:
+            offset = off
+        else:
+            offset = arith_d.addi(offset, off, overflow_flags=overflow_flags)
+    if offset is not None and _get_constant_value(offset) == 0:
+        return None
+    return offset
+
+
 def _linearize_shared_mem(memory: CustomOp) -> Value:
     """
     Convert shared memory with statically shaped N-d memref into 1-D memref.
@@ -1125,9 +1151,10 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
 
     induction_vars = set(emitter.get_induction_vars_and_syms()[1])
 
-    # Three-way split: separate induction-variable (uniform) offsets from
-    # per-lane thread offsets so the backend can place the uniform part in
-    # the buffer-load soffset field instead of emitting a VALU add.
+    # Three-way split: separate induction-variable (uniform/SGPR)
+    # offsets from per-lane (VGPR) thread offsets.  Keeping them apart
+    # lets the backend fold the uniform part into buffer_load soffset
+    # and makes the loop-invariant thread offset visible for LICM.
     src_index_iv = None
     if induction_vars:
         src_index, src_index_wg, src_index_iv, src_index_th = _build_start_indices(
@@ -1170,23 +1197,13 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     src, offset_th = _linearize_memref(src, src_index_wg, src_index_th, strides)
     src = _cast_buffer_and_encode_stride(src, strides, element_type, emitter)
 
-    # Add uniform (induction-variable) contribution as a separate SGPR offset.
-    # Keeping it as a distinct arith.addi (VGPR + SGPR) lets the AMDGPU
-    # backend's SIFoldOperands fold the SGPR into the buffer_load soffset.
     if src_index_iv is not None:
-        overflow_flags = arith_d.IntegerOverflowFlags.nsw
-        offset_iv = None
-        for iv_idx, stride in zip(src_index_iv, strides):
-            if isinstance(iv_idx, int):
-                iv_idx = arith_d.constant(IndexType.get(), iv_idx)
-            off = arith_d.muli(iv_idx, stride, overflow_flags=overflow_flags)
-            if offset_iv is None:
-                offset_iv = off
-            else:
-                offset_iv = arith_d.addi(offset_iv, off, overflow_flags=overflow_flags)
-        if offset_iv is not None and _get_constant_value(offset_iv) != 0:
+        uniform_off = _linearize_uniform_offset(src_index_iv, strides)
+        if uniform_off is not None:
             offset_th = arith_d.addi(
-                offset_th, offset_iv, overflow_flags=overflow_flags
+                offset_th,
+                uniform_off,
+                overflow_flags=arith_d.IntegerOverflowFlags.nsw,
             )
 
     # We previously checked mask is same for all elements, so we can use
