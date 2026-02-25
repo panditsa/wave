@@ -20,8 +20,6 @@ from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm
 from wave_lang.kernel.wave.schedules import get_mxfp4_asymmetric_schedule
 from wave_lang.kernel.lang.global_symbols import GLOBAL_ADDRESS_SPACE
 
-DEBUG_FILE = "./buffer_optimization_debug.txt"
-
 
 @run_test
 def test_asymmetric_mxfp4_buffer_optimization():
@@ -51,9 +49,6 @@ def test_asymmetric_mxfp4_buffer_optimization():
     options.use_buffer_ops = True
 
     result = wave_compile(options, gemm, schedule)
-
-    with open(DEBUG_FILE, "w") as dbg:
-        dbg.write(result.asm)
 
     print(result.asm)
 
