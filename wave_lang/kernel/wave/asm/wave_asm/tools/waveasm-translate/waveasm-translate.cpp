@@ -1,4 +1,4 @@
-// Copyright 2025 The Wave Authors
+// Copyright 2026 The Wave Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -88,6 +88,16 @@ static llvm::cl::opt<bool>
     runPeephole("waveasm-peephole",
                 llvm::cl::desc("Run peephole optimizations"),
                 llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+    runLICM("waveasm-licm",
+            llvm::cl::desc("Hoist loop-invariant code out of loops"),
+            llvm::cl::init(false));
+
+static llvm::cl::opt<bool> runM0RedundancyElim(
+    "waveasm-m0-redundancy-elim",
+    llvm::cl::desc("Eliminate redundant M0 register writes"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<bool> runMemoryOffsetOpt(
     "waveasm-memory-offset-opt",
@@ -245,7 +255,7 @@ int main(int argc, char **argv) {
 
   // Peephole optimizations run after CSE but before waitcnt/hazard.
   if (runPeephole) {
-    pm.addPass(waveasm::createWAVEASMPeepholePass());
+    pm.addPass(waveasm::createWAVEASMPeephole());
   }
 
   // Eliminate BFE/LSHL_OR round-trips for B-scale iter_args.
@@ -253,6 +263,16 @@ int main(int argc, char **argv) {
   // loop address promotion (which modifies loop structure).
   if (runScalePackElimination) {
     pm.addPass(waveasm::createWAVEASMScalePackEliminationPass());
+  }
+
+  // LICM after peephole so fused ops (e.g. v_lshl_add_u32) get hoisted.
+  if (runLICM) {
+    pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+  }
+
+  // M0 redundancy elimination after LICM so hoisted M0 writes get cleaned up.
+  if (runM0RedundancyElim) {
+    pm.addPass(waveasm::createWAVEASMM0RedundancyElim());
   }
 
   // Strength-reduce buffer_load address computation in loops: precompute

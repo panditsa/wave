@@ -26,6 +26,7 @@ add_mlir_dialect_library(MLIRWaveASMTransforms
   RegionBuilder.cpp
   ScopedCSE.cpp
   Peephole.cpp
+  M0RedundancyElimination.cpp
   MemoryOffsetOptimization.cpp
   ScalePackElimination.cpp
   BufferLoadStrengthReduction.cpp

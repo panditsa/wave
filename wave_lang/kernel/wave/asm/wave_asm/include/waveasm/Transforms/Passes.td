@@ -1,4 +1,4 @@
-// Copyright 2025 The Wave Authors
+// Copyright 2026 The Wave Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -246,6 +246,37 @@ def WAVEASMEmitAssembly : Pass<"waveasm-emit-assembly"> {
     Option<"emitMetadata", "emit-metadata", "bool", "true",
            "Emit .amdgpu_metadata section">
   ];
+
+  let dependentDialects = ["::waveasm::WaveASMDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// Peephole Optimization Pass
+//===----------------------------------------------------------------------===//
+
+def WAVEASMPeephole : Pass<"waveasm-peephole"> {
+  let summary = "Local pattern-based peephole optimizations for WAVEASM IR";
+  let description = [{
+    Instruction fusion, strength reduction, constant folding, and redundant
+    move elimination.  All transformations are local rewrite patterns applied
+    via the greedy pattern rewrite driver.
+  }];
+
+  let dependentDialects = ["::waveasm::WaveASMDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// M0 Redundancy Elimination Pass
+//===----------------------------------------------------------------------===//
+
+def WAVEASMM0RedundancyElim : Pass<"waveasm-m0-redundancy-elim"> {
+  let summary = "Eliminate redundant M0 register writes";
+  let description = [{
+    Tracks the last s_mov_b32_m0 source value within each basic block and
+    erases writes that set M0 to the value it already holds.  Conservatively
+    resets tracking across region-bearing ops (loops, ifs) whose bodies may
+    clobber M0.
+  }];
 
   let dependentDialects = ["::waveasm::WaveASMDialect"];
 }

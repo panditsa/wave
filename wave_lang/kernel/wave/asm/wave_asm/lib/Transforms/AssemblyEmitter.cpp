@@ -1,4 +1,4 @@
-// Copyright 2025 The Wave Authors
+// Copyright 2026 The Wave Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -630,10 +630,19 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                       handled[j] = true;
                       break;
                     }
-                    assert(!((!pendingCopies[i].isSGPR) &&
-                             (!pendingCopies[j].isSGPR)) &&
-                           "VGPR swap cycles in iter_args are not supported; "
-                           "extend swap emission to handle VGPRs");
+                    assert(!pendingCopies[i].isSGPR &&
+                           !pendingCopies[j].isSGPR &&
+                           "mixed SGPR/VGPR swap not supported.");
+                    int64_t regA = pendingCopies[i].dst;
+                    int64_t regB = pendingCopies[j].dst;
+                    int64_t tmp = peakVGPRs;
+                    peakVGPRs = std::max(peakVGPRs, tmp + 1);
+                    os << "  v_mov_b32 v" << tmp << ", v" << regA << "\n";
+                    os << "  v_mov_b32 v" << regA << ", v" << regB << "\n";
+                    os << "  v_mov_b32 v" << regB << ", v" << tmp << "\n";
+                    handled[i] = true;
+                    handled[j] = true;
+                    break;
                   }
                 }
               }

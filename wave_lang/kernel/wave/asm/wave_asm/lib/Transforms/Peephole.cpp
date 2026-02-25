@@ -1,4 +1,4 @@
-// Copyright 2025 The Wave Authors
+// Copyright 2026 The Wave Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,10 +7,10 @@
 //===----------------------------------------------------------------------===//
 // Peephole Optimization Pass
 //
-// This pass implements peephole optimizations for WAVEASM IR:
-// 1. Instruction fusion: lshl + add -> v_mad_u32_u24
-// 2. Dead code elimination
-// 3. Redundant move elimination
+// This pass implements local pattern-based peephole optimizations for WAVEASM
+// IR: instruction fusion, strength reduction, constant folding, and redundant
+// move elimination.  Region-level optimizations (LICM, M0 redundancy) live in
+// their own passes.
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMDialect.h"
@@ -20,14 +20,17 @@
 #include "waveasm/Transforms/Utils.h"
 
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <limits>
+
+namespace waveasm {
+#define GEN_PASS_DEF_WAVEASMPEEPHOLE
+#include "waveasm/Transforms/Passes.h.inc"
+} // namespace waveasm
 
 using namespace mlir;
 using namespace waveasm;
@@ -127,9 +130,32 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
 
       int64_t shiftAmount = constOp.getValue();
 
-      // Shift amount must be non-negative and <= 31 for 32-bit operations
+      // Shift amount must be non-negative and <= 31 for 32-bit operations.
       if (shiftAmount < 0 || shiftAmount > 31)
         return failure();
+
+      // If the shifted base is scalar (SGPR) and the result feeds into a
+      // buffer_load_lds voffset chain, skip fusion — let the
+      // BufferLoadLDSSoffsetPattern extract the shift into soffset instead.
+      if (isSGPRType(lshlOp.getSrc1().getType())) {
+        auto isBufferLoadLDS = [](Operation *op) {
+          return isa<BUFFER_LOAD_DWORDX4_LDS, BUFFER_LOAD_DWORD_LDS>(op);
+        };
+        auto feedsBufferLoadLDS = [&](Value v) {
+          for (Operation *user : v.getUsers()) {
+            if (isBufferLoadLDS(user))
+              return true;
+            if (auto add = dyn_cast<V_ADD_U32>(user)) {
+              for (Operation *u2 : add.getResult().getUsers())
+                if (isBufferLoadLDS(u2))
+                  return true;
+            }
+          }
+          return false;
+        };
+        if (feedsBufferLoadLDS(addOp.getResult()))
+          return failure();
+      }
 
       auto loc = addOp.getLoc();
 
@@ -153,6 +179,153 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
       return success();
     if (succeeded(checkOperand(addOp.getSrc1(), addOp.getSrc0())))
       return success();
+
+    return failure();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: Extract SGPR shift from buffer_load_lds voffset into soffset.
+//
+// Matches:
+//   %shifted = v_lshlrev_b32 <const>, <sgpr>    ; single-use
+//   %combined = v_add_u32 %shifted, %vgpr_base  ; or reversed operands
+//   %final = v_add_u32 %combined, %row          ; (optional second add)
+//   buffer_load_dword[x4]_lds %final, %srd, 0
+//
+// Also matches when LshlAddPattern has already fused a VGPR shift+add,
+// burying the scalar shift as the addend of v_lshl_add_u32:
+//   %shifted = v_lshlrev_b32 <const>, <sgpr>    ; single-use
+//   %fused = v_lshl_add_u32 %vgpr, <const2>, %shifted
+//   %final = v_add_u32 %fused, %row
+//   buffer_load_dword[x4]_lds %final, %srd, %soff
+//
+// Rewrites to:
+//   %soff = s_lshl_b32 <sgpr>, <const>
+//   %voff = v_add_u32 %vgpr_base, %row          ; loop-invariant, hoistable
+//   buffer_load_dword[x4]_lds %voff, %srd, %soff
+//===----------------------------------------------------------------------===//
+
+template <typename BufferLoadOp>
+struct BufferLoadLDSSoffsetPattern : public OpRewritePattern<BufferLoadOp> {
+  using OpRewritePattern<BufferLoadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(BufferLoadOp loadOp,
+                                PatternRewriter &rewriter) const override {
+    // Only apply when soffset is currently 0.
+    auto soffsetConst =
+        loadOp.getSoffset().template getDefiningOp<ConstantOp>();
+    if (!soffsetConst || soffsetConst.getValue() != 0)
+      return failure();
+
+    Value voffset = loadOp.getVoffset();
+    auto outerAdd = voffset.template getDefiningOp<V_ADD_U32>();
+    if (!outerAdd)
+      return failure();
+
+    // Check if a value is V_LSHLREV_B32(const, sgpr) with one use.
+    auto extractScalarShift =
+        [](Value v) -> std::optional<std::pair<Value, Value>> {
+      auto lshl = v.getDefiningOp<V_LSHLREV_B32>();
+      if (!lshl || !lshl.getResult().hasOneUse())
+        return std::nullopt;
+      if (!lshl.getSrc0().getDefiningOp<ConstantOp>())
+        return std::nullopt;
+      if (!isSGPRType(lshl.getSrc1().getType()))
+        return std::nullopt;
+      // Return (base_sgpr, shift_amt_const).
+      return std::make_pair(lshl.getSrc1(), lshl.getSrc0());
+    };
+
+    // Try to find a scalar shift in an add's operands.
+    // Returns (base_sgpr, shift_amt, other_operand).
+    auto findShiftInAdd =
+        [&](V_ADD_U32 add) -> std::optional<std::tuple<Value, Value, Value>> {
+      for (int i = 0; i < 2; ++i) {
+        Value op = i == 0 ? add.getSrc0() : add.getSrc1();
+        Value other = i == 0 ? add.getSrc1() : add.getSrc0();
+        if (auto shift = extractScalarShift(op))
+          return std::make_tuple(shift->first, shift->second, other);
+      }
+      return std::nullopt;
+    };
+
+    Location loc = loadOp.getLoc();
+
+    // Return the i-th operand pair of outerAdd (commutative).
+    auto outerOperands = [&](int idx) -> std::pair<Value, Value> {
+      Value lhs = outerAdd.getSrc0(), rhs = outerAdd.getSrc1();
+      return idx == 0 ? std::make_pair(lhs, rhs) : std::make_pair(rhs, lhs);
+    };
+
+    // Case 1: voffset = V_ADD_U32(row, V_LSHLREV_B32(const, sgpr)).
+    if (auto found = findShiftInAdd(outerAdd)) {
+      auto [base, shiftAmt, other] = *found;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(other);
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
+
+    // Case 2: voffset = V_ADD_U32(row, V_ADD_U32(thread, V_LSHLREV(...))).
+    for (int i = 0; i < 2; ++i) {
+      auto [candidate, row] = outerOperands(i);
+      auto innerAdd = candidate.template getDefiningOp<V_ADD_U32>();
+      if (!innerAdd)
+        continue;
+      std::optional<std::tuple<Value, Value, Value>> found =
+          findShiftInAdd(innerAdd);
+      if (!found)
+        continue;
+
+      auto [base, shiftAmt, threadBase] = *found;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      // Rebuild voffset without the scalar shift: v_add_u32(threadBase, row).
+      auto newAdd = V_ADD_U32::create(
+          rewriter, loc, outerAdd.getResult().getType(), threadBase, row);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(newAdd);
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
+
+    // Case 3: v_lshl_add_u32(vgpr, const2, V_LSHLREV_B32(const, sgpr)).
+    // LshlAddPattern fused a VGPR shift+add, burying the SGPR shift as the
+    // addend of v_lshl_add_u32.
+    for (int i = 0; i < 2; ++i) {
+      auto [candidate, row] = outerOperands(i);
+      auto lshlAdd = candidate.template getDefiningOp<V_LSHL_ADD_U32>();
+      if (!lshlAdd)
+        continue;
+      // Check if src2 (the addend) is a scalar shift.
+      std::optional<std::pair<Value, Value>> shift =
+          extractScalarShift(lshlAdd.getSrc2());
+      if (!shift)
+        continue;
+
+      auto [base, shiftAmt] = *shift;
+      auto sLshl =
+          S_LSHL_B32::create(rewriter, loc, base.getType(), base, shiftAmt);
+      // Create v_lshl_add_u32(src0, src1, 0) — drop the scalar shift.
+      auto immType = rewriter.getType<ImmType>(0);
+      auto zeroConst = ConstantOp::create(rewriter, loc, immType, 0);
+      auto newLshlAdd = V_LSHL_ADD_U32::create(
+          rewriter, loc, lshlAdd.getResult().getType(), lshlAdd.getSrc0(),
+          lshlAdd.getSrc1(), zeroConst);
+      // Build new voffset: v_add_u32(newLshlAdd, row).
+      auto newAdd = V_ADD_U32::create(
+          rewriter, loc, outerAdd.getResult().getType(), newLshlAdd, row);
+      rewriter.modifyOpInPlace(loadOp, [&]() {
+        loadOp.getVoffsetMutable().assign(newAdd);
+        loadOp.getSoffsetMutable().assign(sLshl.getDst());
+      });
+      return success();
+    }
 
     return failure();
   }
@@ -781,32 +954,117 @@ struct FoldMovConstIntoAndPattern : public OpRewritePattern<V_AND_B32> {
 };
 
 //===----------------------------------------------------------------------===//
+// Pattern: BFE → pack identity elimination.
+//
+// Recognizes:
+//   v_lshl_or_b32(bfe(x,24,8), 24,
+//     v_lshl_or_b32(bfe(x,16,8), 16,
+//       v_lshl_or_b32(bfe(x,8,8), 8, bfe(x,0,8))))
+// All four BFEs extract consecutive bytes from the same source dword.
+// The pack reconstructs the original dword exactly, so replace with x.
+//===----------------------------------------------------------------------===//
+
+struct BFEPackIdentityPattern : public OpRewritePattern<V_LSHL_OR_B32> {
+  using OpRewritePattern<V_LSHL_OR_B32>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(V_LSHL_OR_B32 outerOp,
+                                PatternRewriter &rewriter) const override {
+    // Outer: v_lshl_or_b32(byte3, 24, middle_result).
+    std::optional<int64_t> shiftOuter = getConstantValue(outerOp.getSrc1());
+    if (!shiftOuter || *shiftOuter != 24)
+      return failure();
+
+    auto bfe3 = outerOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe3)
+      return failure();
+
+    // Middle: v_lshl_or_b32(byte2, 16, inner_result).
+    auto middleOp = outerOp.getSrc2().getDefiningOp<V_LSHL_OR_B32>();
+    if (!middleOp)
+      return failure();
+
+    std::optional<int64_t> shiftMiddle = getConstantValue(middleOp.getSrc1());
+    if (!shiftMiddle || *shiftMiddle != 16)
+      return failure();
+
+    auto bfe2 = middleOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe2)
+      return failure();
+
+    // Inner: v_lshl_or_b32(byte1, 8, byte0).
+    auto innerOp = middleOp.getSrc2().getDefiningOp<V_LSHL_OR_B32>();
+    if (!innerOp)
+      return failure();
+
+    std::optional<int64_t> shiftInner = getConstantValue(innerOp.getSrc1());
+    if (!shiftInner || *shiftInner != 8)
+      return failure();
+
+    auto bfe1 = innerOp.getSrc0().getDefiningOp<V_BFE_U32>();
+    if (!bfe1)
+      return failure();
+
+    auto bfe0 = innerOp.getSrc2().getDefiningOp<V_BFE_U32>();
+    if (!bfe0)
+      return failure();
+
+    // All 4 BFEs must extract from the same source with width 8.
+    auto checkBFE = [](V_BFE_U32 bfe,
+                       int64_t expectedOffset) -> std::optional<Value> {
+      std::optional<int64_t> width = getConstantValue(bfe.getSrc2());
+      if (!width || *width != 8)
+        return std::nullopt;
+      std::optional<int64_t> offset = getConstantValue(bfe.getSrc1());
+      if (!offset || *offset != expectedOffset)
+        return std::nullopt;
+      return bfe.getSrc0();
+    };
+
+    std::optional<Value> src0 = checkBFE(bfe0, 0);
+    std::optional<Value> src1 = checkBFE(bfe1, 8);
+    std::optional<Value> src2 = checkBFE(bfe2, 16);
+    std::optional<Value> src3 = checkBFE(bfe3, 24);
+
+    if (!src0 || !src1 || !src2 || !src3)
+      return failure();
+
+    // All must extract from the same source register.
+    if (*src0 != *src1 || *src0 != *src2 || *src0 != *src3)
+      return failure();
+
+    // The source must be a VGPR — replacing a VGPR result (from v_lshl_or_b32)
+    // with an SGPR or immediate would create a type mismatch for downstream
+    // users.
+    if (!isVGPRType(src0->getType()))
+      return failure();
+
+    // The packed result equals the original source dword.
+    rewriter.replaceOp(outerOp, *src0);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Peephole Optimization Pass
 //===----------------------------------------------------------------------===//
 
-struct PeepholePass
-    : public PassWrapper<PeepholePass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PeepholePass)
-
-  PeepholePass() = default;
-
-  StringRef getArgument() const override { return "waveasm-peephole"; }
-
-  StringRef getDescription() const override {
-    return "Peephole optimizations for WAVEASM IR";
-  }
+struct PeepholePass : public waveasm::impl::WAVEASMPeepholeBase<PeepholePass> {
+  using WAVEASMPeepholeBase::WAVEASMPeepholeBase;
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
-    MLIRContext *ctx = module.getContext();
+    Operation *op = getOperation();
+    MLIRContext *ctx = op->getContext();
 
     RewritePatternSet patterns(ctx);
 
-    // Add all peephole patterns
+    // Add all peephole patterns.
     patterns.add<
         // clang-format off
         AddNegToSubPattern,
         AddZeroPattern,
+        BFEPackIdentityPattern,
+        BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORD_LDS>,
+        BufferLoadLDSSoffsetPattern<BUFFER_LOAD_DWORDX4_LDS>,
         FoldMovConstIntoAddPattern,
         FoldMovConstIntoAndPattern,
         FoldMovConstIntoLshlPattern,
@@ -824,51 +1082,12 @@ struct PeepholePass
         // clang-format on
         >(ctx);
 
-    // Apply patterns greedily
-    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
+    // Apply patterns greedily.
+    if (failed(applyPatternsGreedily(op, std::move(patterns)))) {
       signalPassFailure();
       return;
     }
-
-    // After pattern-based optimizations, eliminate redundant M0 writes.
-    // Track the last M0 source value and skip writes that set M0 to the
-    // same value. This requires sequential analysis, not a rewrite pattern.
-    module.walk([](ProgramOp program) {
-      program.walk([](Block *block) {
-        Value lastM0Source;
-        SmallVector<Operation *, 8> toErase;
-
-        for (Operation &op : *block) {
-          auto m0Op = dyn_cast<S_MOV_B32_M0>(&op);
-          if (!m0Op)
-            continue;
-
-          if (m0Op->getNumOperands() < 1)
-            continue;
-
-          Value src = m0Op->getOperand(0);
-
-          // If M0 already holds this value, the write is redundant
-          if (src == lastM0Source) {
-            toErase.push_back(m0Op);
-          } else {
-            lastM0Source = src;
-          }
-        }
-
-        for (auto *op : toErase)
-          op->erase();
-      });
-    });
   }
 };
 
 } // namespace
-
-namespace waveasm {
-
-std::unique_ptr<mlir::Pass> createWAVEASMPeepholePass() {
-  return std::make_unique<PeepholePass>();
-}
-
-} // namespace waveasm
