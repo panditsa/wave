@@ -333,7 +333,7 @@ def compute_multi_buffer_count(
             node_to_buffer[node] = shared_memory_operand
 
     if not multi_buffer_count:
-        result = optimize_buffer_counts(result, graph, node_to_buffer)
+        result = optimize_buffer_counts(result, node_to_buffer)
 
     return result
 
