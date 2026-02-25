@@ -20,6 +20,8 @@ from ...ops.wave_ops import (
     get_custom,
 )
 
+from .post_scheduling_buffer_opt import optimize_buffer_counts
+
 logger = get_logger("wave.scheduling.loop_reconstruction_utils")
 
 
@@ -300,6 +302,7 @@ def compute_multi_buffer_count(
     """
     lifetime: dict[fx.Node, int] = compute_lifetime(graph, use_absolute_cycle=True)
     result: dict[fx.Node, int] = defaultdict(int)
+    node_to_buffer: dict[fx.Node, fx.Node] = {}
     for node in graph.nodes:
         if not isinstance(get_custom(node), (Write, GatherToLDS, TensorLoadToLDS)):
             continue
@@ -327,6 +330,10 @@ def compute_multi_buffer_count(
             result[shared_memory_operand] = max(
                 result[shared_memory_operand], buffer_count
             )
+            node_to_buffer[node] = shared_memory_operand
+
+    if not multi_buffer_count:
+        result = optimize_buffer_counts(result, graph, node_to_buffer)
 
     return result
 
