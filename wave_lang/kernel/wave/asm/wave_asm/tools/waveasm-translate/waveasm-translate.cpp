@@ -98,6 +98,7 @@ static llvm::cl::opt<bool> runMemoryOffsetOpt(
 static llvm::cl::opt<bool> runBufferLoadStrengthReduction(
     "waveasm-buffer-load-strength-reduction",
     llvm::cl::desc("Run buffer load strength reduction pass"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<bool> disableLoopAddressPromotion(
     "waveasm-loop-address-promotion-disable",
