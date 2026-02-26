@@ -7,8 +7,6 @@ mlir operations of wave and other dialects.
 """
 
 from __future__ import annotations
-import argparse
-import dill
 import sys
 import torch.fx as fx
 from pathlib import Path
@@ -49,6 +47,7 @@ from wave_lang.kernel.wave.mlir_converter.diagnostics import (
     WaterDiagTestingMode,
     WaterError,
 )
+from wave_lang.kernel.wave.mlir_converter import dill_util
 from wave_lang.support.location_config import LocationCaptureLevel
 from wave_lang.kernel.lang.wave_types import Memory, Register, IndexMapping
 from wave_lang.kernel.lang.kernel_buffer import AddressSpace
@@ -155,6 +154,7 @@ try:
 except Exception as e:
     print(f"FATAL: failed to import water_mlir: {e}", file=sys.stderr)
     sys.exit(1)
+
 
 # Mapping from tkw_op_name to actual op constructors
 WAVE_OP_CONSTRUCTORS = {
@@ -292,51 +292,6 @@ def _type_to_wave_mlir(
             ctx, type_.symbolic_shape, type_.dtype, address_space_attr
         )
     raise RuntimeError(f"Unsupported wave type for MLIR conversion: {type_}")
-
-
-def _parse_input() -> tuple[CapturedTrace, list[Constraint], WaveCompileOptions, str]:
-    """Parses and returns the pickled trace, options, and pipeline from stdin.
-
-    The input is expected to be a dill-serialized dict with keys:
-    - "trace": CapturedTrace object
-    - "constraints": list[Constraint]
-    - "options": WaveCompileOptions
-    - "pipeline": A string containing the transform dialect pass pipeline
-
-    Restores supplemental fx.Node fields (e.g., .type) from node.meta.
-    """
-    try:
-        unpickled = dill.loads(sys.stdin.buffer.read())
-    except Exception as e:
-        raise SystemExit(f"FATAL: failed to unpickle: {e}")
-    trace = unpickled.get("trace") if isinstance(unpickled, dict) else None
-    constraints = unpickled.get("constraints") if isinstance(unpickled, dict) else None
-    options = unpickled.get("options") if isinstance(unpickled, dict) else None
-    pipeline = unpickled.get("pipeline") if isinstance(unpickled, dict) else None
-
-    if not isinstance(trace, CapturedTrace):
-        raise SystemExit(
-            f"FATAL: unpickled object is not CapturedTrace (got {type(trace)})"
-        )
-
-    if not isinstance(constraints, list) or not all(
-        isinstance(c, Constraint) for c in constraints
-    ):
-        raise SystemExit(
-            f"FATAL: unpickled object is not list of Constraints (got {type(constraints)})"
-        )
-
-    if not isinstance(options, WaveCompileOptions):
-        raise SystemExit(
-            f"FATAL: unpickled object is not WaveCompileOptions (got {type(options)})"
-        )
-
-    if not isinstance(pipeline, str):
-        raise SystemExit(f"FATAL: unpickled object is not str (got {type(pipeline)})")
-
-    # Restore supplemental node fields captured in the meta field
-    trace.restore_node_state()
-    return trace, constraints, options, pipeline
 
 
 def _convert_sympy_expr_to_affine_map(
@@ -1100,24 +1055,6 @@ def diagnostic_from_mlir_error(e: ir.MLIRError) -> list[MLIRDiagnostic]:
     return diagnostics
 
 
-def _flush_output(
-    module_str: str,
-    diagnostics: list[MLIRDiagnostic | WaterError],
-    inferred_attributes: dict[str, dict[str, Any]] | None = None,
-) -> None:
-    output = dill.dumps(
-        {
-            "diagnostics": diagnostics,
-            "module": module_str.encode("utf-8"),
-            "inferred_attributes": (
-                inferred_attributes if inferred_attributes is not None else {}
-            ),
-        }
-    )
-    sys.stdout.buffer.write(output)
-    sys.stdout.flush()
-
-
 def _create_kernel_module(
     ctx: ir.Context,
     trace: CapturedTrace,
@@ -1299,15 +1236,17 @@ _INTERNAL_WATER_ID_ATTR_NAME = "_water_internal.id"
 _INTERNAL_RESULT_WATER_IRS_ATTR_NAME = "_water_internal.result_ids"
 
 
-def _emit_from_captured_trace(
+def _build_response(
     trace: CapturedTrace,
     constraints: list[Constraint],
     options: WaveCompileOptions,
     pipeline: str = "",
-    *,
     test_diagnostics: WaterDiagTestingMode = WaterDiagTestingMode.NO,
-) -> int:
+) -> bytes:
+    """Core conversion logic that returns the dill-serialized response bytes.
 
+    Shared between single-shot mode and server mode.
+    """
     diagnostics: list[MLIRDiagnostic | WaterError] = []
 
     def diagnostics_handler(d):
@@ -1342,8 +1281,7 @@ def _emit_from_captured_trace(
         if creation_diagnostics:
             diagnostics.extend(creation_diagnostics)
         if module is None:
-            _flush_output("", diagnostics, None)
-            return 0
+            return _serialize_response("", diagnostics, None)
 
         # Verify the module before transforming or printing. Note that the call
         # to explicit `verify` registers its own diagnostic handler and raises
@@ -1355,14 +1293,13 @@ def _emit_from_captured_trace(
             diagnostics.extend(diagnostic_from_mlir_error(e))
             # Print in generic form if verification fails, this form should be
             # robust to that.
-            _flush_output(
+            return _serialize_response(
                 module.operation.get_asm(
                     enable_debug_info=enable_debug_info, print_generic_op_form=True
                 ),
                 diagnostics,
                 None,
             )
-            return 0
 
         if options.print_mlir_before_water:
             print(module.operation.get_asm(), file=sys.stderr)
@@ -1379,7 +1316,8 @@ def _emit_from_captured_trace(
                 # Require the first op to be a named sequence.
                 if entry_op.operation.name != "transform.named_sequence":
                     raise RuntimeError(
-                        f'Expected first op to be "transform.named_sequence", got "{entry_op.operation.name}"'
+                        f'Expected first op to be "transform.named_sequence", '
+                        f'got "{entry_op.operation.name}"'
                     )
                 interpreter.apply_named_sequence(
                     module,
@@ -1455,29 +1393,92 @@ def _emit_from_captured_trace(
                     raise RuntimeError(f"Index not inferred for water id {water_id}.")
 
         module_str = module.operation.get_asm(enable_debug_info=enable_debug_info)
-        _flush_output(module_str, diagnostics, inferred_attributes)
-    return 0
+        return _serialize_response(module_str, diagnostics, inferred_attributes)
+
+
+def _serialize_response(
+    module_str: str,
+    diagnostics: list[MLIRDiagnostic | WaterError],
+    inferred_attributes: dict[str, dict[str, Any]] | None = None,
+) -> bytes:
+    return dill_util.dumps(
+        {
+            "diagnostics": diagnostics,
+            "module": module_str.encode("utf-8"),
+            "inferred_attributes": (
+                inferred_attributes if inferred_attributes is not None else {}
+            ),
+        }
+    )
+
+
+def _server_mode() -> None:
+    """Run as a persistent server, reading length-prefixed requests from stdin.
+
+    Instead of spawning a fresh process per request (which costs ~2 s in
+    module imports each time), the parent keeps this process alive and
+    sends multiple requests over the same stdin/stdout pipes.
+
+    Each request payload is a dill-serialized dict with the same keys as
+    in single-shot mode (trace, constraints, options, pipeline, ...).
+    Each response payload is a dill-serialized dict with keys
+    `diagnostics`, `module`, and `inferred_attributes`.
+
+    The loop exits when stdin is closed (EOF on the length header), i.e.
+    when the parent closes its end of the pipe.
+    """
+    from wave_lang.kernel.wave.mlir_converter.protocol import (
+        recv_message,
+        send_message,
+    )
+
+    while True:
+        try:
+            raw_request = recv_message(sys.stdin.buffer)
+        except EOFError:
+            break  # Parent closed stdin, clean shutdown.
+        except ConnectionError as e:
+            # The parent likely crashed mid-write. The response pipe is
+            # broken so we can't send a diagnostic back, stderr is
+            # best-effort.
+            print(f"WARNING: {e}", file=sys.stderr)
+            break
+
+        try:
+            request = dill_util.loads(raw_request)
+        except Exception as e:
+            response_data = _serialize_response(
+                "", [WaterError(message=f"Failed to unpickle request: {e}")], None
+            )
+            send_message(sys.stdout.buffer, response_data)
+            continue
+
+        trace = request.get("trace")
+        constraints = request.get("constraints", [])
+        options = request.get("options", WaveCompileOptions())
+        pipeline = request.get("pipeline", "")
+        test_diags = request.get("test_diagnostic_emission", WaterDiagTestingMode.NO)
+
+        if not isinstance(trace, CapturedTrace):
+            response_data = _serialize_response(
+                "",
+                [WaterError(message=f"Expected CapturedTrace, got {type(trace)}")],
+                None,
+            )
+            send_message(sys.stdout.buffer, response_data)
+            continue
+
+        trace.restore_node_state()
+
+        try:
+            response_data = _build_response(
+                trace, constraints, options, pipeline, test_diags
+            )
+        except Exception as e:
+            response_data = _serialize_response("", [WaterError(message=str(e))], None)
+
+        send_message(sys.stdout.buffer, response_data)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Water dialect emitter")
-
-    parser.add_argument(
-        "--test-diagnostic-emission",
-        choices=[m.value for m in WaterDiagTestingMode],
-        default=WaterDiagTestingMode.NO.value,
-        help="Test diagnostic serialization and deserialization through stdin and stdout",
-    )
-
-    args = parser.parse_args()
-
-    trace, constraints, options, pass_pipeline = _parse_input()
-    sys.exit(
-        _emit_from_captured_trace(
-            trace,
-            constraints,
-            options,
-            pass_pipeline,
-            test_diagnostics=WaterDiagTestingMode(args.test_diagnostic_emission),
-        )
-    )
+    _server_mode()

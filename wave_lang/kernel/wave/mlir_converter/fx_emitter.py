@@ -12,7 +12,11 @@ from typing import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import dill
+from wave_lang.kernel.wave.mlir_converter import dill_util
+from wave_lang.kernel.wave.mlir_converter.protocol import (
+    recv_message,
+    send_message,
+)
 
 if __name__ == "__main__":
     # Add parent directory to sys.path to enable relative imports when running standalone.
@@ -66,7 +70,7 @@ from wave_lang.kernel.wave.constraints import (
     DeviceConstraint,
     HardwareConstraint,
 )
-from wave_lang.kernel.wave.mlir_converter.diagnostics import MLIRDiagnostic
+from wave_lang.kernel.wave.mlir_converter.diagnostics import MLIRDiagnostic, WaterError
 from wave_lang.kernel.wave.mlir_converter.mlir_converter import FxEmitterResponse
 from wave_lang.kernel.wave.mlir_converter.water_emitter import serialize_location
 from wave_lang.kernel.wave.utils.symbol_utils import get_induction_symbol
@@ -515,7 +519,7 @@ class _OpParseContext:
         return self.value_map[value]
 
     def add_mapping(self, mlir_value: ir.Value, fx_node: fx.Node | int | float) -> None:
-        """Add MLIR value → FX node mapping."""
+        """Add MLIR value -> FX node mapping."""
         assert (
             mlir_value not in self.value_map
         ), f"Duplicate mapping for MLIR value: {mlir_value}"
@@ -809,8 +813,8 @@ def _handle_iterate_op(op: IterateOp, parse_ctx: _OpParseContext) -> None:
     iter_count = len(init_args)
 
     # Create a local scope for the iterate body.
-    # - IterArg block arguments → new IterArg placeholder nodes in subgraph
-    # - Capture block arguments → mapped directly to outer values (no placeholders)
+    # - IterArg block arguments -> new IterArg placeholder nodes in subgraph
+    # - Capture block arguments -> mapped directly to outer values (no placeholders)
     local_map: dict[ir.Value, fx.Node | int | float] = {}
 
     # Map iter args to new placeholder nodes in the subgraph
@@ -1041,20 +1045,8 @@ def convert_mlir_to_trace(
         return trace, constraints, options, diagnostics
 
 
-if __name__ == "__main__":
-    try:
-        request = dill.loads(sys.stdin.buffer.read())
-    except Exception as e:
-        sys.stderr.write(f"FATAL: failed to unpickle input: {e}\n")
-        sys.exit(1)
-
-    mlir_text = request.get("mlir") if isinstance(request, dict) else None
-    if not isinstance(mlir_text, str):
-        sys.stderr.write(
-            f"FATAL: expected 'mlir' string in request, got: {type(mlir_text)}\n"
-        )
-        sys.exit(1)
-
+def _process_single_request(mlir_text: str) -> bytes:
+    """Process one MLIR-to-FX request and return dill-serialized response bytes."""
     response = FxEmitterResponse()
     try:
         trace, constraints, options, diagnostics = convert_mlir_to_trace(mlir_text)
@@ -1067,14 +1059,61 @@ if __name__ == "__main__":
             options=options,
             diagnostics=diagnostics,
         )
-        sys.stdout.buffer.write(dill.dumps(response))
-        sys.stdout.flush()
-        sys.exit(0)
     except Exception as e:
-        response.diagnostics.append(MLIRDiagnostic(message=str(e), severity="ERROR"))
+        response.diagnostics.append(WaterError(message=str(e)))
+    return dill_util.dumps(response)
+
+
+def _server_mode() -> None:
+    """Run as a persistent server, reading length-prefixed requests from stdin.
+
+    Instead of spawning a fresh process per request, the parent keeps this
+    process alive and sends multiple requests over the same stdin/stdout pipes.
+
+    Each request payload is a dill-serialized dict with an `"mlir"` key.
+    Each response payload is a dill-serialized `FxEmitterResponse`.
+
+    The loop exits when stdin is closed (EOF on the length header), i.e.
+    when the parent closes its end of the pipe.
+    """
+
+    while True:
         try:
-            sys.stdout.buffer.write(dill.dumps(response))
-            sys.stdout.flush()
-        finally:
-            sys.stderr.write(f"FATAL: fx_emitter failed: {e}\n")
-            sys.exit(1)
+            raw_request = recv_message(sys.stdin.buffer)
+        except EOFError:
+            break  # Parent closed stdin, clean shutdown.
+        except ConnectionError as e:
+            # The parent likely crashed mid-write. The response pipe is
+            # broken so we can't send a diagnostic back, stderr is
+            # best-effort.
+            print(f"WARNING: {e}", file=sys.stderr)
+            break
+
+        try:
+            request = dill_util.loads(raw_request)
+        except Exception as e:
+            response = FxEmitterResponse()
+            response.diagnostics.append(
+                WaterError(message=f"Failed to unpickle request: {e}")
+            )
+            send_message(sys.stdout.buffer, dill_util.dumps(response))
+            continue
+
+        mlir_text = request.get("mlir") if isinstance(request, dict) else None
+        if not isinstance(mlir_text, str):
+            response = FxEmitterResponse()
+            response.diagnostics.append(
+                WaterError(
+                    message=f"Expected 'mlir' string in request, got: {type(mlir_text)}"
+                )
+            )
+            send_message(sys.stdout.buffer, dill_util.dumps(response))
+            continue
+
+        response_data = _process_single_request(mlir_text)
+
+        send_message(sys.stdout.buffer, response_data)
+
+
+if __name__ == "__main__":
+    _server_mode()
