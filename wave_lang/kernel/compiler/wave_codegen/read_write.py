@@ -554,6 +554,7 @@ def _create_vec_read_write(
         offsets_vec_type, DenseElementsAttr.get(vals, offsets_vec_type)
     )
 
+    offset_th = None
     if buffer_ops_enabled:
         mem, offset_th = _linearize_memref(
             mem, start_indices_wg, start_indices_th, strides
