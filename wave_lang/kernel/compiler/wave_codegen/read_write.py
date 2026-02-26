@@ -194,10 +194,7 @@ def _build_start_indices(
     src_indices: dict[IndexExpr, IndexSequence | IndexExpr],
     dynamic_values: dict[IndexExpr, Any] = {},
     uniform_syms: set | None = None,
-) -> (
-    tuple[list[OpResult], list[OpResult], list[OpResult]]
-    | tuple[list[OpResult], list[OpResult], list[OpResult], list[OpResult]]
-):
+) -> tuple[list[OpResult], list[OpResult], list[OpResult] | None, list[OpResult]]:
     start_indices = _get_start_indices(src_indices)
     subs = add_emitter_subs(emitter, dynamic_values)
     indices = [gen_sympy_index(subs, i) for i in start_indices]
@@ -212,7 +209,7 @@ def _build_start_indices(
     split_indices = [_split_index(i) for i in start_indices]
     indices_wg = [gen_sympy_index(subs, i[0]) for i in split_indices]
     indices_th = [gen_sympy_index(subs, i[1]) for i in split_indices]
-    return indices, indices_wg, indices_th
+    return indices, indices_wg, None, indices_th
 
 
 def _get_symbolic_shape(node: fx.Node) -> tuple[IndexExpr]:
@@ -358,8 +355,10 @@ def _linearize_uniform_offset(
             offset = off
         else:
             offset = arith_d.addi(offset, off, overflow_flags=overflow_flags)
-    if offset is not None and _get_constant_value(offset) == 0:
-        return None
+    if offset is not None:
+        cv = _get_constant_value(offset)
+        if cv is not None and cv == 0:
+            return None
     return offset
 
 
@@ -596,7 +595,7 @@ def _create_vec_read_write(
             linearized_index = {
                 "linearized_idx": linearize_index(node_index, stride_values)
             }
-            start_indices, _, _ = _build_start_indices(emitter, linearized_index)
+            start_indices, _, _, _ = _build_start_indices(emitter, linearized_index)
 
         indices = [offset_th] if buffer_ops_enabled else start_indices
         if is_read:
@@ -790,7 +789,7 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     else:
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    start_indices, start_indices_wg, start_indices_th = _build_start_indices(
+    start_indices, start_indices_wg, _, start_indices_th = _build_start_indices(
         emitter, index, dynamic_vals_map_start
     )
 
@@ -881,7 +880,7 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
     else:
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    start_indices, start_indices_wg, start_indices_th = _build_start_indices(
+    start_indices, start_indices_wg, _, start_indices_th = _build_start_indices(
         emitter, index, dynamic_vals_map_start
     )
 
@@ -986,7 +985,7 @@ def handle_tensor_load_to_lds(emitter: WaveEmitter, node: fx.Node):
         global_value = global_mem.ir_value
         shared_value = shared_mem.ir_value
 
-        index, _, _ = _build_start_indices(emitter, global_tile_index_current)
+        index, _, _, _ = _build_start_indices(emitter, global_tile_index_current)
 
         shared_tile_index_current = {k: shared_tile_index[k] for k in symbolic_shape}
         shared_tile_index_current = _subs_index_dict(
@@ -994,7 +993,7 @@ def handle_tensor_load_to_lds(emitter: WaveEmitter, node: fx.Node):
         )
 
         # Calculate shared memory offset from tile indices
-        shared_index, _, _ = _build_start_indices(emitter, shared_tile_index_current)
+        shared_index, _, _, _ = _build_start_indices(emitter, shared_tile_index_current)
         shared_index = [assume_index_subgroup_uniform(idx, i32) for idx in shared_index]
 
         base = amdgpu_d.make_dma_base(
@@ -1155,18 +1154,12 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     # offsets from per-lane (VGPR) thread offsets.  Keeping them apart
     # lets the backend fold the uniform part into buffer_load soffset
     # and makes the loop-invariant thread offset visible for LICM.
-    src_index_iv = None
-    if induction_vars:
-        src_index, src_index_wg, src_index_iv, src_index_th = _build_start_indices(
-            emitter,
-            new_src_idx,
-            src_dynamic_vals_map_start,
-            uniform_syms=induction_vars,
-        )
-    else:
-        src_index, src_index_wg, src_index_th = _build_start_indices(
-            emitter, new_src_idx, src_dynamic_vals_map_start
-        )
+    src_index, src_index_wg, src_index_iv, src_index_th = _build_start_indices(
+        emitter,
+        new_src_idx,
+        src_dynamic_vals_map_start,
+        uniform_syms=induction_vars if induction_vars else None,
+    )
 
     ip = InsertionPoint.current
 
@@ -1179,7 +1172,7 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
             ip = InsertionPoint(ip.block.owner)
 
     with ip:
-        dst_index, _, _ = _build_start_indices(
+        dst_index, _, _, _ = _build_start_indices(
             emitter, dst_idx, dst_dynamic_vals_map_start
         )
         # We are indexing shared mem so i32 is enough.
@@ -1273,7 +1266,7 @@ def _handle_scatter_op(
         )
         mask = _constant_mask(mask_vec_type)
 
-    start_indices, start_indices_wg, start_indices_th = _build_start_indices(
+    start_indices, start_indices_wg, _, start_indices_th = _build_start_indices(
         emitter, result_index
     )
 
