@@ -46,6 +46,7 @@ from wave_lang.kernel.wave.mlir_converter.diagnostics import (
     LocationFrame,
     MLIRDiagnostic,
     NameLocation,
+    WaterDiagTestingMode,
     WaterError,
 )
 from wave_lang.support.location_config import LocationCaptureLevel
@@ -1067,6 +1068,38 @@ def serialize_location(loc: ir.Location) -> list[LocationFrame]:
     return _collect_frames(loc)
 
 
+def diagnostic_from_mlir_error(e: ir.MLIRError) -> list[MLIRDiagnostic]:
+    """Convert an MLIR exception into a list of Wave-compatible diagnostics.
+
+    Each note is added as a separate diagnostic. If it has the same location as
+    the previous diagnostic, the location is omitted.
+    """
+    diagnostics = []
+    for d in e.error_diagnostics:
+        diagnostics.append(
+            MLIRDiagnostic(
+                message=d.message,
+                severity=d.severity.name,
+                location=serialize_location(d.location),
+            )
+        )
+        previous_location = d.location
+        for n in d.notes:
+            diagnostics.append(
+                MLIRDiagnostic(
+                    message=n.message,
+                    severity=n.severity.name,
+                    location=(
+                        serialize_location(n.location)
+                        if n.location != previous_location
+                        else []
+                    ),
+                )
+            )
+            previous_location = n.location
+    return diagnostics
+
+
 def _flush_output(
     module_str: str,
     diagnostics: list[MLIRDiagnostic | WaterError],
@@ -1090,7 +1123,8 @@ def _create_kernel_module(
     trace: CapturedTrace,
     constraints: list[Constraint],
     options: WaveCompileOptions,
-    test_diagnostics: bool = False,
+    *,
+    test_diagnostics: WaterDiagTestingMode = WaterDiagTestingMode.NO,
 ) -> tuple[ir.Module | None, list[MLIRDiagnostic | WaterError], set[str] | None]:
     """Creates an MLIR module containing the kernel function from the captured trace.
 
@@ -1114,7 +1148,7 @@ def _create_kernel_module(
         try:
             module = ir.Module.parse(options.override_mlir, context=ctx)
         except ir.MLIRError as e:
-            diagnostics.append(WaterError(message=e.message))
+            diagnostics.extend(diagnostic_from_mlir_error(e))
             return None, diagnostics, known_ids
         else:
             return module, diagnostics, known_ids
@@ -1125,9 +1159,30 @@ def _create_kernel_module(
 
     module = ir.Module.create()
 
-    if test_diagnostics:
-        loc = ir.Location.current
+    if test_diagnostics == WaterDiagTestingMode.DIRECT:
+        # A suitable location is the first non-placeholder op (placeholders use
+        # "name" locations that are near-useless).
+        candidates = trace.walk(
+            lambda n: not isinstance(get_custom(n), Placeholder)
+            and get_custom(n).location
+        )
+        loc = candidates[0].location.to_water() if candidates else ir.Location.current
         loc.emit_error("test error")
+        return module, None, None
+
+    # Having a duplicate function name in the module is very likely to remain a
+    # verifier error for the observable future. If that is not the case,
+    # programmatically construct other IR that causes verification failure so we
+    # can exercise the diagnostic reporting mechanism.
+    if test_diagnostics == WaterDiagTestingMode.VERIFIER:
+        with ir.InsertionPoint(module.body):
+            func.FuncOp(
+                "repeated_name", ir.FunctionType.get([], []), visibility="private"
+            )
+            func.FuncOp(
+                "repeated_name", ir.FunctionType.get([], []), visibility="private"
+            )
+        return module, None, None
 
     # Collect placeholders from graph
     placeholders = [n for n in trace.walk() if getattr(n, "op", "") == "placeholder"]
@@ -1249,7 +1304,8 @@ def _emit_from_captured_trace(
     constraints: list[Constraint],
     options: WaveCompileOptions,
     pipeline: str = "",
-    test_diagnostics=False,
+    *,
+    test_diagnostics: WaterDiagTestingMode = WaterDiagTestingMode.NO,
 ) -> int:
 
     diagnostics: list[MLIRDiagnostic | WaterError] = []
@@ -1281,18 +1337,22 @@ def _emit_from_captured_trace(
         wave.register_passes()
 
         module, creation_diagnostics, known_ids = _create_kernel_module(
-            ctx, trace, constraints, options, test_diagnostics
+            ctx, trace, constraints, options, test_diagnostics=test_diagnostics
         )
-        diagnostics += creation_diagnostics
+        if creation_diagnostics:
+            diagnostics.extend(creation_diagnostics)
         if module is None:
             _flush_output("", diagnostics, None)
             return 0
 
-        # Verify the module before transforming or printing.
+        # Verify the module before transforming or printing. Note that the call
+        # to explicit `verify` registers its own diagnostic handler and raises
+        # an exception instead of going through the handler we registered.
+        # Therefore we need to manually unpack the exception into `diagnostics`.
         try:
             module.operation.verify()
         except ir.MLIRError as e:
-            diagnostics.append(WaterError(message=e.message))
+            diagnostics.extend(diagnostic_from_mlir_error(e))
             # Print in generic form if verification fails, this form should be
             # robust to that.
             _flush_output(
@@ -1404,7 +1464,8 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--test-diagnostic-emission",
-        action="store_true",
+        choices=[m.value for m in WaterDiagTestingMode],
+        default=WaterDiagTestingMode.NO.value,
         help="Test diagnostic serialization and deserialization through stdin and stdout",
     )
 
@@ -1413,6 +1474,10 @@ if __name__ == "__main__":
     trace, constraints, options, pass_pipeline = _parse_input()
     sys.exit(
         _emit_from_captured_trace(
-            trace, constraints, options, pass_pipeline, args.test_diagnostic_emission
+            trace,
+            constraints,
+            options,
+            pass_pipeline,
+            test_diagnostics=WaterDiagTestingMode(args.test_diagnostic_emission),
         )
     )
