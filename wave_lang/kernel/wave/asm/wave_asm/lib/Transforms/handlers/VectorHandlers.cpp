@@ -213,10 +213,11 @@ LogicalResult handleVectorExtractStridedSlice(Operation *op,
     size = cast<IntegerAttr>(sizes[0]).getInt();
   }
 
-  // Check for sub-register packed extraction: when multiple sub-32-bit
-  // elements are packed into fewer registers than elements (e.g. vector<4xi8>
-  // fits in 1 VGPR), extracting at offset>0 requires bitfield operations
-  // rather than a register-index offset.
+  // Check for sub-register packed extraction: when all elements fit in a
+  // single 32-bit VGPR (e.g. vector<4xi8>), extracting at offset>0 requires
+  // a bitfield operation rather than a register-index offset.
+  // Only handle the single-register case; multi-register packed vectors
+  // (e.g. vector<8xi8> = 2 VGPRs) would need per-register selection first.
   auto sourceVecType = dyn_cast<VectorType>(extractOp.getSource().getType());
   if (sourceVecType) {
     int64_t elemBitWidth =
@@ -225,7 +226,7 @@ LogicalResult handleVectorExtractStridedSlice(Operation *op,
     int64_t totalBits = numElems * elemBitWidth;
     int64_t srcRegWidth = (totalBits + 31) / 32;
 
-    if (srcRegWidth < numElems) {
+    if (srcRegWidth == 1 && srcRegWidth < numElems) {
       int64_t bitOffset = offset * elemBitWidth;
       int64_t extractWidth = size * elemBitWidth;
       auto vregType = ctx.createVRegType(1, 1);

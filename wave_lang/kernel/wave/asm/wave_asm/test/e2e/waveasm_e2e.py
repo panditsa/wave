@@ -171,7 +171,7 @@ class WaveASMCompiler:
         self,
         mlir_text: str,
         workgroup_size: Optional[Tuple[int, int, int]] = None,
-        ticketed_waitcnt: bool = False,
+        ticketed_waitcnt: bool = True,
     ) -> Tuple[bool, str, str]:
         """
         Compile MLIR to AMDGCN assembly using C++ waveasm-translate.
@@ -179,7 +179,7 @@ class WaveASMCompiler:
         Args:
             mlir_text: MLIR module text
             workgroup_size: Optional workgroup size tuple (x, y, z)
-            ticketed_waitcnt: Disable ticket-based waitcnt/barrier insertion
+            ticketed_waitcnt: Enable ticket-based waitcnt/barrier insertion
 
         Returns:
             Tuple of (success, asm_text_or_error, stderr)

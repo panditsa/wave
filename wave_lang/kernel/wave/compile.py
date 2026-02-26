@@ -1319,7 +1319,6 @@ def _compile_asm_to_binary(asm_code, options):
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Assembly compilation failed: {result.stderr}")
-
         # Step 2: Link object file to hsaco file
         link_cmd = [
             "amdclang++",
