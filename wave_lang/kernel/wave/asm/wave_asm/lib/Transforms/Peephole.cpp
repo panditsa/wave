@@ -166,8 +166,7 @@ struct LshlAddPattern : public OpRewritePattern<V_ADD_U32> {
       // If both base and addend are SGPRs (and not the same value), the
       // fused instruction would need two constant bus slots → illegal.
       if (isSGPRType(lshlOp.getSrc1().getType()) &&
-          isSGPRType(other.getType()) &&
-          lshlOp.getSrc1() != other)
+          isSGPRType(other.getType()) && lshlOp.getSrc1() != other)
         return failure();
 
       auto loc = addOp.getLoc();
