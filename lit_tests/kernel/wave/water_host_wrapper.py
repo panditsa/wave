@@ -87,6 +87,8 @@ def test_read_write():
         tkw.write(res, b)
 
     read_write = wave_compile(get_wave_compile_options(canonicalize=True), read_write)
+    with open("read_write.mlir", "w") as f:
+        f.write(read_write.asm)
     print(read_write.asm)
 
     # CHECK-LABEL:    test_read_write
@@ -95,9 +97,9 @@ def test_read_write():
     # CHECK-SAME:       (%[[D0:.*]]: memref<f16> {llvm.inreg}, %[[D1:.*]]: memref<f16> {llvm.inreg})
     # CHECK-SAME:       kernel attributes {known_block_size = array<i32: 64, 1, 1>}
     # CHECK:            %[[thread_id_x:.*]] = gpu.thread_id  x
-    # CHECK:            memref.reinterpret_cast %[[D0]] to offset: [0], sizes: [{{.*}}], strides: [1] : memref<f16> to memref<{{.*}}xf16, strided<[1]>>
+    # CHECK:            memref.reinterpret_cast %[[D0]] to offset: [0], sizes: [16, 16], strides: [16, 1] : memref<f16> to memref<16x16xf16, strided<[16, 1]>>
+    # CHECK:            vector.load {{.*}} : memref<16x16xf16, strided<[16, 1]>>, vector<16xf16>
     # CHECK:            memref.reinterpret_cast %[[D1]] to offset: [0], sizes: [{{.*}}], strides: [1] : memref<f16> to memref<{{.*}}xf16, strided<[1]>>
-    # CHECK:            vector.load {{.*}} : memref<{{.*}}xf16, strided<[1]>>, vector<16xf16>
     # CHECK:            vector.store {{.*}} : memref<{{.*}}xf16, strided<[1]>>, vector<16xf16>
     # CHECK:            return
 
