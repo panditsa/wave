@@ -1103,7 +1103,9 @@ def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
             start_after_groups=[[], [], [1], [0]],
         )
 
-        loop_B_g2v_bs = len(loop_g2v_b) + (len(loop_g2v_b_scale) // 4)
+        loop_B_g2v_bs = len(loop_g2v_b) + (
+            len(loop_g2v_b_scale) // b_scale_shuffling_factor
+        )
         loop_A_s2v_bs = len(loop_g2s_a) + len(loop_g2s_a_scale)
         clusters = [
             tkw.cluster(
@@ -1270,12 +1272,13 @@ def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
 
         tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
         tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
-        #tkw.reorder_graph(pipeline_loop.EPILOGUE, epilogue_clusters_itr0)
+        # tkw.reorder_graph(pipeline_loop.EPILOGUE, epilogue_clusters_itr0)
         unroll_factor = 2
         tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
         tkw.insert_at_start(
-            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=A_g2s_per_iter, ds=0)
+            pipeline_loop.KERNEL,
+            tkw.MemoryCounterWaitBarrier(load=A_g2s_per_iter, ds=0),
         )
         tkw.insert_after(
             pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
