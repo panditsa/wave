@@ -171,6 +171,7 @@ class WaveASMCompiler:
         self,
         mlir_text: str,
         workgroup_size: Optional[Tuple[int, int, int]] = None,
+        ticketed_waitcnt: bool = True,
     ) -> Tuple[bool, str, str]:
         """
         Compile MLIR to AMDGCN assembly using C++ waveasm-translate.
@@ -178,7 +179,7 @@ class WaveASMCompiler:
         Args:
             mlir_text: MLIR module text
             workgroup_size: Optional workgroup size tuple (x, y, z)
-
+            ticketed_waitcnt: Whether to use ticketed waitcnts (default: True)
         Returns:
             Tuple of (success, asm_text_or_error, stderr)
         """
@@ -219,6 +220,8 @@ class WaveASMCompiler:
                     f"--workgroup-size-z={workgroup_size[2]}",
                 ]
             )
+
+        cmd.append(f"--ticketed-waitcnt={'true' if ticketed_waitcnt else 'false'}")
 
         cmd.append(str(mlir_file))
 
