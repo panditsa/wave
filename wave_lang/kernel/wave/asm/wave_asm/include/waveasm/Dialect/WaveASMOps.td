@@ -102,6 +102,10 @@ class SALUBinaryOp<string mnemonic, list<Trait> traits = []>
 // s_add_u32 and s_addc_u32 set SCC (carry flag) as a side effect.
 // We model SCC as an explicit sreg result so the verifier can prevent
 // reordering ops that corrupt the carry chain.
+// TODO: The scc result should be fed as an explicit operand to s_addc_u32
+// when used in an add-with-carry chain (s_add_u32 → s_addc_u32), creating
+// a true SSA dependency. Currently the chain is only enforced by emission
+// ordering, not by the SSA graph.
 class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
