@@ -23,11 +23,11 @@ waveasm.program @test_loop_structure
   // CHECK:      %[[INIT:.*]] = waveasm.s_mov_b32 %{{.*}} : !waveasm.imm<0> -> !waveasm.sreg
   // CHECK-NEXT: %{{.*}} = waveasm.loop (%[[IV:.*]] = %[[INIT]]) : (!waveasm.sreg) -> !waveasm.sreg {
   %counter = waveasm.loop(%i = %init) : (!waveasm.sreg) -> (!waveasm.sreg) {
-    // CHECK-NEXT:   %[[NEXT:.*]]:2 = waveasm.s_add_u32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
+    // CHECK-NEXT:   %[[NEXT:.*]], %{{.*}} = waveasm.s_add_u32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %next:2 = waveasm.s_add_u32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
-    // CHECK-NEXT:   %[[COND:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]]#0, %{{.*}} : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
+    // CHECK-NEXT:   %[[COND:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]], %{{.*}} : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next#0, %ten : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
-    // CHECK-NEXT:   waveasm.condition %[[COND]] : !waveasm.sreg iter_args(%[[NEXT]]#0) : !waveasm.sreg
+    // CHECK-NEXT:   waveasm.condition %[[COND]] : !waveasm.sreg iter_args(%[[NEXT]]) : !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next#0) : !waveasm.sreg
   // CHECK-NEXT: }
   }
@@ -56,11 +56,11 @@ waveasm.program @test_loop_accumulator
     // CHECK-NEXT:   %[[NEWSUM:.*]] = waveasm.v_add_u32 %[[SUM]], %[[IV]] : !waveasm.vreg, !waveasm.sreg -> !waveasm.vreg
     %new_sum = waveasm.v_add_u32 %sum, %i
         : !waveasm.vreg, !waveasm.sreg -> !waveasm.vreg
-    // CHECK-NEXT:   %[[NEXT:.*]]:2 = waveasm.s_add_u32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
+    // CHECK-NEXT:   %[[NEXT:.*]], %{{.*}} = waveasm.s_add_u32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %next:2 = waveasm.s_add_u32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
-    // CHECK-NEXT:   %[[COND:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]]#0, %{{.*}} : !waveasm.sreg, !waveasm.imm<16> -> !waveasm.sreg
+    // CHECK-NEXT:   %[[COND:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]], %{{.*}} : !waveasm.sreg, !waveasm.imm<16> -> !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next#0, %limit : !waveasm.sreg, !waveasm.imm<16> -> !waveasm.sreg
-    // CHECK-NEXT:   waveasm.condition %[[COND]] : !waveasm.sreg iter_args(%[[NEXT]]#0, %[[NEWSUM]]) : !waveasm.sreg, !waveasm.vreg
+    // CHECK-NEXT:   waveasm.condition %[[COND]] : !waveasm.sreg iter_args(%[[NEXT]], %[[NEWSUM]]) : !waveasm.sreg, !waveasm.vreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next#0, %new_sum) : !waveasm.sreg, !waveasm.vreg
   // CHECK-NEXT: }
   }
@@ -188,11 +188,11 @@ waveasm.program @test_if_in_loop
     }
 
     // If result feeds loop counter update
-    // CHECK:      %[[NEXT:.*]]:2 = waveasm.s_add_u32 %[[IV]], %[[STEP]] : !waveasm.sreg, !waveasm.sreg -> !waveasm.sreg, !waveasm.sreg
+    // CHECK:      %[[NEXT:.*]], %{{.*}} = waveasm.s_add_u32 %[[IV]], %[[STEP]] : !waveasm.sreg, !waveasm.sreg -> !waveasm.sreg, !waveasm.sreg
     %next:2 = waveasm.s_add_u32 %i, %step : !waveasm.sreg, !waveasm.sreg -> !waveasm.sreg, !waveasm.sreg
-    // CHECK-NEXT: %[[CONT:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]]#0, %{{.*}} : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
+    // CHECK-NEXT: %[[CONT:.*]] = waveasm.s_cmp_lt_u32 %[[NEXT]], %{{.*}} : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
     %cont = waveasm.s_cmp_lt_u32 %next#0, %limit : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
-    // CHECK-NEXT: waveasm.condition %[[CONT]] : !waveasm.sreg iter_args(%[[NEXT]]#0) : !waveasm.sreg
+    // CHECK-NEXT: waveasm.condition %[[CONT]] : !waveasm.sreg iter_args(%[[NEXT]]) : !waveasm.sreg
     waveasm.condition %cont : !waveasm.sreg iter_args(%next#0) : !waveasm.sreg
   }
 
