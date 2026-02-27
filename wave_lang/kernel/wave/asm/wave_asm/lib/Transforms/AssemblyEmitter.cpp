@@ -749,6 +749,23 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             return formatter.format(mnemonic, operands);
           })
 
+      // SALU arithmetic ops that set SCC: emit dst and operands, skip scc.
+      .Case<S_ADD_U32, S_ADD_I32, S_SUB_U32, S_SUB_I32>(
+          [&](auto addOp) -> std::optional<std::string> {
+            llvm::StringRef opName = addOp->getName().getStringRef();
+            llvm::StringRef mnemonic = opName;
+            if (opName.starts_with("waveasm.")) {
+              mnemonic = opName.drop_front(8);
+            }
+            llvm::SmallVector<std::string> operands;
+            // Only emit the first result (dst), not the second (scc)
+            operands.push_back(resolveValue(addOp.getDst()));
+            for (Value operand : addOp->getOperands()) {
+              operands.push_back(resolveValue(operand));
+            }
+            return formatter.format(mnemonic, operands);
+          })
+
       // V_CMP_* operations: write to VCC implicitly, need explicit vcc in asm.
       .Case<V_CMP_EQ_U32, V_CMP_NE_U32, V_CMP_LT_U32, V_CMP_LE_U32,
             V_CMP_GT_U32, V_CMP_GE_U32, V_CMP_EQ_I32, V_CMP_NE_I32,
