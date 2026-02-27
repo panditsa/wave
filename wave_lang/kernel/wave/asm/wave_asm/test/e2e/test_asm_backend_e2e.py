@@ -1325,6 +1325,7 @@ def _dbuf_mxfp4_helper(
     block,
     num_waves,
     use_stagger,
+    preshuffle_b,
     compiler,
     backend,
     dump_asm,
@@ -1358,13 +1359,24 @@ def _dbuf_mxfp4_helper(
     from wave_lang.kernel.wave.utils.mxfp_utils import (
         generate_gemm_afp4wfp4_inputs,
         torchScaledGemmMXFP4,
+        b_preshuffle,
+        e8m0_shuffle,
     )
 
     # Get tagged kernel + options (same as 7.1_schedule.py)
-    # Use preshuffle B + asymmetric schedule with wave_shape=(1,4) for 4-wave,
-    # standard double-buffer with wave_shape=(4,2) for 8-wave.
-    if num_waves <= 4:
+    # 4-wave uses asymmetric schedule with wave_shape=(1,4):
+    # - preshuffle_b=True: B is preshuffled + E8M0 shuffled
+    # - preshuffle_b=False: baseline non-preshuffle path
+    # 8-wave uses standard double-buffer with wave_shape=(4,2).
+    if num_waves <= 4 and preshuffle_b:
         gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+            shape,
+            block,
+            wave_shape=(1, 4),
+        )
+        schedule = get_mxfp4_asymmetric_schedule()
+    elif num_waves <= 4:
+        gemm, options = get_tagged_mxfp4_gemm(
             shape,
             block,
             wave_shape=(1, 4),
@@ -1434,7 +1446,7 @@ def _dbuf_mxfp4_helper(
     # Execute on GPU
     # Kernel signature: (a, a_scale, b, b_scale, c)
     # For preshuffle B: transform B data and B scales to preshuffled layout
-    if num_waves <= 4:
+    if num_waves <= 4 and preshuffle_b:
         w_input = b_preshuffle(w.T.contiguous()).contiguous()
         w_scales_input = e8m0_shuffle(w_scales).contiguous()
     else:
@@ -1466,6 +1478,7 @@ def _dbuf_mxfp4_helper(
     reason="Asymmetric schedule with wave_shape=(1,4) requires ~323 VGPRs, "
     "exceeding the 256 hardware encoding limit. Needs LDS scale layout "
     "fix or spilling to resolve.",
+    strict=True,
 )
 def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
     """End-to-end test for asymmetric MXFP4 GEMM with 4 waves.
@@ -1478,6 +1491,7 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
         block=(256, 256, 256),
         num_waves=4,
         use_stagger=False,
+        preshuffle_b=False,
         compiler=compiler,
         backend=backend,
         dump_asm=dump_asm,
@@ -1504,6 +1518,7 @@ def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
         block=(256, 256, 256),
         num_waves=8,
         use_stagger=True,
+        preshuffle_b=False,
         compiler=compiler,
         backend=backend,
         dump_asm=dump_asm,

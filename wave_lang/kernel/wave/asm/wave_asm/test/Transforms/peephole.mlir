@@ -437,3 +437,41 @@ waveasm.program @test_lds_soffset_vgpr_base target = #waveasm.target<#waveasm.gf
 
   waveasm.s_endpgm
 }
+
+//===----------------------------------------------------------------------===//
+// Test: Do not fuse when VOP3 would need two distinct SGPRs.
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: waveasm.program @test_lshl_add_two_sgprs_no_fusion
+waveasm.program @test_lshl_add_two_sgprs_no_fusion target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
+  %s0 = waveasm.precolored.sreg 0 : !waveasm.psreg<0>
+  %s1 = waveasm.precolored.sreg 1 : !waveasm.psreg<1>
+  %c2 = waveasm.constant 2 : !waveasm.imm<2>
+  %srd = waveasm.precolored.sreg 4, 4 : !waveasm.psreg<4, 4>
+
+  // Keep as lshl + add: fused v_lshl_add_u32 would require two distinct SGPRs.
+  // CHECK: waveasm.v_lshlrev_b32
+  // CHECK: waveasm.v_add_u32
+  // CHECK-NOT: waveasm.v_lshl_add_u32
+  %shifted = waveasm.v_lshlrev_b32 %c2, %s0 : !waveasm.imm<2>, !waveasm.psreg<0> -> !waveasm.vreg
+  %sum = waveasm.v_add_u32 %shifted, %s1 : !waveasm.vreg, !waveasm.psreg<1> -> !waveasm.vreg
+  waveasm.buffer_store_dword %sum, %srd, %sum : !waveasm.vreg, !waveasm.psreg<4, 4>, !waveasm.vreg
+  waveasm.s_endpgm
+}
+
+// CHECK-LABEL: waveasm.program @test_lshl_or_two_sgprs_no_fusion
+waveasm.program @test_lshl_or_two_sgprs_no_fusion target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
+  %s0 = waveasm.precolored.sreg 0 : !waveasm.psreg<0>
+  %s1 = waveasm.precolored.sreg 1 : !waveasm.psreg<1>
+  %c4 = waveasm.constant 4 : !waveasm.imm<4>
+  %srd = waveasm.precolored.sreg 4, 4 : !waveasm.psreg<4, 4>
+
+  // Keep as lshl + or: fused v_lshl_or_b32 would need two SGPRs.
+  // CHECK: waveasm.v_lshlrev_b32
+  // CHECK: waveasm.v_or_b32
+  // CHECK-NOT: waveasm.v_lshl_or_b32
+  %shifted = waveasm.v_lshlrev_b32 %c4, %s0 : !waveasm.imm<4>, !waveasm.psreg<0> -> !waveasm.vreg
+  %res = waveasm.v_or_b32 %shifted, %s1 : !waveasm.vreg, !waveasm.psreg<1> -> !waveasm.vreg
+  waveasm.buffer_store_dword %res, %srd, %res : !waveasm.vreg, !waveasm.psreg<4, 4>, !waveasm.vreg
+  waveasm.s_endpgm
+}

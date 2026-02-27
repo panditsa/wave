@@ -42,14 +42,14 @@ waveasm.program @basic_strength_reduction
 
     // Soffset is a loop-carried sreg, bumped each iteration, fed back via condition.
     // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-    // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+    // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
     // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_SOFF]]) :
     %val = waveasm.buffer_load_dword %srd, %voff, %soff0
         : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.imm<0> -> !waveasm.vreg
 
     %new_acc = waveasm.v_add_u32 %acc, %val : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -90,7 +90,7 @@ waveasm.program @no_transform_loop_invariant_voffset
 
     %new_acc = waveasm.v_add_u32 %acc, %val : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -124,8 +124,8 @@ waveasm.program @two_srd_groups
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.vreg, !waveasm.sreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF_A:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF_B:%[a-z0-9]+]] : !waveasm.psreg<4, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_A:%[0-9]+]] = waveasm.s_add_u32 [[SOFF_A]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_B:%[0-9]+]] = waveasm.s_add_u32 [[SOFF_B]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_A:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF_A]], {{.*}} : !waveasm.sreg, {{.*}} ->
+  // CHECK: [[NEXT_B:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF_B]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_A]], [[NEXT_B]]) :
   %final_iv, %final_acc = waveasm.loop(%iv = %init_iv, %acc = %init_acc)
       : (!waveasm.sreg, !waveasm.vreg) -> (!waveasm.sreg, !waveasm.vreg) {
@@ -141,7 +141,7 @@ waveasm.program @two_srd_groups
     %sum = waveasm.v_add_u32 %val_a, %val_b : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
     %new_acc = waveasm.v_add_u32 %acc, %sum : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -177,7 +177,7 @@ waveasm.program @shared_srd_group
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.vreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_SOFF]]) :
   %final_iv, %final_acc = waveasm.loop(%iv = %init_iv, %acc = %init_acc)
       : (!waveasm.sreg, !waveasm.vreg) -> (!waveasm.sreg, !waveasm.vreg) {
@@ -197,7 +197,7 @@ waveasm.program @shared_srd_group
     %sum = waveasm.v_add_u32 %val_a, %val_b : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
     %new_acc = waveasm.v_add_u32 %acc, %sum : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -239,9 +239,9 @@ waveasm.program @soffset_increment
 
     // Trace the loop-carried soffset: load uses it, s_add bumps it, condition feeds it back.
     // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-    // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+    // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
     // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_SOFF]]) :
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -249,9 +249,10 @@ waveasm.program @soffset_increment
   waveasm.s_endpgm
 }
 
-// ---- Stride materialization: s_mov_b32 with constant stride before loop ----
+// ---- Stride materialization: inline immediate in s_add_u32 ----
 // The pass computes stride symbolically (here: ivStep=1, shift=4, so stride=16)
-// and emits s_mov_b32 with the constant before the loop.
+// and uses an inline immediate in each soffset bump. This avoids SGPR aliasing
+// with loop-carried IV values.
 
 // CHECK-LABEL: @stride_precompute
 waveasm.program @stride_precompute
@@ -269,12 +270,11 @@ waveasm.program @stride_precompute
   %tid = waveasm.precolored.vreg 0 : !waveasm.pvreg<0>
   %init_iv = waveasm.s_mov_b32 %zero : !waveasm.imm<0> -> !waveasm.sreg
 
-  // Before the loop: stride=16 materialized as constant + s_mov_b32.
-  // CHECK: waveasm.constant 16
-  // CHECK: [[STRIDE:%[0-9]+]] = waveasm.s_mov_b32 {{.*}} : !waveasm.imm<16> -> !waveasm.sreg
+  // No standalone stride SGPR should be materialized.
+  // CHECK-NOT: waveasm.s_mov_b32 {{.*}} : !waveasm.imm<16> -> !waveasm.sreg
   // CHECK: waveasm.loop
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], [[STRIDE]] : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.imm<16> ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, [[NEXT_SOFF]]) :
   %final_iv = waveasm.loop(%iv = %init_iv) : (!waveasm.sreg) -> (!waveasm.sreg) {
 
@@ -284,7 +284,7 @@ waveasm.program @stride_precompute
     %val = waveasm.buffer_load_dword %srd, %voff, %soff0
         : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.imm<0> -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -346,7 +346,7 @@ waveasm.program @non_uniform_stride
 
     %new_acc = waveasm.v_add_u32 %acc, %val : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -378,7 +378,7 @@ waveasm.program @multi_dword_load
   // CHECK: waveasm.loop
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.vreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dwordx4 {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_SOFF]]) :
   %final_iv, %final_acc = waveasm.loop(%iv = %init_iv, %acc = %init_acc)
       : (!waveasm.sreg, !waveasm.vreg) -> (!waveasm.sreg, !waveasm.vreg) {
@@ -391,7 +391,7 @@ waveasm.program @multi_dword_load
 
     %new_acc = waveasm.v_add_u32 %acc, %v0 : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -423,7 +423,7 @@ waveasm.program @nonzero_inst_offset
   // CHECK: waveasm.loop
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] offset : 2048 : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, [[NEXT_SOFF]]) :
   %final_iv = waveasm.loop(%iv = %init_iv) : (!waveasm.sreg) -> (!waveasm.sreg) {
 
@@ -432,7 +432,7 @@ waveasm.program @nonzero_inst_offset
     %val = waveasm.buffer_load_dword %srd, %voff, %soff0 offset : 2048
         : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.imm<0> -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -467,8 +467,8 @@ waveasm.program @different_strides_same_srd
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.vreg, !waveasm.sreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF_A:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
   // CHECK: waveasm.buffer_load_dword {{.*}}, {{.*}}, [[SOFF_B:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_A:%[0-9]+]] = waveasm.s_add_u32 [[SOFF_A]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_B:%[0-9]+]] = waveasm.s_add_u32 [[SOFF_B]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_A:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF_A]], {{.*}} : !waveasm.sreg, {{.*}} ->
+  // CHECK: [[NEXT_B:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF_B]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, {{.*}}, [[NEXT_A]], [[NEXT_B]]) :
   %final_iv, %final_acc = waveasm.loop(%iv = %init_iv, %acc = %init_acc)
       : (!waveasm.sreg, !waveasm.vreg) -> (!waveasm.sreg, !waveasm.vreg) {
@@ -488,7 +488,7 @@ waveasm.program @different_strides_same_srd
     %sum = waveasm.v_add_u32 %val_a, %val_b : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
     %new_acc = waveasm.v_add_u32 %acc, %sum : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }
@@ -522,7 +522,7 @@ waveasm.program @lds_load_strength_reduction
   // m0 write preserved, soffset is loop-carried sreg.
   // CHECK: waveasm.s_mov_b32_m0
   // CHECK: waveasm.buffer_load_dwordx4_lds {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.vreg, !waveasm.psreg<0, 4>, !waveasm.sreg
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, [[NEXT_SOFF]]) :
   %final_iv = waveasm.loop(%iv = %init_iv) : (!waveasm.sreg) -> (!waveasm.sreg) {
 
@@ -535,7 +535,7 @@ waveasm.program @lds_load_strength_reduction
     waveasm.buffer_load_dwordx4_lds %voff, %srd, %soff0
         : !waveasm.vreg, !waveasm.psreg<0, 4>, !waveasm.imm<0>
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -572,7 +572,7 @@ waveasm.program @lds_load_no_transform
     waveasm.buffer_load_dword_lds %tid, %srd, %soff0
         : !waveasm.pvreg<0>, !waveasm.psreg<0, 4>, !waveasm.imm<0>
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -608,7 +608,7 @@ waveasm.program @lshrrev_in_address_chain
   // CHECK: waveasm.loop
   // CHECK-SAME: -> (!waveasm.sreg, !waveasm.sreg) {
   // CHECK: waveasm.buffer_load_dwordx4 {{.*}}, {{.*}}, [[SOFF:%[a-z0-9]+]] : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.sreg ->
-  // CHECK: [[NEXT_SOFF:%[0-9]+]] = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, !waveasm.sreg ->
+  // CHECK: [[NEXT_SOFF:%[^ ]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], {{.*}} : !waveasm.sreg, {{.*}} ->
   // CHECK: waveasm.condition {{.*}} iter_args({{.*}}, [[NEXT_SOFF]]) :
   %final_iv = waveasm.loop(%iv = %init_iv) : (!waveasm.sreg) -> (!waveasm.sreg) {
 
@@ -622,7 +622,7 @@ waveasm.program @lshrrev_in_address_chain
         : !waveasm.psreg<0, 4>, !waveasm.vreg, !waveasm.imm<0>
         -> !waveasm.vreg, !waveasm.vreg, !waveasm.vreg, !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %two : !waveasm.sreg, !waveasm.imm<2> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %two : !waveasm.sreg, !waveasm.imm<2> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<32> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -668,7 +668,7 @@ waveasm.program @lshrrev_non_divisible
 
     %new_acc = waveasm.v_add_u32 %acc, %val : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %new_acc) : !waveasm.sreg, !waveasm.vreg
   }

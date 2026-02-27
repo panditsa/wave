@@ -47,7 +47,7 @@ waveasm.program @loop_result_no_body_pressure
         : !waveasm.pvreg<4, 4>, !waveasm.pvreg<4, 4>, !waveasm.vreg<4, 4> -> !waveasm.vreg<4, 4>
 
     // Loop bookkeeping
-    %next_i = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_i, %scc_0 = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_i, %c10 : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_i, %new_acc) : !waveasm.sreg, !waveasm.vreg<4, 4>
   }
@@ -92,7 +92,7 @@ waveasm.program @loop_result_tied_to_block_arg
     %new_acc = waveasm.v_mfma_f32_16x16x16_f16 %a, %b, %acc
         : !waveasm.pvreg<0, 4>, !waveasm.pvreg<4, 4>, !waveasm.vreg<4, 4> -> !waveasm.vreg<4, 4>
 
-    %next_i = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_i, %scc_0 = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_i, %c8 : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_i, %new_acc) : !waveasm.sreg, !waveasm.vreg<4, 4>
   }

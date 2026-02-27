@@ -93,7 +93,7 @@ waveasm.program @if_in_loop_type_mismatch
 
     %new_sum = waveasm.v_add_u32 %new_val, %c1 : !waveasm.vreg, !waveasm.imm<1> -> !waveasm.vreg
 
-    %next_i = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_i, %scc_0 = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %loop_cond = waveasm.s_cmp_lt_u32 %next_i, %c10 : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
     waveasm.condition %loop_cond : !waveasm.sreg iter_args(%next_i, %new_sum) : !waveasm.sreg, !waveasm.vreg
   }
@@ -136,7 +136,7 @@ waveasm.program @multiple_ifs_compound
       waveasm.yield %if1_result : !waveasm.vreg
     }
 
-    %next_i = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_i, %scc_0 = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %loop_cond = waveasm.s_cmp_lt_u32 %next_i, %c10 : !waveasm.sreg, !waveasm.imm<10> -> !waveasm.sreg
     waveasm.condition %loop_cond : !waveasm.sreg iter_args(%next_i, %if2_result) : !waveasm.sreg, !waveasm.vreg
   }

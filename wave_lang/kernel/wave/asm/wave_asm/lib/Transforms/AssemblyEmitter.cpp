@@ -604,7 +604,23 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 auto [dstPhys, dstIsSGPR] = getPhysRegInfo(body.getArgument(i));
 
                 if (srcPhys >= 0 && dstPhys >= 0 && srcPhys != dstPhys) {
-                  pendingCopies.push_back({dstPhys, srcPhys, isSGPR});
+                  assert(isSGPR == dstIsSGPR &&
+                         "iter_arg source/dest register class mismatch");
+                  // Multi-register iter_args (e.g. dwordx4) need one copy per
+                  // sub-register, otherwise only the first register is copied
+                  // and the remaining lanes silently corrupt after iteration 0.
+                  // Copy in reverse order when dst > src to avoid clobbering
+                  // source registers that later copies still need to read.
+                  int64_t width = getRegSize(body.getArgument(i).getType());
+                  if (dstPhys > srcPhys) {
+                    for (int64_t r = width - 1; r >= 0; --r)
+                      pendingCopies.push_back(
+                          {dstPhys + r, srcPhys + r, isSGPR});
+                  } else {
+                    for (int64_t r = 0; r < width; ++r)
+                      pendingCopies.push_back(
+                          {dstPhys + r, srcPhys + r, isSGPR});
+                  }
                 }
               }
 
@@ -616,7 +632,8 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 for (size_t j = i + 1; j < pendingCopies.size(); ++j) {
                   if (handled[j])
                     continue;
-                  if (pendingCopies[i].dst == pendingCopies[j].src &&
+                  if (pendingCopies[i].isSGPR == pendingCopies[j].isSGPR &&
+                      pendingCopies[i].dst == pendingCopies[j].src &&
                       pendingCopies[j].dst == pendingCopies[i].src) {
                     if (pendingCopies[i].isSGPR && pendingCopies[j].isSGPR) {
                       int64_t regA = pendingCopies[i].dst;
@@ -630,9 +647,6 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                       handled[j] = true;
                       break;
                     }
-                    assert(!pendingCopies[i].isSGPR &&
-                           !pendingCopies[j].isSGPR &&
-                           "mixed SGPR/VGPR swap not supported.");
                     int64_t regA = pendingCopies[i].dst;
                     int64_t regB = pendingCopies[j].dst;
                     int64_t tmp = peakVGPRs;
@@ -730,6 +744,22 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             for (Value operand : cmpOp->getOperands()) {
               operands.push_back(resolveValue(operand));
             }
+            return formatter.format(mnemonic, operands);
+          })
+
+      // S_ADD_U32 / S_ADDC_U32: two SSA results (dst + SCC) but the
+      // hardware instruction only has one explicit destination register.
+      // Emit dst as the destination and skip the SCC result.
+      .Case<S_ADD_U32, S_ADDC_U32>(
+          [&](auto addOp) -> std::optional<std::string> {
+            llvm::StringRef opName = addOp->getName().getStringRef();
+            llvm::StringRef mnemonic = opName;
+            if (opName.starts_with("waveasm."))
+              mnemonic = opName.drop_front(8);
+            llvm::SmallVector<std::string> operands;
+            operands.push_back(resolveValue(addOp.getDst()));
+            for (Value operand : addOp->getOperands())
+              operands.push_back(resolveScalarValue(operand));
             return formatter.format(mnemonic, operands);
           })
 

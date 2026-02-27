@@ -46,7 +46,7 @@ waveasm.program @test_licm_chain
 
     waveasm.buffer_store_dword %addr, %srd, %v0 : !waveasm.vreg, !waveasm.psreg<0, 4>, !waveasm.pvreg<0>
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv) : !waveasm.sreg
   }
@@ -84,7 +84,7 @@ waveasm.program @test_licm_no_hoist
     %addr = waveasm.v_add_u32 %v0, %acc : !waveasm.pvreg<0>, !waveasm.vreg -> !waveasm.vreg
     waveasm.buffer_store_dword %addr, %srd, %v0 : !waveasm.vreg, !waveasm.psreg<0, 4>, !waveasm.pvreg<0>
 
-    %next_iv = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_iv, %scc_0 = waveasm.s_add_u32 %iv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_iv, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv, %addr) : !waveasm.sreg, !waveasm.vreg
   }
@@ -135,12 +135,12 @@ waveasm.program @test_licm_nested
 
       waveasm.buffer_store_dword %sum, %srd, %v0 : !waveasm.vreg, !waveasm.psreg<0, 4>, !waveasm.pvreg<0>
 
-      %next_iiv = waveasm.s_add_u32 %iiv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+      %next_iiv, %scc_0 = waveasm.s_add_u32 %iiv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
       %icond = waveasm.s_cmp_lt_u32 %next_iiv, %limit : !waveasm.sreg, !waveasm.imm<4> -> !waveasm.sreg
       waveasm.condition %icond : !waveasm.sreg iter_args(%next_iiv, %sum) : !waveasm.sreg, !waveasm.vreg
     }
 
-    %next_oiv = waveasm.s_add_u32 %oiv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_oiv, %scc_1 = waveasm.s_add_u32 %oiv, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %ocond = waveasm.s_cmp_lt_u32 %next_oiv, %limit : !waveasm.sreg, !waveasm.imm<4> -> !waveasm.sreg
     waveasm.condition %ocond : !waveasm.sreg iter_args(%next_oiv) : !waveasm.sreg
   }

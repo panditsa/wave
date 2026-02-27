@@ -123,7 +123,7 @@ waveasm.program @double_buffer_pressure
     %n29 = waveasm.v_mfma_f32_16x16x16_f16 %a, %b, %acc29 : !waveasm.pvreg<0, 4>, !waveasm.pvreg<4, 4>, !waveasm.vreg<4, 4> -> !waveasm.vreg<4, 4>
 
     // Loop counter
-    %next_i = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    %next_i, %scc_0 = waveasm.s_add_u32 %i, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
     %cond = waveasm.s_cmp_lt_u32 %next_i, %c16 : !waveasm.sreg, !waveasm.imm<16> -> !waveasm.sreg
     waveasm.condition %cond : !waveasm.sreg iter_args(%next_i,
         %n0, %n1, %n2, %n3, %n4, %n5, %n6, %n7,

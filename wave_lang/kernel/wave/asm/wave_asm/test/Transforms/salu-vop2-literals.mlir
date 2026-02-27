@@ -18,7 +18,7 @@ waveasm.program @salu_literal_test target = #waveasm.target<#waveasm.gfx942, 5> 
   // CHECK-NOT: v_mov_b32
   // CHECK: s_add_u32 s{{[0-9]+}}, s0, 4096
   %c4096 = waveasm.constant 4096 : !waveasm.imm<4096>
-  %r1 = waveasm.s_add_u32 %s0, %c4096 : !waveasm.psreg<0>, !waveasm.imm<4096> -> !waveasm.sreg
+  %r1, %scc_0 = waveasm.s_add_u32 %s0, %c4096 : !waveasm.psreg<0>, !waveasm.imm<4096> -> !waveasm.sreg, !waveasm.sreg
 
   // Another SALU with literal -- should also be direct
   // CHECK-NOT: v_mov_b32
