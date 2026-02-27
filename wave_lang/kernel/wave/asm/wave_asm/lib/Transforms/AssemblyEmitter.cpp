@@ -750,7 +750,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           })
 
       // SALU arithmetic ops that set SCC: emit dst and operands, skip scc.
-      .Case<S_ADD_U32, S_ADD_I32, S_SUB_U32, S_SUB_I32>(
+      .Case<S_ADD_U32, S_ADDC_U32, S_ADD_I32, S_SUB_U32, S_SUB_I32>(
           [&](auto addOp) -> std::optional<std::string> {
             llvm::StringRef opName = addOp->getName().getStringRef();
             llvm::StringRef mnemonic = opName;
