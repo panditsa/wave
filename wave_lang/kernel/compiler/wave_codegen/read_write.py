@@ -154,14 +154,16 @@ def _split_index_three_way(
     # WG part = src - no_wg.
     wg_index = _simplify(src - no_wg)
 
-    # Validate WG part contains only WG symbols.
-    if wg_index.free_symbols - set(subs_wg.keys()):
+    # Validate WG part has no thread or induction-var symbols.
+    # Shape constants (e.g. BLOCK_M) are allowed alongside WG symbols.
+    thread_syms = {THREAD_0, THREAD_1, THREAD_2}
+    forbidden_in_wg = thread_syms | uniform_syms
+    if wg_index.free_symbols & forbidden_in_wg:
         wg_index = sympy.sympify(0)
         no_wg = src
         uniform_index = _simplify(no_wg - thread_index)
 
     # Validate uniform part has no thread-dependent symbols.
-    thread_syms = {THREAD_0, THREAD_1, THREAD_2}
     if uniform_index.free_symbols & thread_syms:
         thread_index = no_wg
         uniform_index = sympy.sympify(0)
@@ -271,7 +273,7 @@ def _linearize_memref(
     offsets_wg: tuple[Value | int],
     offsets_th: tuple[Value | int],
     strides: tuple[Value],
-) -> tuple[Value, Value]:
+) -> tuple[Value, Value, bool]:
     """
     Convert n-D memref into 1-D memref, suitable for buffer ops.
 
@@ -282,10 +284,13 @@ def _linearize_memref(
     memref_type = mem.type
     offset = None
     offset_th = None
+    has_dynamic_wg_rebase = False
     overflow_flags = arith_d.IntegerOverflowFlags.nsw
     for ind_wg, ind_th, stride in zip(offsets_wg, offsets_th, strides):
         if isinstance(ind_wg, int):
             ind_wg = arith_d.constant(IndexType.get(), ind_wg)
+        elif _get_constant_value(ind_wg) is None:
+            has_dynamic_wg_rebase = True
 
         if isinstance(ind_th, int):
             ind_th = arith_d.constant(IndexType.get(), ind_th)
@@ -331,6 +336,7 @@ def _linearize_memref(
             static_strides=[1],
         ),
         offset_th,
+        has_dynamic_wg_rebase,
     )
 
 
@@ -444,7 +450,11 @@ def _get_constant_value(candidate: Value):
 
 
 def _cast_buffer_and_encode_stride(
-    ptr: Value, strides: tuple[Value], elem_type: IrType, emitter: WaveEmitter
+    ptr: Value,
+    strides: tuple[Value],
+    elem_type: IrType,
+    emitter: WaveEmitter,
+    reset_offset: bool = True,
 ) -> Value:
     uint64 = IntegerType.get_signless(64)
     uint14 = IntegerType.get_signless(14)
@@ -470,14 +480,14 @@ def _cast_buffer_and_encode_stride(
             ptr,
             cache_swizzle_stride=swizzle_stride,
             bounds_check=True,
-            reset_offset=True,
+            reset_offset=reset_offset,
             valid_bytes=valid_bytes_constant,
         )
     else:
         ptr = amdgpu_d.fat_raw_buffer_cast(
             ptr,
             bounds_check=True,
-            reset_offset=True,
+            reset_offset=reset_offset,
             valid_bytes=valid_bytes_constant,
         )
 
@@ -586,10 +596,21 @@ def _create_vec_read_write(
         if buffer_ops_enabled:
             # TODO: If strides cannot be converted into integers, means they are dynamic
             # and linearize breaks, need to investigate later.
-            mem, offset_th = _linearize_memref(
+            mem, offset_th, has_dynamic_wg_rebase = _linearize_memref(
                 mem, start_indices_wg, start_indices_th, strides
             )
-            mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+            # has_dynamic_wg_rebase means the WG contribution became a dynamic
+            # memref.reinterpret_cast offset. With reset_offset=True this dynamic
+            # rebase can be dropped/misapplied during fat_raw_buffer lowering,
+            # producing incorrect addresses. Keep reset_offset=False in that case.
+            # For non-dynamic rebases, keep reset_offset=True.
+            mem = _cast_buffer_and_encode_stride(
+                mem,
+                strides,
+                element_type,
+                emitter,
+                reset_offset=not has_dynamic_wg_rebase,
+            )
         if linearize_shared_mem:
             mem = _linearize_shared_mem(mem)
             linearized_index = {
@@ -622,10 +643,16 @@ def _create_vec_read_write(
     )
 
     if buffer_ops_enabled:
-        mem, offset_th = _linearize_memref(
+        mem, offset_th, has_dynamic_wg_rebase = _linearize_memref(
             mem, start_indices_wg, start_indices_th, strides
         )
-        mem = _cast_buffer_and_encode_stride(mem, strides, element_type, emitter)
+        mem = _cast_buffer_and_encode_stride(
+            mem,
+            strides,
+            element_type,
+            emitter,
+            reset_offset=not has_dynamic_wg_rebase,
+        )
 
     indices = [offset_th] if buffer_ops_enabled else start_indices
 
@@ -1187,8 +1214,16 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         for s in strides
     ]
 
-    src, offset_th = _linearize_memref(src, src_index_wg, src_index_th, strides)
-    src = _cast_buffer_and_encode_stride(src, strides, element_type, emitter)
+    src, offset_th, has_dynamic_wg_rebase = _linearize_memref(
+        src, src_index_wg, src_index_th, strides
+    )
+    src = _cast_buffer_and_encode_stride(
+        src,
+        strides,
+        element_type,
+        emitter,
+        reset_offset=not has_dynamic_wg_rebase,
+    )
 
     if src_index_iv is not None:
         uniform_off = _linearize_uniform_offset(src_index_iv, strides)

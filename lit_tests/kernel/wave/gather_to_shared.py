@@ -151,13 +151,14 @@ def test_gather_to_shared_wave_tile_aligned_coalescing():
     # CHECK:            %[[TIDX:.+]] = gpu.thread_id  x
     # CHECK:            %[[TIDY:.+]] = gpu.thread_id  y
     # CHECK:            %[[WAVE_OFF:.+]] = affine.apply #[[MAP_WAVE]]()[%[[TIDX]], %[[TIDY]]]
-    # With three-way split, the thread offset is computed outside the loop
-    # and the IV contribution is a separate affine.apply inside the loop.
+    # With three-way split + rebase path, WG contribution is hoisted into
+    # memref.reinterpret_cast offset, while the loop combines thread+IV.
+    # CHECK:            %[[WG_BASE:.+]] = arith.muli %{{.*}}, %c64 overflow<nsw> : index
+    # CHECK:            %[[SRC_REBASE:.+]] = memref.reinterpret_cast %{{.*}} to offset: [%[[WG_BASE]]]
     # CHECK:            scf.for %[[IND_VAR:[a-z0-9]+]] = %c0
     # CHECK:              amdgpu.lds_barrier
     # CHECK:              %[[IV_OFF:.+]] = affine.apply #[[MAP_IV]]()[%[[IND_VAR]]]
-    # CHECK:              %[[WG_IV:.+]] = arith.addi %{{.*}}, %[[IV_OFF]]
-    # CHECK:              %[[COMBINED:.+]] = arith.addi %{{.*}}, %[[WG_IV]]
+    # CHECK:              %[[COMBINED:.+]] = arith.addi %{{.*}}, %[[IV_OFF]]
     # CHECK:              amdgpu.gather_to_lds %{{.*}}[%[[COMBINED]]]
 
 

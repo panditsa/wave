@@ -3,16 +3,17 @@
 """
 Lit test for the uniform (induction-variable) offset splitting in GatherToLDS.
 
-When use_buffer_ops=True, the codegen separates the induction-variable
-contribution from the per-lane thread offset so the backend can fold the
-uniform part into the buffer_load soffset field (SGPR) instead of a VALU add.
+The codegen separates the induction-variable contribution from the per-lane
+thread offset so the backend can fold the uniform part into the buffer_load
+soffset field (SGPR) instead of a VALU add.
 
 Without the split, the loop body computes:
-  offset = thread_offset + iv_offset   (single arith.addi, all in VGPR)
+  offset = wg_off + thread_off + iv_off  (single expression in lane offset path)
 
-With the split:
-  iv_off  = arith.muli(iv, stride)     (uniform across lanes)
-  offset  = arith.addi(thread_off, iv_off)
+With the split and rebase path:
+  wg_off  -> memref.reinterpret_cast offset (SRD/base path)
+  iv_off  = arith.muli(iv, stride)         (uniform across lanes)
+  offset  = arith.addi(thread_off, iv_off) (loop body lane offset)
 
 The arith.addi(VGPR, SGPR) pattern lets the AMDGPU backend's
 SIFoldOperands fold the SGPR into the buffer_load soffset field.
@@ -92,24 +93,26 @@ def test_uniform_offset_split():
         target="gfx950",
     )
     gemm = wave_compile(options, gemm)
+    with open("uniform_offset_split.mlir", "w") as f:
+        f.write(gemm.asm)
     print(gemm.asm)
 
     # CHECK-LABEL: test_uniform_offset_split
     # CHECK:       func.func @gemm
 
-    # The per-lane thread offset (%thread_off) is computed OUTSIDE the
-    # scf.for loop -- it is loop-invariant.
+    # Workgroup-base contribution is hoisted into memref.reinterpret_cast
+    # (SRD base path), while per-lane thread offset remains a loop-invariant
+    # add and IV offset is added inside the loop body.
+    # CHECK:       %[[WG_BASE:.*]] = arith.muli %{{.*}}, %c64 overflow<nsw> : index
     # CHECK:       %[[THREAD_OFF:.*]] = arith.addi %{{.*}}, %{{.*}} overflow<nsw>
+    # CHECK:       %[[SRC_REBASE:.*]] = memref.reinterpret_cast %{{.*}} to offset: [%[[WG_BASE]]]
     # CHECK:       scf.for %[[IV:[a-z0-9]+]] =
 
     # Inside the loop, the induction-variable contribution is computed
-    # via affine.apply (IV * stride) and combined with a workgroup base
-    # via arith.addi.  The per-lane thread offset is then added as a
-    # SEPARATE arith.addi -- this separation lets the backend place the
-    # lane-uniform part in buffer_load soffset (SGPR).
+    # via affine.apply (IV * stride) and added to the thread-dependent
+    # offset before gather_to_lds.
     # CHECK:         %[[IV_OFF:.*]] = affine.apply {{.*}}()[%[[IV]]]
-    # CHECK:         %[[WG_IV:.*]] = arith.addi %{{.*}}, %[[IV_OFF]] overflow<nsw>
-    # CHECK:         %[[COMBINED:.*]] = arith.addi %[[THREAD_OFF]], %[[WG_IV]] overflow<nsw>
+    # CHECK:         %[[COMBINED:.*]] = arith.addi %[[THREAD_OFF]], %[[IV_OFF]] overflow<nsw>
     # CHECK:         amdgpu.gather_to_lds %{{.*}}[%[[COMBINED]]]
 
 

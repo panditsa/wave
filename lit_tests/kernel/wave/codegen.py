@@ -2148,7 +2148,7 @@ def test_broadcast_scaled_add():
     # on the rhs before doing add.
 
     # CHECK-LABEL: func @broadcast_scaled_add
-    # CHECK: %[[RHS:.+]] = memref.load {{.*}} : memref<?xf16, #amdgpu.address_space<fat_raw_buffer>>
+    # CHECK: %[[RHS:.+]] = memref.load {{.*}} : memref<?xf16, {{.*}}#amdgpu.address_space<fat_raw_buffer>>
     # CHECK: %[[BROADCAST_RHS:.+]] = vector.broadcast %[[RHS]] : f16 to vector<2xf16>
     # CHECK: arith.addf %{{.*}}, %[[BROADCAST_RHS]] : vector<2xf16>
 
