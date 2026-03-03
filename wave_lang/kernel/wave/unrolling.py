@@ -70,10 +70,16 @@ def unroll(
         assert isinstance(
             iterate.count, int | Integer
         ), "Iteration count must be a statically determinable integer"
-    if iterate.count / unroll_factor < 1:
-        raise ValueError("Unroll factor is too large for the iteration count.")
-    if iterate.count % unroll_factor != 0:
-        raise ValueError("Unroll factor must divide the iteration count evenly.")
+
+    count = iterate.count
+    is_concrete = isinstance(count, (int, Integer)) or (
+        hasattr(count, "is_number") and count.is_number
+    )
+    if is_concrete:
+        if count / unroll_factor < 1:
+            raise ValueError("Unroll factor is too large for the iteration count.")
+        if count % unroll_factor != 0:
+            raise ValueError("Unroll factor must divide the iteration count evenly.")
     if iterate.condition is not None:
         raise ValueError("Unrolling is not supported for iterates with conditions.")
 
