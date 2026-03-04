@@ -270,7 +270,7 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     print("MXFP GEMM preshuffle-B 4-wave (WaveASM backend) test passed!")
 
 
-def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
+def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
     is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
 ):
     """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
