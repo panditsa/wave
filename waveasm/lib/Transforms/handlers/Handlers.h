@@ -71,8 +71,6 @@ mlir::LogicalResult handleArithMulI(mlir::Operation *op,
                                     TranslationContext &ctx);
 mlir::LogicalResult handleArithDivUI(mlir::Operation *op,
                                      TranslationContext &ctx);
-mlir::LogicalResult handleArithDivSI(mlir::Operation *op,
-                                     TranslationContext &ctx);
 mlir::LogicalResult handleArithRemUI(mlir::Operation *op,
                                      TranslationContext &ctx);
 mlir::LogicalResult handleArithIndexCast(mlir::Operation *op,
@@ -157,8 +155,6 @@ mlir::LogicalResult handleVectorFma(mlir::Operation *op,
                                     TranslationContext &ctx);
 mlir::LogicalResult handleVectorReduction(mlir::Operation *op,
                                           TranslationContext &ctx);
-mlir::LogicalResult handleVectorFromElements(mlir::Operation *op,
-                                             TranslationContext &ctx);
 
 //===----------------------------------------------------------------------===//
 // AMDGPU Dialect Handlers

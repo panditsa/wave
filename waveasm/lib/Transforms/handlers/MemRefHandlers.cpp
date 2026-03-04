@@ -196,38 +196,31 @@ LogicalResult handleMemRefLoad(Operation *op, TranslationContext &ctx) {
   auto memrefType = loadOp.getMemRefType();
   auto vregType = ctx.createVRegType();
 
-  Type elemType = memrefType.getElementType();
-  int64_t elemBits = elemType.getIntOrFloatBitWidth();
-
   if (isLDSMemRef(memrefType)) {
-    // LDS load.
+    // LDS load
     Value vaddr;
     if (!loadOp.getIndices().empty()) {
-      if (auto mapped = ctx.getMapper().getMapped(loadOp.getIndices()[0]))
+      if (auto mapped = ctx.getMapper().getMapped(loadOp.getIndices()[0])) {
         vaddr = *mapped;
+      }
     }
     if (!vaddr) {
       auto immType = ctx.createImmType(0);
       vaddr = ConstantOp::create(builder, loc, immType, 0);
     }
 
-    Value result;
-    if (elemBits <= 8)
-      result = DS_READ_U8::create(builder, loc, TypeRange{vregType}, vaddr)
-                   .getResult(0);
-    else
-      result = DS_READ_B32::create(builder, loc, TypeRange{vregType}, vaddr)
-                   .getResult(0);
-    ctx.getMapper().mapValue(loadOp.getResult(), result);
+    auto readOp = DS_READ_B32::create(builder, loc, TypeRange{vregType}, vaddr);
+    ctx.getMapper().mapValue(loadOp.getResult(), readOp.getResult(0));
   } else {
-    // Global load.
+    // Global load
     auto sregType = ctx.createSRegType(4, 4);
     auto srd = PrecoloredSRegOp::create(builder, loc, sregType, 8, 4);
 
     Value voffset;
     if (!loadOp.getIndices().empty()) {
-      if (auto mapped = ctx.getMapper().getMapped(loadOp.getIndices()[0]))
+      if (auto mapped = ctx.getMapper().getMapped(loadOp.getIndices()[0])) {
         voffset = *mapped;
+      }
     }
     if (!voffset) {
       auto immType = ctx.createImmType(0);
@@ -236,17 +229,9 @@ LogicalResult handleMemRefLoad(Operation *op, TranslationContext &ctx) {
 
     auto zeroImm = builder.getType<ImmType>(0);
     auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-
-    Value result;
-    if (elemBits <= 8)
-      result = BUFFER_LOAD_UBYTE::create(builder, loc, TypeRange{vregType}, srd,
-                                         voffset, zeroConst)
-                   .getResult(0);
-    else
-      result = BUFFER_LOAD_DWORD::create(builder, loc, TypeRange{vregType}, srd,
-                                         voffset, zeroConst)
-                   .getResult(0);
-    ctx.getMapper().mapValue(loadOp.getResult(), result);
+    auto loadInstr = BUFFER_LOAD_DWORD::create(
+        builder, loc, TypeRange{vregType}, srd, voffset, zeroConst);
+    ctx.getMapper().mapValue(loadOp.getResult(), loadInstr.getResult(0));
   }
 
   return success();
