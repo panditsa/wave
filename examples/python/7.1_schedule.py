@@ -257,15 +257,32 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
 ):
     """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    options.use_buffer_ops = False
+    options.wave_runtime = True
+    options.use_wave_asm_backend = True
+    options.dump_intermediates = "build/intermediates"
+    schedule = get_mxfp4_asymmetric_schedule(is_bscale_shuffled=True)
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    print("MXFP GEMM preshuffle-B 4-wave (WaveASM backend) test passed!")
+
+
+def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
+):
+    """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
     # Make M, N, K dynamic so the compiler does not specialize on problem size.
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
     for sym in dynamic_symbols:
         del options.subs[sym]
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
-    options.backend = "asm"
+    options.backend = "llvm"
     options.wave_runtime = True
-    options.use_wave_asm_backend = True
     options.dump_intermediates = "build/intermediates"
     schedule = get_mxfp4_asymmetric_schedule(is_bscale_shuffled=True)
     options.print_ir_after = "all" if is_debug else []
