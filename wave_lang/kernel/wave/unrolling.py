@@ -7,6 +7,7 @@
 from sympy import Integer
 from torch import fx
 
+from wave_lang.kernel._support.indexing import is_literal
 from wave_lang.kernel._support.tracing import CapturedTrace
 
 from ..ops.wave_ops import (
@@ -72,10 +73,7 @@ def unroll(
         ), "Iteration count must be a statically determinable integer"
 
     count = iterate.count
-    is_concrete = isinstance(count, (int, Integer)) or (
-        hasattr(count, "is_number") and count.is_number
-    )
-    if is_concrete:
+    if is_literal(count):
         if count / unroll_factor < 1:
             raise ValueError("Unroll factor is too large for the iteration count.")
         if count % unroll_factor != 0:
