@@ -391,14 +391,19 @@ def _transform_scale_memory(
         k_start = subs_idxc(seq_d0.start)
         m_start = subs_idxc(seq_d1.start)
 
-        probe_subs = {s: 0 for s in k_start.free_symbols | m_start.free_symbols}
+        # TODO: This will not work with split K where each wave may start at a different k offset.
+        probe_subs = {s: 0 for s in k_start.free_symbols}
         k_offset = int(k_start.subs(probe_subs))
-        m_offset = int(m_start.subs(probe_subs))
 
         chunk_size = (k_scale_shuffled // 8) * 256
-        constant_base = (
-            (m_offset // 32) * chunk_size + (k_offset // 4) * 2 + ((m_offset // 16) % 2)
-        )
+
+        # m_start is kept symbolic: it contains THREAD_0 terms that encode
+        # the wave's M-position (via floor(T0/64)).  Zeroing THREAD_0 would
+        # collapse all waves to wave-0 addresses, producing wrong reads for
+        # waves covering higher M-blocks.
+        m_block = sympy.floor(m_start / 32)
+        half_block = sympy.Mod(sympy.floor(m_start / 16), 2)
+        constant_base = m_block * chunk_size + (k_offset // 4) * 2 + half_block
 
         lane_id = sympy.Mod(THREAD_0, 64)
         flat_lds = constant_base + lane_id * 4
