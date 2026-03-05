@@ -858,8 +858,8 @@ def testScaledGemmMXFP4PreshuffleMacrotiles(
     [(1024, 1024, 8192)],
 )
 @pytest.mark.parametrize(
-    "block_shape",
-    [(128, 256, 256)],
+    "block_shape,wave_shape",
+    [((128, 256, 256), (1, 4)), ((128, 32, 256), (2, 2)), ((256, 224, 256), (2, 2))],
 )
 @pytest.mark.parametrize(
     "mfma_variant",
@@ -868,13 +868,14 @@ def testScaledGemmMXFP4PreshuffleMacrotiles(
 def testScaledGemmMXFP4PreshuffleBDynamic(
     shape: tuple[int, int, int],
     block_shape: tuple[int, int, int],
+    wave_shape: tuple[int, int],
     mfma_variant: ScaledMMAType,
 ):
     """End-to-end test for MXFP4 GEMM with preshuffled B and dynamic M, N, K."""
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape,
         block_shape,
-        wave_shape=(1, 4),
+        wave_shape=wave_shape,
         mfma_variant=mfma_variant,
     )
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
