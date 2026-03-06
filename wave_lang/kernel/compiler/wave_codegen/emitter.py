@@ -153,10 +153,23 @@ class WaveEmitter:
 
         arg_types = [abi_type(b) for b in bindings]
 
+        # Dynamic strides only with Wave runtime and LLVM backend (not ASM).
+        # Stride args only for leading dimensions (innermost always has unit stride).
+        stride_arg_count = 0
+        if self.options.dynamic_strides:
+            stride_arg_count = sum(
+                max(0, len(b.kernel_buffer_type.symbolic_shape) - 1)
+                for b in self.root_sig.sig.kernel_buffer_bindings
+            )
+            if stride_arg_count > 0:
+                arg_types += [IndexType.get()] * stride_arg_count
+
         ftype = FunctionType.get(arg_types, [])
         func_op = func_d.FuncOp(self.kernel_name, ftype, visibility="private")
 
         locs = create_argument_locations(bindings)
+        if stride_arg_count > 0:
+            locs += [Location.unknown()] * stride_arg_count
         entry_block = func_op.add_entry_block(locs)
 
         # Map dynamic symbols to buffer argument indices and dimensions.
@@ -166,6 +179,7 @@ class WaveEmitter:
 
         with InsertionPoint(entry_block), Location.name("wave-generated function"):
             self.emit_program_invariants()
+            stride_arg_offset = len(bindings) if self.options.dynamic_strides else 0
             for bind, arg in zip(bindings, entry_block.arguments):
                 node = bind.reference[1]
                 if bind.binding_type != BindingType.KERNEL_BUFFER:
@@ -193,25 +207,43 @@ class WaveEmitter:
                     physical_shape = layout.shape
 
                 static_sizes = [get_static_dim(s) for s in physical_shape]
+                rank = len(symbolic_shape)
 
-                idx_context = IndexingContext.current()
-                strides = strides_from_symbolic_shape(
-                    idx_context, physical_shape, allow_mixed_shapes=True
-                )
-                static_strides = [get_static_dim(s) for s in strides]
+                dynamic_strides = self.options.dynamic_strides and stride_arg_count > 0
+                if dynamic_strides:
+                    # vector.load requires the most minor (innermost) dim to have unit stride.
+                    # Only leading (rank - 1) strides are passed; innermost is always 1.
+                    leading_count = max(0, rank - 1)
+                    stride_args = list(
+                        entry_block.arguments[
+                            stride_arg_offset : stride_arg_offset + leading_count
+                        ]
+                    )
+                    stride_arg_offset += leading_count
+                    dyn_stride_sentinel = MemRefType.get_dynamic_stride_or_offset()
+                    static_strides = [dyn_stride_sentinel] * (rank - 1) + [1]
+                    dyn_strides = list(stride_args) + [
+                        arith_d.constant(IndexType.get(), 1)
+                    ]
+                else:
+                    idx_context = IndexingContext.current()
+                    strides = strides_from_symbolic_shape(
+                        idx_context, physical_shape, allow_mixed_shapes=True
+                    )
+                    static_strides = [get_static_dim(s) for s in strides]
+                    dyn_strides = [
+                        gen_sympy_index(add_emitter_subs(self), s)
+                        for s in strides
+                        if get_static_dim(s) == dyn_val
+                    ]
+
                 layout = StridedLayoutAttr.get(offset=dyn_val, strides=static_strides)
                 memref_type = MemRefType.get(static_sizes, element_type, layout=layout)
-
                 offset = arith_d.constant(IndexType.get(), 0)
                 dyn_sizes = [
                     gen_sympy_index(add_emitter_subs(self), s)
                     for s, p in zip(symbolic_shape, physical_shape)
                     if get_static_dim(p) == dyn_val
-                ]
-                dyn_strides = [
-                    gen_sympy_index(add_emitter_subs(self), s)
-                    for s in strides
-                    if get_static_dim(s) == dyn_val
                 ]
                 res = memref_d.reinterpret_cast(
                     memref_type,

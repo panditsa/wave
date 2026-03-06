@@ -778,6 +778,7 @@ def compile_launchable_to_mlir(
     if options.waves_per_eu:
         llvm_func_config["amdgpu-waves-per-eu"] = options.waves_per_eu
 
+    # Dynamic strides are only supported with the LLVM/Wave runtime path, not ASM backend.
     dispatch_entrypoint = exe.define_entrypoint(
         entrypoint_name,
         kernel_sig,
@@ -787,6 +788,7 @@ def compile_launchable_to_mlir(
         options.dynamic_symbols,
         llvm_func_config,
         trace.location,
+        options.dynamic_strides,
     )
 
     # Only emit MLIR if we don't have a module yet.
@@ -1115,6 +1117,7 @@ def wave_compile(
                 async_dispatch=is_async,
                 device_layout=device_layout,
                 device_constraints=kernel.device_constraints,
+                dynamic_strides=options.dynamic_strides,
             )
         mb.module_op.verify()
         asm = mb.module_op.get_asm(

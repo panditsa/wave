@@ -35,6 +35,7 @@ from .kernel_codegen import (
     BindingDesc,
     KernelSignature,
     create_argument_locations,
+    get_dynamic_stride_arg_count,
 )
 from ..wave.constraints import DeviceConstraint
 from .host_utils import HostSignature, split_input_tensors, merge_output_slices
@@ -135,6 +136,7 @@ def isolated_test_call(
     async_dispatch: bool = False,
     device_layout: Optional[Grid] = None,
     device_constraints: Optional[list[DeviceConstraint]] = None,
+    dynamic_strides: bool = False,
 ):
     with InsertionPoint(mb.body_block), Location.unknown():
 
@@ -159,6 +161,12 @@ def isolated_test_call(
 
                 arg_dim_mapping[dim_symbol] = (arg_idx, dim_idx)
 
+        stride_arg_count = get_dynamic_stride_arg_count(
+            dynamic_strides, host_sig.buffer_bindings
+        )
+        if stride_arg_count > 0:
+            input_tensors += [IndexType.get()] * stride_arg_count
+
         if async_dispatch:
             fence_type = IrType.parse("!hal.fence")
             input_tensors += [fence_type] * 2
@@ -175,6 +183,8 @@ def isolated_test_call(
             sig.kernel_buffer_bindings + scalar_bindings
         )
 
+        if stride_arg_count > 0:
+            arg_locs += [Location.unknown()] * stride_arg_count
         if async_dispatch:
             arg_locs += [Location.unknown()] * 2
 
@@ -184,7 +194,7 @@ def isolated_test_call(
         dynamic_offset = scalars_offset + scalars_count
 
         with InsertionPoint(entry_block):
-            arguments = entry_block.arguments
+            arguments = list(entry_block.arguments)
             if async_dispatch:
                 in_fence = arguments[-2]
                 out_fence = arguments[-1]
@@ -258,6 +268,14 @@ def isolated_test_call(
                     sym_val = arith_d.divsi(sym_val, div_c)
                 dynamic_argument_map[dim] = sym_val
 
+            # Create workload base: dynamic dims, then scalars, then strides.
+            dynamic_args = [dynamic_argument_map[dim] for dim in dynamic_symbols]
+            if stride_arg_count > 0:
+                stride_args = [to_index(v) for v in arguments[-stride_arg_count:]]
+            else:
+                stride_args = []
+            workload_base = dynamic_args + scalars_args + stride_args
+
             assert isinstance(entry_block, Block)
             # Create a flow.dispatch op to the kernel
             dispatch = SymbolRefAttr.get([exe.sym_name.value, entrypoint])
@@ -313,8 +331,7 @@ def isolated_test_call(
 
                     out = flow_d.DispatchOp(
                         output_slices,
-                        [dynamic_argument_map[dim] for dim in dynamic_symbols]
-                        + scalars_args,
+                        workload_base,
                         entrypoints,
                         block_argument_list,
                         [dynamic_argument_map[dim] for dim in argument_dims],
@@ -340,8 +357,7 @@ def isolated_test_call(
                 # with the provided host signature arguments.
                 out = flow_d.DispatchOp(
                     memref_to_tensor(output_types),
-                    [dynamic_argument_map[dim] for dim in dynamic_symbols]
-                    + scalars_args,
+                    workload_base,
                     entrypoints,
                     list(arguments)
                     + [dynamic_argument_map[s] for s in dynamic_symbols],

@@ -35,6 +35,7 @@ try:
     from water_mlir.water_mlir.dialects import wave, arith, amdgpu, func
     from water_mlir.water_mlir.dialects.wave import (
         AllocateOp,
+        BroadcastOp,
         ReadOp,
         WriteOp,
         MmaOp,
@@ -43,6 +44,7 @@ try:
         IterateOp,
         YieldOp,
         WaveAddressSpaceAttr,
+        WaveExprListAttr,
         WaveMmaKindAttr,
         WaveSymbolMappingAttr,
         WaveWorkgroupDimAttr,
@@ -76,13 +78,14 @@ from wave_lang.kernel.wave.mlir_converter.water_emitter import serialize_locatio
 from wave_lang.kernel.wave.utils.symbol_utils import get_induction_symbol
 from wave_lang.support.indexing import index_symbol, IndexSequence
 from wave_lang.kernel._support.indexing import IndexExpr, IndexSymbol, safe_subs
-from wave_lang.kernel.lang.wave_types import Memory, Register
+from wave_lang.kernel.lang.wave_types import IndexMapping, Memory, Register
 from wave_lang.kernel.lang.global_symbols import (
     GLOBAL_ADDRESS_SPACE,
     SHARED_ADDRESS_SPACE,
 )
 from wave_lang.kernel.ops.wave_ops import (
     Allocate,
+    Broadcast,
     Read,
     Write,
     MMA,
@@ -133,6 +136,7 @@ class AttrNames(Enum):
     OFFSET = ("offset", "offset")
     SIZE = ("size", "size")
     STRIDE = ("stride", "stride")
+    MAPPING = ("mapping", "mapping")
     ORDERED_SYMS = ("ordered_syms", "ordered_syms")
     VALUE = ("value", "value")
 
@@ -216,6 +220,58 @@ def _convert_read_write_bounds(
         exprs = expr_list_attr_to_exprs(value)
         bounds[index_symbol(key.name)] = exprs[0]
     return bounds
+
+
+def _convert_mapping_attr(
+    mapping_attr: WaveExprListAttr,
+    memory_type: WaveTensorType,
+    value_type: WaveTensorType,
+    *,
+    is_read: bool,
+) -> IndexMapping | None:
+    """Reconstruct an IndexMapping from a Water MLIR permutation map attribute.
+
+    The water emitter stores the mapping as a permutation affine map
+    (memory dims -> value dims). This inverts the process: extracts the
+    permutation, then rebuilds input/output mappings using dimension symbols
+    from the memory and value types.
+
+    For reads, input_mapping describes memory dims; for writes, output_mapping
+    describes memory dims (matching the convention in water_emitter.py).
+
+    Note: dynamic_val_mappings are not represented in the MLIR attribute and
+    are not reconstructed here. Roundtripping mappings with dynamic values
+    is not currently supported.
+    """
+    affine_map = mapping_attr.map
+    if affine_map is None:
+        return None
+    n = affine_map.n_dims
+
+    inverse_perm = []
+    for i in range(n):
+        expr = affine_map.results[i]
+        assert isinstance(
+            expr, ir.AffineDimExpr
+        ), f"Expected permutation map with AffineDimExpr results, got {type(expr)}"
+        inverse_perm.append(ir.AffineDimExpr(expr).position)
+
+    perm = [0] * n
+    for i, j in enumerate(inverse_perm):
+        perm[j] = i
+
+    memory_dims = [index_symbol(symbol_attr_to_name(s)) for s in memory_type.shape]
+    value_dims = [index_symbol(symbol_attr_to_name(s)) for s in value_type.shape]
+
+    sym_to_iter = {memory_dims[i]: IndexMapping.iterator(perm[i]) for i in range(n)}
+
+    memory_mapping = {dim: sym_to_iter[dim] for dim in memory_dims}
+    value_mapping = {dim: sym_to_iter[dim] for dim in value_dims}
+
+    if is_read:
+        return IndexMapping(n, memory_mapping, value_mapping)
+    else:
+        return IndexMapping(n, value_mapping, memory_mapping)
 
 
 def _convert_supported_attrs(
@@ -551,6 +607,26 @@ def _handle_register_op(op: RegisterOp, parse_ctx: _OpParseContext) -> None:
     parse_ctx.add_mapping(op.result, register_op.fx_node)
 
 
+def _handle_broadcast_op(op: BroadcastOp, parse_ctx: _OpParseContext) -> None:
+    """Handle wave.broadcast operation."""
+    source_node = parse_ctx.resolve_operand(op.source)
+    result_type = op.result.type
+    target_shape = tuple(
+        index_symbol(symbol_attr_to_name(attr)) for attr in result_type.shape
+    )
+    dtype = mlir_element_type_to_dtype(result_type.element_type)
+    converted_attrs = _convert_supported_attrs(op)
+
+    broadcast_op = Broadcast.create(
+        parse_ctx.graph,
+        arg=source_node,
+        target_shape=target_shape,
+        type=Register[(*target_shape, dtype)],
+    )
+    _apply_mlir_attrs_to_fx_node(broadcast_op.fx_node, converted_attrs)
+    parse_ctx.add_mapping(op.result, broadcast_op.fx_node)
+
+
 def _handle_lds_barrier_op(op: amdgpu.LDSBarrierOp, parse_ctx: _OpParseContext) -> None:
     """Handle amdgpu.lds_barrier operation."""
     # AMD GPU lds_barrier maps to SharedMemoryBarrier in FX
@@ -616,8 +692,17 @@ def _handle_read_op(op: ReadOp, parse_ctx: _OpParseContext) -> None:
     memory_node = parse_ctx.resolve_operand(op.memory)
     converted_attrs = _convert_supported_attrs(
         op,
-        ignore_attrs={AttrNames.ORDERED_SYMS.mlir_name},
+        ignore_attrs={AttrNames.ORDERED_SYMS.mlir_name, AttrNames.MAPPING.mlir_name},
     )
+
+    mapping = None
+    if AttrNames.MAPPING.mlir_name in op.attributes:
+        mapping = _convert_mapping_attr(
+            op.attributes[AttrNames.MAPPING.mlir_name],
+            op.memory.type,
+            op.result.type,
+            is_read=True,
+        )
 
     read_op = Read.create(
         parse_ctx.graph,
@@ -625,6 +710,7 @@ def _handle_read_op(op: ReadOp, parse_ctx: _OpParseContext) -> None:
         elements_per_thread=converted_attrs.pop(
             AttrNames.ELEMENTS_PER_THREAD.mlir_name, None
         ),
+        mapping=mapping,
         bounds=converted_attrs.pop(AttrNames.BOUNDS.mlir_name, None),
         type=_convert_wave_tensor_type(op.result.type, parse_ctx),
     )
@@ -638,8 +724,17 @@ def _handle_write_op(op: WriteOp, parse_ctx: _OpParseContext) -> None:
     mem_node = parse_ctx.resolve_operand(op.memory)
     converted_attrs = _convert_supported_attrs(
         op,
-        ignore_attrs={AttrNames.ORDERED_SYMS.mlir_name},
+        ignore_attrs={AttrNames.ORDERED_SYMS.mlir_name, AttrNames.MAPPING.mlir_name},
     )
+
+    mapping = None
+    if AttrNames.MAPPING.mlir_name in op.attributes:
+        mapping = _convert_mapping_attr(
+            op.attributes[AttrNames.MAPPING.mlir_name],
+            op.memory.type,
+            op.value_to_store.type,
+            is_read=False,
+        )
 
     write_op = Write.create(
         parse_ctx.graph,
@@ -648,9 +743,15 @@ def _handle_write_op(op: WriteOp, parse_ctx: _OpParseContext) -> None:
         elements_per_thread=converted_attrs.pop(
             AttrNames.ELEMENTS_PER_THREAD.mlir_name, None
         ),
+        mapping=mapping,
         bounds=converted_attrs.pop(AttrNames.BOUNDS.mlir_name, None),
         type=get_custom(mem_node).type,
     )
+    if mapping is not None:
+        # type was set from memory shape (e.g. [N,K,M]). infer_type corrects
+        # it to the mapping's input shape (the value-to-store/register shape,
+        # e.g. [M,N,K]).
+        write_op.infer_type()
     _apply_mlir_attrs_to_fx_node(write_op.fx_node, converted_attrs)
     # No mapping added because write produces no SSA results.
 
@@ -918,6 +1019,8 @@ def _convert_ops(ops: Sequence[ir.Operation], parse_ctx: _OpParseContext) -> Non
                 _handle_register_op(op, parse_ctx)
             case AllocateOp():
                 _handle_allocate_op(op, parse_ctx)
+            case BroadcastOp():
+                _handle_broadcast_op(op, parse_ctx)
             case ReadOp():
                 _handle_read_op(op, parse_ctx)
             case WriteOp():

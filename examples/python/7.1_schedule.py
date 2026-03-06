@@ -20,6 +20,7 @@ from wave_lang.kernel.wave.templates import (
     get_tagged_mxfp4_gemm,
     get_tagged_mxfp4_gemm_preshuffle_b,
     get_tagged_mxfp4_gemm_preshuffle_scales,
+    get_tagged_mxfp4_gemm_preshuffle_scales_and_B,
 )
 from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_schedule,
@@ -27,6 +28,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
+    get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
 )
 from wave_lang.kernel.wave.utils.mxfp_utils import (
     generate_gemm_afp4wfp4_inputs,
@@ -116,6 +118,7 @@ def test_dbuf_8wave_pingpong_mxfp_gemm(
     options.specialize = True
     options.use_buffer_ops = True
     options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
     schedule = get_mxfp4_dbuf_pingpong_schedule(use_stagger=True, shape=shape)
 
     options.print_ir_after = "all" if is_debug else []
@@ -123,6 +126,36 @@ def test_dbuf_8wave_pingpong_mxfp_gemm(
     gemm = wave_compile(options, gemm, schedule)
 
     _run_mxfp_gemm_preshuffle(gemm, shape, only_scale=True)
+    print("MXFP GEMM double-buffer 8-wave ping pong with scale shuffling test passed!")
+
+
+def test_dbuf_8wave_pingpong_mxfp_gemm_Bshuffle(
+    is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256), dynamic=False
+):
+    """Double-buffered MXFP4 GEMM, 8 waves, ping-pong with stagger.
+    A&B scales are preshuffled and read from global memory directly to VGPRs.
+    Same for B data. However, loading B directly to VGPR consumes too many VGPRs and causes spilling.
+    A is read from global memory directly to LDS.
+    """
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_scales_and_B(
+        shape, block, wave_shape=(4, 2)
+    )
+    options.specialize = True
+    options.use_buffer_ops = True
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+
+    if dynamic:
+        options.dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
+        for sym in options.dynamic_symbols:
+            del options.subs[sym]
+    schedule = get_mxfp4_dbuf_pingpong_schedule_Bshuffled(use_stagger=True, shape=shape)
+
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
     print("MXFP GEMM double-buffer 8-wave ping pong with scale shuffling test passed!")
 
 
@@ -257,6 +290,7 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
 ):
     """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    options.backend = "asm"
     options.use_buffer_ops = False
     options.wave_runtime = True
     options.use_wave_asm_backend = True
