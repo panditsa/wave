@@ -63,15 +63,28 @@ int64_t getElementBytes(Type type) {
 
 int64_t computeBufferSizeFromMemRef(MemRefType memrefType) {
   int64_t numElements = 1;
+  bool hasDynamic = false;
   for (int64_t dim : memrefType.getShape()) {
-    if (dim == ShapedType::kDynamic)
-      dim = 1; // Conservative estimate for dynamic dims
+    if (dim == ShapedType::kDynamic) {
+      hasDynamic = true;
+      break;
+    }
     numElements *= dim;
+  }
+  if (hasDynamic) {
+    return 0xFFFFFFFF;
   }
   int64_t elementBytes = memrefType.getElementTypeBitWidth() / 8;
   if (elementBytes == 0)
-    elementBytes = 1; // Minimum 1 byte
-  return numElements * elementBytes;
+    elementBytes = 1;
+  int64_t size = numElements * elementBytes;
+  // The Wave compiler uses 0x7FFFFFFF as an OOB sentinel in dynamic
+  // bounds-check address selection.  If the computed SRD num_records is
+  // close to this sentinel, bump to 0xFFFFFFFF so gather_to_lds loads
+  // with sentinel voffsets don't fault on gfx950.
+  if (size >= 0x7FFFFF00)
+    size = 0xFFFFFFFF;
+  return size;
 }
 
 //===----------------------------------------------------------------------===//

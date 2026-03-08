@@ -591,7 +591,14 @@ def WaveASM_V_LSHL_OR_B32 : VALUTernaryOp<"v_lshl_or_b32">;
 def WaveASM_V_LSHL_ADD_U32 : VALUTernaryOp<"v_lshl_add_u32">;
 
 // Conditional mask and lane operations
-def WaveASM_V_CNDMASK_B32 : VALUTernaryOp<"v_cndmask_b32">;
+// V_CNDMASK_B32 implicitly reads VCC, so it must NOT have Pure or
+// ArithmeticOp traits (which would make CSE treat two instances with
+// identical explicit operands as equivalent even when VCC differs).
+def WaveASM_V_CNDMASK_B32 : WAVEASMOp<"v_cndmask_b32", []> {
+  let arguments = (ins WaveASM_VALUSrc:$src0, WaveASM_VALUSrc:$src1, WaveASM_VALUSrc:$src2);
+  let results = (outs WaveASM_AnyVGPR:$dst);
+  let assemblyFormat = "$src0 `,` $src1 `,` $src2 attr-dict `:` type($src0) `,` type($src1) `,` type($src2) `->` type($dst)";
+}
 
 // Lane read operations (VGPR -> SGPR)
 def WaveASM_V_READLANE_B32 : WAVEASMOp<"v_readlane_b32", [Pure]> {
