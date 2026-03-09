@@ -27,6 +27,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_pingpong_schedule,
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
+    get_mxfp4_asymmetric_schedule_small_n,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
 )
@@ -247,10 +248,10 @@ def test_dbuf_4wave_mxfp_asymmetric_gemm(
 
 
 def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
-    is_debug=False, shape=(1024, 1024, 8192), block=(256, 256, 256)
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 32, 256)
 ):
     """Asymmetric MXFP4 GEMM with preshuffled B data and B scales."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(2, 2))
     options.minimize_shared_allocs = True
     options.linearize_shared_access = True
     options.use_buffer_ops = True
@@ -304,11 +305,29 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     print("MXFP GEMM preshuffle-B 4-wave (WaveASM backend) test passed!")
 
 
+def test_dbuf_4wave_mxfp_preshuffle_b_gemm_small_n_cpp(
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 32, 256)
+):
+    """Preshuffle-B MXFP4 GEMM for small-N tile (128x32) using WaveASM backend."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(4, 1))
+    options.backend = "asm"
+    options.use_wave_asm_backend = True
+    options.wave_runtime = True
+    options.dump_intermediates = "build/intermediates"
+    schedule = get_mxfp4_asymmetric_schedule_small_n(is_bscale_shuffled=True)
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    print("MXFP GEMM preshuffle-B small-N 4-wave (WaveASM backend) test passed!")
+
+
 def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
     is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
 ):
     """Preshuffle-B MXFP4 GEMM with dynamic M, N, K."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(2, 2))
     # Make M, N, K dynamic so the compiler does not specialize on problem size.
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
     for sym in dynamic_symbols:
