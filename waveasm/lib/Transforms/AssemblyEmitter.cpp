@@ -699,6 +699,12 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         std::string buf;
         llvm::raw_string_ostream os(buf);
 
+        // Set SCC from the condition SGPR before branching.
+        // v_readfirstlane_b32 and s_mov_b32 do not set SCC, so we must
+        // explicitly compare the condition against zero.
+        std::string condReg = resolveValue(ifOp.getCondition());
+        os << "  s_cmp_lg_u32 " << condReg << ", 0\n";
+
         if (ifOp.hasElse()) {
           os << "  s_cbranch_scc0 " << elseLabel << "\n";
         } else {
