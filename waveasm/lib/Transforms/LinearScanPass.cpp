@@ -208,6 +208,47 @@ private:
       }
     });
 
+    // Handle duplicate yield operands in IfOp regions: if CSE or shared
+    // constants cause multiple yield operands to reference the same Value,
+    // the allocator assigns them all to the same physical register. Each
+    // IfOp result needs its own physical register, so insert copies.
+    program.walk([&](IfOp ifOp) {
+      auto deduplicateYieldOperands = [&](Block &block) {
+        auto yieldOp = dyn_cast<YieldOp>(block.getTerminator());
+        if (!yieldOp)
+          return;
+        llvm::DenseSet<Value> usedVals;
+        for (unsigned i = 0; i < yieldOp.getResults().size(); ++i) {
+          Value val = yieldOp.getResults()[i];
+          if (usedVals.contains(val)) {
+            // Create a fresh copy so the allocator assigns distinct registers.
+            OpBuilder copyBuilder(yieldOp);
+            auto loc = yieldOp.getLoc();
+            auto immType = ImmType::get(ifOp->getContext(), 0);
+            Value zeroImm =
+                ConstantOp::create(copyBuilder, loc, immType, 0);
+            Value copy;
+            if (isAGPRType(val.getType())) {
+              copy = V_MOV_B32::create(copyBuilder, loc, val.getType(),
+                                       zeroImm);
+            } else if (isVGPRType(val.getType())) {
+              copy = V_MOV_B32::create(copyBuilder, loc, val.getType(),
+                                       zeroImm);
+            } else if (isSGPRType(val.getType())) {
+              copy = S_MOV_B32::create(copyBuilder, loc, val.getType(),
+                                       zeroImm);
+            }
+            if (copy)
+              yieldOp.getResultsMutable()[i].set(copy);
+          }
+          usedVals.insert(yieldOp.getResults()[i]);
+        }
+      };
+      deduplicateYieldOperands(ifOp.getThenBlock());
+      if (ifOp.hasElse())
+        deduplicateYieldOperands(*ifOp.getElseBlock());
+    });
+
     // Create allocator with precolored values and tied operands.
     // MFMA ties come from the local tiedPairs map; loop ties come from
     // the TiedValueClasses built during liveness analysis (see below).
