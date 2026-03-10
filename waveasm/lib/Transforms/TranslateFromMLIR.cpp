@@ -594,17 +594,31 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   // Set num_records and stride using buffer size from the source SRD.
   // Use cache-swizzle encoding (0x27000) when the buffer has a
   // cacheSwizzleStride, otherwise use standard encoding (0x20000).
+  bool needsCacheSwizzle = ctx.getCacheSwizzleStride(memref).has_value();
+
   int64_t bufferSize = ctx.getBufferSizeForSRD(adj.srcSrdBase);
   int64_t clampedSize = std::min(bufferSize, kMaxNumRecords32);
   std::string movSize = "s_mov_b32 s" + std::to_string(N + 2) + ", 0x" +
                         llvm::utohexstr(clampedSize);
   RawOp::create(builder, loc, movSize);
   int64_t srdStride = kSRDStrideSwizzle;
-  if (ctx.getCacheSwizzleStride(memref).has_value())
+  if (needsCacheSwizzle)
     srdStride = 0x27000;
   std::string movStride = "s_mov_b32 s" + std::to_string(N + 3) + ", 0x" +
                           llvm::utohexstr(srdStride);
   RawOp::create(builder, loc, movStride);
+
+  // For cache-swizzle SRDs, word 1 needs the swizzle enable bits (0x40400000)
+  // in the upper 16 bits.  The s_mov_b64 above copies the raw base pointer;
+  // we must mask and OR the upper half to enable swizzle.
+  if (needsCacheSwizzle) {
+    std::string andW1 = "s_and_b32 s" + std::to_string(N + 1) + ", s" +
+                        std::to_string(N + 1) + ", 0xffff";
+    RawOp::create(builder, loc, andW1);
+    std::string orW1 = "s_or_b32 s" + std::to_string(N + 1) + ", s" +
+                       std::to_string(N + 1) + ", 0x40400000";
+    RawOp::create(builder, loc, orW1);
+  }
 
   auto srdType = ctx.createSRegType(4, 4);
   auto srd = PrecoloredSRegOp::create(builder, loc, srdType, N, 4);
