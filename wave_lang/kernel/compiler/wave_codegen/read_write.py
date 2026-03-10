@@ -399,8 +399,13 @@ def _cast_buffer_and_encode_stride(
         # fastest_dim_bound == second to last stride.
         stride_candidate = strides[-2]
         stride_int = _get_constant_value(stride_candidate)
-        # Only swizzle if stride is static and <= 8192(the useful case).
-        if stride_int and stride_int <= 8192:
+        # Swizzle if stride is static and <= 8192, or if stride is dynamic
+        # and the element type is sub-word (i8 for MXFP4 data buffers).
+        # Output buffers (f32) should not be swizzled.
+        elem_bit_width = elem_type.width if hasattr(elem_type, "width") else 32
+        if stride_int is not None and stride_int <= 8192:
+            swizzle_stride = arith_d.index_cast(uint14, stride_candidate)
+        elif stride_int is None and elem_bit_width <= 8:
             swizzle_stride = arith_d.index_cast(uint14, stride_candidate)
 
     if swizzle_stride:

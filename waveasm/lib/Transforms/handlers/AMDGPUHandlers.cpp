@@ -387,6 +387,14 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     if (auto swizzleVal = getArithConstantValue(op->getOperand(2))) {
       swizzleStride = *swizzleVal;
       hasCacheSwizzle = (swizzleStride > 0);
+    } else {
+      // Dynamic swizzle stride (e.g. K/2 when K is a runtime value).
+      // Treat as a standard swizzle — allocate a new SRD below.
+      // Use placeholder stride of 4096 (the most common stride for
+      // MXFP4 gather_to_lds).  The 0x27000 SRD encoding is stride-
+      // independent on gfx9; it only enables the swizzle mechanism.
+      swizzleStride = 4096;
+      hasCacheSwizzle = true;
     }
   }
 
@@ -395,7 +403,8 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
-  int64_t newSrdBase = ctx.getNextSwizzleSRDIndex();
+
+  // Find source SRD base — walk through the cast chain.
   int64_t srcSrdBase = -1;
 
   if (auto defOp = srcMapped->getDefiningOp()) {
@@ -423,6 +432,18 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
+  // Reuse an existing swizzle SRD for the same source binding.  These
+  // are created in the top-level program scope (not inside regions) by
+  // the emitSRDPrologue, so they dominate all uses including those
+  // inside IfOp/LoopOp regions.
+  if (auto cached = ctx.getSwizzleSRDForBase(srcSrdBase)) {
+    ctx.getMapper().mapValue(op->getResult(0), *cached);
+    ctx.setCacheSwizzleStride(op->getResult(0), swizzleStride);
+    return success();
+  }
+
+  int64_t newSrdBase = ctx.getNextSwizzleSRDIndex();
+
   std::string mov0 = "s_mov_b32 s" + std::to_string(newSrdBase) + ", s" +
                      std::to_string(srcSrdBase);
   RawOp::create(builder, loc, mov0);
@@ -449,6 +470,7 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   auto newSrd = PrecoloredSRegOp::create(builder, loc, srdType, newSrdBase, 4);
   ctx.getMapper().mapValue(op->getResult(0), newSrd);
   ctx.setCacheSwizzleStride(op->getResult(0), swizzleStride);
+  ctx.setSwizzleSRDForBase(srcSrdBase, newSrd);
 
   return success();
 }

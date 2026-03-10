@@ -295,6 +295,18 @@ public:
     return std::nullopt;
   }
 
+  /// Cache / retrieve swizzle SRDs by source SRD base index to avoid
+  /// creating duplicate swizzle SRDs for the same binding.
+  void setSwizzleSRDForBase(int64_t srcSrdBase, mlir::Value srd) {
+    swizzleSRDByBase[srcSrdBase] = srd;
+  }
+  std::optional<mlir::Value> getSwizzleSRDForBase(int64_t srcSrdBase) const {
+    auto it = swizzleSRDByBase.find(srcSrdBase);
+    if (it != swizzleSRDByBase.end())
+      return it->second;
+    return std::nullopt;
+  }
+
   //===--------------------------------------------------------------------===//
   // SRD Management
   //===--------------------------------------------------------------------===//
@@ -711,6 +723,7 @@ private:
   ValueMapper mapper;
   llvm::DenseMap<mlir::Value, int64_t> bindingMap;
   llvm::DenseMap<mlir::Value, int64_t> cacheSwizzleMap;
+  llvm::DenseMap<int64_t, mlir::Value> swizzleSRDByBase;
   llvm::DenseMap<mlir::Value, SRDInfo> srdMap;
   llvm::DenseMap<mlir::Value, int64_t>
       srdIndexMap; // memref -> SRD SGPR base index

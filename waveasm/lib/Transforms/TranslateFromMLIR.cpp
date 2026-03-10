@@ -2205,6 +2205,78 @@ LogicalResult translateModule(ModuleOp module,
     // Emit SRD prologue
     transCtx.emitSRDPrologue();
 
+    // Pre-create swizzle SRDs for fat_raw_buffer_cast ops with dynamic
+    // cacheSwizzleStride.  This must happen after emitSRDPrologue (so
+    // the source SRD indices are known) and before the second pass (so
+    // the swizzle SRDs dominate all uses including those inside IfOp
+    // regions).  Walk ALL ops including nested regions.
+    funcOp.walk([&](Operation *op) {
+      StringRef opName = op->getName().getStringRef();
+      if (opName == "amdgpu.fat_raw_buffer_cast" && op->getNumOperands() >= 3) {
+        // Check if cacheSwizzleStride is dynamic (non-constant).
+        if (!getArithConstantValue(op->getOperand(2))) {
+          // Find the source SRD base by walking the cast chain.
+          // Skip sources that go through a reinterpret_cast with a
+          // dynamic offset — those will create their own SRD via
+          // emitSRDBaseAdjustment and don't need a swizzle SRD here.
+          Value src = op->getOperand(0);
+          {
+            Value walkCheck = src;
+            for (int d = 0; d < 5; ++d) {
+              if (auto castOp = walkCheck.getDefiningOp<memref::CastOp>())
+                walkCheck = castOp.getSource();
+              else if (auto rcOp =
+                           walkCheck.getDefiningOp<memref::ReinterpretCastOp>()) {
+                auto offsets = rcOp.getStaticOffsets();
+                if (!offsets.empty() && offsets[0] == ShapedType::kDynamic)
+                  return; // Has dynamic offset → skip
+                walkCheck = rcOp.getSource();
+              } else
+                break;
+            }
+          }
+          int64_t srcSrdBase = -1;
+          for (int depth = 0; depth < 5 && srcSrdBase < 0; ++depth) {
+            if (auto srdIdx = transCtx.getSRDIndex(src)) {
+              srcSrdBase = *srdIdx;
+              break;
+            }
+            if (auto castOp = src.getDefiningOp<memref::CastOp>())
+              src = castOp.getSource();
+            else if (auto rcOp =
+                         src.getDefiningOp<memref::ReinterpretCastOp>())
+              src = rcOp.getSource();
+            else
+              break;
+          }
+          if (srcSrdBase >= 0 && !transCtx.getSwizzleSRDForBase(srcSrdBase)) {
+            int64_t N = transCtx.getNextSwizzleSRDIndex();
+            if (N + 4 < 108) {
+              auto loc = op->getLoc();
+              RawOp::create(builder, loc,
+                            "s_mov_b32 s" + std::to_string(N) + ", s" +
+                                std::to_string(srcSrdBase));
+              RawOp::create(builder, loc,
+                            "s_and_b32 s" + std::to_string(N + 1) + ", s" +
+                                std::to_string(srcSrdBase + 1) + ", 0xffff");
+              RawOp::create(builder, loc,
+                            "s_or_b32 s" + std::to_string(N + 1) + ", s" +
+                                std::to_string(N + 1) + ", 0x40400000");
+              RawOp::create(builder, loc,
+                            "s_mov_b32 s" + std::to_string(N + 2) +
+                                ", 0xFFFFFFFF");
+              RawOp::create(builder, loc,
+                            "s_mov_b32 s" + std::to_string(N + 3) +
+                                ", 0x27000");
+              auto srdType = transCtx.createSRegType(4, 4);
+              auto srd = PrecoloredSRegOp::create(builder, loc, srdType, N, 4);
+              transCtx.setSwizzleSRDForBase(srcSrdBase, srd);
+            }
+          }
+        }
+      }
+    });
+
     // Second pass: translate all operations
     for (Operation &op : funcOp.getBody().front()) {
       (void)translateOperation(&op, transCtx);
