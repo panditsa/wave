@@ -719,6 +719,48 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           os << "  s_cbranch_scc0 " << endLabel << "\n";
         }
 
+        // Helper: extract base register index from "a128", "a[128:131]",
+        // "v0", "s7", etc.
+        auto regIdx = [](const std::string &r) -> int64_t {
+          size_t p = 0;
+          while (p < r.size() && !std::isdigit(r[p]) && r[p] != '[')
+            ++p;
+          if (p < r.size() && r[p] == '[')
+            ++p;
+          return std::stoll(r.substr(p));
+        };
+
+        // Helper: emit yield-to-result copies for one branch.
+        auto emitYieldToResultCopies = [&](YieldOp yieldOp) {
+          for (unsigned i = 0; i < yieldOp.getResults().size() &&
+                               i < ifOp->getNumResults();
+               ++i) {
+            std::string src = resolveValue(yieldOp.getResults()[i]);
+            std::string dst = resolveValue(ifOp->getResult(i));
+            if (src == dst)
+              continue;
+            Type ty = yieldOp.getResults()[i].getType();
+            int64_t width = getRegSize(ty);
+            bool isAGPR = isAGPRType(ty) || isa<PARegType>(ty);
+            bool isSGPR = isSGPRType(ty) || isa<PSRegType>(ty);
+            int64_t si = regIdx(src), di = regIdx(dst);
+            for (int64_t r = 0; r < width; ++r) {
+              if (isAGPR) {
+                os << "  v_accvgpr_read_b32 v15, a" << (si + r)
+                   << "\n";
+                os << "  v_accvgpr_write_b32 a" << (di + r)
+                   << ", v15\n";
+              } else if (isSGPR) {
+                os << "  s_mov_b32 s" << (di + r) << ", s"
+                   << (si + r) << "\n";
+              } else {
+                os << "  v_mov_b32 v" << (di + r) << ", v"
+                   << (si + r) << "\n";
+              }
+            }
+          }
+        };
+
         for (Operation &thenOp : ifOp.getThenBlock()) {
           if (isa<YieldOp>(&thenOp))
             continue;
@@ -735,6 +777,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             os << line << "\n";
           }
         }
+        // Copy then-yield registers to IfOp result registers.
+        if (auto thenYield =
+                dyn_cast<YieldOp>(ifOp.getThenBlock().getTerminator()))
+          emitYieldToResultCopies(thenYield);
 
         if (ifOp.hasElse()) {
           os << "  s_branch " << endLabel << "\n";
@@ -755,6 +801,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
               os << line << "\n";
             }
           }
+          // Copy else-yield registers to IfOp result registers.
+          if (auto elseYield =
+                  dyn_cast<YieldOp>(ifOp.getElseBlock()->getTerminator()))
+            emitYieldToResultCopies(elseYield);
         }
 
         os << endLabel << ":";
