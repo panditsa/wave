@@ -592,13 +592,18 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   S_ADDC_U32::create(builder, loc, base1Type, sccType, base1, byteOffHi);
 
   // Set num_records and stride using buffer size from the source SRD.
+  // Use cache-swizzle encoding (0x27000) when the buffer has a
+  // cacheSwizzleStride, otherwise use standard encoding (0x20000).
   int64_t bufferSize = ctx.getBufferSizeForSRD(adj.srcSrdBase);
   int64_t clampedSize = std::min(bufferSize, kMaxNumRecords32);
   std::string movSize = "s_mov_b32 s" + std::to_string(N + 2) + ", 0x" +
                         llvm::utohexstr(clampedSize);
   RawOp::create(builder, loc, movSize);
+  int64_t srdStride = kSRDStrideSwizzle;
+  if (ctx.getCacheSwizzleStride(memref).has_value())
+    srdStride = 0x27000;
   std::string movStride = "s_mov_b32 s" + std::to_string(N + 3) + ", 0x" +
-                          llvm::utohexstr(kSRDStrideSwizzle);
+                          llvm::utohexstr(srdStride);
   RawOp::create(builder, loc, movStride);
 
   auto srdType = ctx.createSRegType(4, 4);

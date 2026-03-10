@@ -373,9 +373,23 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
       adj = ctx.getPendingSRDBaseAdjust(castOp.getSource());
   }
   if (adj) {
+    // Propagate the SRD base adjustment.  Also propagate any
+    // cacheSwizzleStride so that emitSRDBaseAdjustment can use 0x27000
+    // instead of 0x20000 when creating the adjusted SRD.
     ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
     ctx.setPendingSRDBaseAdjust(op->getResult(0), adj->elementOffset,
                                 adj->srcSrdBase, adj->elementBytes);
+    // Propagate cacheSwizzleStride from the fat_raw_buffer_cast operand.
+    if (op->getNumOperands() >= 3) {
+      int64_t stride = 0;
+      if (auto swizzleVal = getArithConstantValue(op->getOperand(2))) {
+        stride = *swizzleVal;
+      } else {
+        stride = 4096; // dynamic stride, use placeholder
+      }
+      if (stride > 0)
+        ctx.setCacheSwizzleStride(op->getResult(0), stride);
+    }
     return success();
   }
 
@@ -407,10 +421,12 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // Find source SRD base — walk through the cast chain.
   int64_t srcSrdBase = -1;
 
-  if (auto defOp = srcMapped->getDefiningOp()) {
-    if (defOp->getName().getStringRef() == "waveasm.precolored.sreg") {
-      if (auto indexAttr = defOp->getAttrOfType<IntegerAttr>("index")) {
-        srcSrdBase = indexAttr.getInt();
+  {
+    if (auto defOp = srcMapped->getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "waveasm.precolored.sreg") {
+        if (auto indexAttr = defOp->getAttrOfType<IntegerAttr>("index")) {
+          srcSrdBase = indexAttr.getInt();
+        }
       }
     }
   }
@@ -471,7 +487,6 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   ctx.getMapper().mapValue(op->getResult(0), newSrd);
   ctx.setCacheSwizzleStride(op->getResult(0), swizzleStride);
   ctx.setSwizzleSRDForBase(srcSrdBase, newSrd);
-
   return success();
 }
 
