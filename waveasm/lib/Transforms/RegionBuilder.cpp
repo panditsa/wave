@@ -158,6 +158,26 @@ LoopOp RegionBuilder::buildLoopFromSCFFor(scf::ForOp forOp) {
     }
   }
 
+  // Emit zero-trip-count guard.  waveasm.loop has do-while semantics
+  // (body executes at least once), but scf.for skips the body when
+  // lb >= ub.  Emit:  s_cmp_lt_u32 lb, ub; s_cbranch_scc0 L_skip_N
+  // before the loop, and L_skip_N: after the loop.
+  auto guardUpperBound = ctx.getMapper().getMapped(forOp.getUpperBound());
+  std::string guardLabel;
+  if (guardUpperBound) {
+    auto sregType = ctx.createSRegType();
+    Value ub = *guardUpperBound;
+    if (isVGPRType(ub.getType()) || isAGPRType(ub.getType()))
+      ub = V_READFIRSTLANE_B32::create(builder, loc, sregType, ub);
+    else if (!isSGPRType(ub.getType()))
+      ub = S_MOV_B32::create(builder, loc, sregType, ub);
+    S_CMP_LT_U32::create(builder, loc, sregType, lowerBoundValue, ub);
+    static int guardLabelCounter = 0;
+    guardLabel =
+        "L_skip_loop_" + std::to_string(guardLabelCounter++);
+    RawOp::create(builder, loc, "s_cbranch_scc0 " + guardLabel);
+  }
+
   // Create loop op (result types inferred from initArgs)
   auto loopOp = LoopOp::create(builder, loc, initArgs);
   Block &bodyBlock = loopOp.getBodyBlock();
@@ -283,6 +303,13 @@ LoopOp RegionBuilder::buildLoopFromSCFFor(scf::ForOp forOp) {
       ctx.setLDSBaseOffset(forRes, loopResult);
     }
     resIdx++;
+  }
+
+  // Emit the skip-label after the loop so the zero-trip-count guard
+  // branch target is defined.
+  if (!guardLabel.empty()) {
+    builder.setInsertionPointAfter(loopOp);
+    RawOp::create(builder, loc, guardLabel + ":");
   }
 
   return loopOp;
