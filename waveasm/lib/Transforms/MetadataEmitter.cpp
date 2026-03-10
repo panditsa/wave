@@ -205,11 +205,12 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   }
 
   if (usePreloading && preloadLength == 0) {
-    // Cap preload length to 14 SGPRs (7 argument pairs).
-    // The hardware on gfx950 does not reliably preload beyond this.
-    // Args beyond the preload limit are loaded via s_load_dwordx2.
-    int64_t maxPreloadSgprs = 14;
-    preloadLength = std::min(numArgs * 2, maxPreloadSgprs);
+    // Only preload when all args fit in 7 pairs (14 SGPRs).
+    // gfx950 does not reliably preload when numArgs > 7 — the loads
+    // into s[16:17] return zero even with s_load_dwordx2 backup.
+    // With > 7 args, disable preloading entirely and rely on s_load.
+    if (numArgs <= 7)
+      preloadLength = numArgs * 2;
   }
 
   // user_sgpr_count must cover ALL kernel arg slots (not just preloaded)
