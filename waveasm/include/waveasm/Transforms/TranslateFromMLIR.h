@@ -641,10 +641,14 @@ public:
   int64_t getUserSgprCount() const {
     // Base: 2 SGPRs for kernarg_segment_ptr
     int64_t count = 2;
-    // On gfx950+ with kernarg preloading, add preloaded args
+    // On gfx950+ with kernarg preloading, add preloaded args.
+    // Cap at 14 preload SGPRs (7 argument pairs) so user_sgpr_count <= 16.
+    // The hardware on gfx950 does not reliably preload the last pair
+    // when user_sgpr_count > 16.
     if (llvm::isa<GFX950TargetAttr>(target)) {
-      // Each kernel arg pointer uses 2 SGPRs
-      count += getNumKernelArgs() * 2;
+      int64_t maxPreloadSgprs = 14;
+      count += std::min(static_cast<int64_t>(getNumKernelArgs()) * 2,
+                        maxPreloadSgprs);
     }
     return count;
   }

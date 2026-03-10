@@ -163,10 +163,7 @@ void TranslationContext::emitSRDPrologue() {
 
   // Recompute SRD base indices now that we know the total number of args
   // SRDs must start after: user SGPRs + system SGPRs (workgroup IDs)
-  int64_t userSgprCount = 2; // kernarg ptr
-  if (isGFX95) {
-    userSgprCount += getNumKernelArgs() * 2; // preloaded args (bindings + scalars)
-  }
+  int64_t userSgprCount = getUserSgprCount();
   int64_t systemSgprCount = 3; // workgroup_id_x, y, z
   int64_t srdStartIndex =
       (userSgprCount + systemSgprCount + 3) & ~3; // Align to 4

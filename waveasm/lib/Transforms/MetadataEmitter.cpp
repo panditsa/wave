@@ -146,9 +146,14 @@ static void scanSystemRegisterUsage(ProgramOp program, bool &usesWorkgroupIdX,
     numArgs = numArgsAttr.getInt();
   }
 
+  // Cap preloaded args so user_sgpr_count does not exceed 16.
+  // The hardware on gfx950 does not reliably preload the last pair
+  // when user_sgpr_count > 16.
+  int64_t maxPreloadSgprs = 14; // 7 argument pairs
+  int64_t preloadSgprs = std::min(numArgs * 2, maxPreloadSgprs);
   int64_t userSgprCount = 2;
   if (isGfx950) {
-    userSgprCount = 2 + numArgs * 2;
+    userSgprCount = 2 + preloadSgprs;
   }
 
   int64_t wgIdXIndex = userSgprCount;
@@ -202,7 +207,11 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
             program->getAttrOfType<IntegerAttr>("num_kernel_args")) {
       numArgs = numArgsAttr.getInt();
     }
-    preloadLength = numArgs * 2;
+    // Cap preload length so user_sgpr_count does not exceed 16.
+    // The hardware on gfx950 does not reliably preload the last pair
+    // when user_sgpr_count > 16.
+    int64_t maxPreloadSgprs = 14; // 7 argument pairs
+    preloadLength = std::min(numArgs * 2, maxPreloadSgprs);
   }
 
   int64_t userSgprCount = 2;
