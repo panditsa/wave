@@ -683,6 +683,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             break;
           }
 
+          if (auto rawOp = dyn_cast<RawOp>(&bodyOp)) {
+            os << generateRaw(rawOp) << "\n";
+            continue;
+          }
+          if (auto commentOp = dyn_cast<CommentOp>(&bodyOp)) {
+            os << generateComment(commentOp) << "\n";
+            continue;
+          }
           auto instrLines = generateOpWithLiteralHandling(&bodyOp);
           for (const auto &line : instrLines) {
             os << line << "\n";
@@ -714,6 +722,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         for (Operation &thenOp : ifOp.getThenBlock()) {
           if (isa<YieldOp>(&thenOp))
             continue;
+          if (auto rawOp = dyn_cast<RawOp>(&thenOp)) {
+            os << generateRaw(rawOp) << "\n";
+            continue;
+          }
+          if (auto commentOp = dyn_cast<CommentOp>(&thenOp)) {
+            os << generateComment(commentOp) << "\n";
+            continue;
+          }
           auto instrLines = generateOpWithLiteralHandling(&thenOp);
           for (const auto &line : instrLines) {
             os << line << "\n";
@@ -726,6 +742,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           for (Operation &elseOp : *ifOp.getElseBlock()) {
             if (isa<YieldOp>(&elseOp))
               continue;
+            if (auto rawOp = dyn_cast<RawOp>(&elseOp)) {
+              os << generateRaw(rawOp) << "\n";
+              continue;
+            }
+            if (auto commentOp = dyn_cast<CommentOp>(&elseOp)) {
+              os << generateComment(commentOp) << "\n";
+              continue;
+            }
             auto instrLines = generateOpWithLiteralHandling(&elseOp);
             for (const auto &line : instrLines) {
               os << line << "\n";

@@ -56,3 +56,9 @@ wave_lang/kernel/wave/water_mlir/*
 water/llvm-install
 water/llvm-project
 water/build_tools/wheel/water_mlir/water_mlir
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+AGENTS.md
+CLAUDE.md

@@ -374,6 +374,21 @@ private:
           loopOp->getResult(i).setType(bodyBlock.getArgument(i).getType());
         }
       }
+
+      // Sync init arg types to body arg types for LoopLikeOpInterface
+      // verifier consistency.
+      for (unsigned i = 0; i < loopOp.getInitArgs().size(); ++i) {
+        if (i >= bodyBlock.getNumArguments())
+          continue;
+        Value initArg = loopOp.getInitArgs()[i];
+        Type bodyArgType = bodyBlock.getArgument(i).getType();
+        if (initArg.getType() != bodyArgType) {
+          if (auto opResult = dyn_cast<OpResult>(initArg))
+            opResult.setType(bodyArgType);
+          else if (auto blockArg = dyn_cast<BlockArgument>(initArg))
+            blockArg.setType(bodyArgType);
+        }
+      }
     });
 
     // Also update if op result types from yield operand types
@@ -384,6 +399,26 @@ private:
           if (i < yieldOp.getResults().size()) {
             ifOp->getResult(i).setType(yieldOp.getResults()[i].getType());
           }
+        }
+      }
+    });
+
+    // Final sync: re-propagate LoopOp body arg types to init args.
+    // The IfOp walk above may have overwritten init arg types (IfOp results)
+    // that were already synced by the LoopOp walk. Re-sync to ensure the
+    // LoopLikeOpInterface verifier sees matching types.
+    program.walk([&](LoopOp loopOp) {
+      Block &bodyBlock = loopOp.getBodyBlock();
+      for (unsigned i = 0; i < loopOp.getInitArgs().size(); ++i) {
+        if (i >= bodyBlock.getNumArguments())
+          continue;
+        Value initArg = loopOp.getInitArgs()[i];
+        Type bodyArgType = bodyBlock.getArgument(i).getType();
+        if (initArg.getType() != bodyArgType) {
+          if (auto opResult = dyn_cast<OpResult>(initArg))
+            opResult.setType(bodyArgType);
+          else if (auto blockArg = dyn_cast<BlockArgument>(initArg))
+            blockArg.setType(bodyArgType);
         }
       }
     });
