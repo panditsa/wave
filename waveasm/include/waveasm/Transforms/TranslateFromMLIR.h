@@ -636,20 +636,14 @@ public:
   bool getUsesWorkgroupIdZ() const { return usesWorkgroupIdZ; }
   bool getUsesWorkitemId() const { return usesWorkitemId; }
 
-  /// Get the number of user SGPRs (for computing system SGPR offsets)
-  /// User SGPRs include: kernarg ptr (2) + preloaded args (on gfx950+)
+  /// Get the number of user SGPRs (for computing system SGPR offsets).
+  /// User SGPRs include: kernarg ptr (2) + arg slots (on gfx950+).
+  /// This must cover ALL kernel arg slots (not just preloaded ones) so that
+  /// system SGPRs (workgroup IDs) are placed after all arg SGPR pairs.
   int64_t getUserSgprCount() const {
-    // Base: 2 SGPRs for kernarg_segment_ptr
-    int64_t count = 2;
-    // On gfx950+ with kernarg preloading, add preloaded args.
-    // Cap at 14 preload SGPRs (7 argument pairs) so user_sgpr_count <= 16.
-    // The hardware on gfx950 does not reliably preload the last pair
-    // when user_sgpr_count > 16.
-    if (llvm::isa<GFX950TargetAttr>(target)) {
-      int64_t maxPreloadSgprs = 14;
-      count += std::min(static_cast<int64_t>(getNumKernelArgs()) * 2,
-                        maxPreloadSgprs);
-    }
+    int64_t count = 2; // s[0:1] = kernarg_segment_ptr
+    if (llvm::isa<GFX950TargetAttr>(target))
+      count += getNumKernelArgs() * 2;
     return count;
   }
 

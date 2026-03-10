@@ -146,14 +146,11 @@ static void scanSystemRegisterUsage(ProgramOp program, bool &usesWorkgroupIdX,
     numArgs = numArgsAttr.getInt();
   }
 
-  // Cap preloaded args so user_sgpr_count does not exceed 16.
-  // The hardware on gfx950 does not reliably preload the last pair
-  // when user_sgpr_count > 16.
-  int64_t maxPreloadSgprs = 14; // 7 argument pairs
-  int64_t preloadSgprs = std::min(numArgs * 2, maxPreloadSgprs);
+  // user_sgpr_count must cover ALL kernel arg slots (not just preloaded ones)
+  // so that system SGPRs (workgroup IDs) are placed after all arg SGPR pairs.
   int64_t userSgprCount = 2;
   if (isGfx950) {
-    userSgprCount = 2 + preloadSgprs;
+    userSgprCount = 2 + numArgs * 2;
   }
 
   int64_t wgIdXIndex = userSgprCount;
@@ -201,22 +198,25 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   int64_t preloadLength = program.getKernargPreloadLength();
   bool usePreloading = llvm::isa<GFX950TargetAttr>(targetKind);
 
+  int64_t numArgs = 2;
+  if (auto numArgsAttr =
+          program->getAttrOfType<IntegerAttr>("num_kernel_args")) {
+    numArgs = numArgsAttr.getInt();
+  }
+
   if (usePreloading && preloadLength == 0) {
-    int64_t numArgs = 2;
-    if (auto numArgsAttr =
-            program->getAttrOfType<IntegerAttr>("num_kernel_args")) {
-      numArgs = numArgsAttr.getInt();
-    }
-    // Cap preload length so user_sgpr_count does not exceed 16.
-    // The hardware on gfx950 does not reliably preload the last pair
-    // when user_sgpr_count > 16.
-    int64_t maxPreloadSgprs = 14; // 7 argument pairs
+    // Cap preload length to 14 SGPRs (7 argument pairs).
+    // The hardware on gfx950 does not reliably preload beyond this.
+    // Args beyond the preload limit are loaded via s_load_dwordx2.
+    int64_t maxPreloadSgprs = 14;
     preloadLength = std::min(numArgs * 2, maxPreloadSgprs);
   }
 
+  // user_sgpr_count must cover ALL kernel arg slots (not just preloaded)
+  // so that system SGPRs (workgroup IDs) are placed after all arg pairs.
   int64_t userSgprCount = 2;
-  if (usePreloading && preloadLength > 0) {
-    userSgprCount = 2 + preloadLength;
+  if (usePreloading) {
+    userSgprCount = 2 + numArgs * 2;
   }
 
   lines.push_back("  .amdhsa_user_sgpr_count " + std::to_string(userSgprCount));
