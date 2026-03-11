@@ -104,6 +104,18 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
     return lines;
   }
 
+  // Instructions with dedicated generateOp handlers that already perform their
+  // own literal materialization (e.g. v_cndmask_b32 drops src2 and calls
+  // materializeLiteralOperand for src0/src1). Fall through to generateOp so
+  // the dedicated handler is used rather than the generic emitMaterializedLiteral
+  // path (which would incorrectly emit all operands including the implicit VCC).
+  if (mnemonic == "v_cndmask_b32") {
+    if (auto line = generateOp(op)) {
+      lines.push_back(*line);
+    }
+    return lines;
+  }
+
   // VOP2: literal MUST be in src0. Swap for commutative ops, materialize
   // otherwise.
   bool isCommutative = op->hasTrait<mlir::OpTrait::IsCommutative>();

@@ -579,9 +579,28 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
 
       .Case<LoopOp>([&](LoopOp loopOp) -> std::optional<std::string> {
         std::string labelName = "L_loop_" + std::to_string(loopLabelCounter++);
+        std::string exitLabel = labelName + "_end";
 
         std::string buf;
         llvm::raw_string_ostream os(buf);
+
+        // scf.for has while-loop semantics: skip the body if lb >= ub.
+        // The LoopOp is do-while, so emit a pre-check before the label.
+        // Find the S_CMP_LT_U32 feeding the ConditionOp to extract ub.
+        Block &bodyForPreCheck = loopOp.getBodyBlock();
+        for (Operation &bodyOp : bodyForPreCheck) {
+          if (auto condOp = dyn_cast<ConditionOp>(&bodyOp)) {
+            if (auto cmpOp =
+                    condOp.getCondition().getDefiningOp<S_CMP_LT_U32>()) {
+              std::string initIVStr = resolveValue(loopOp.getInitArgs()[0]);
+              std::string ubStr = resolveValue(cmpOp.getSrc1());
+              os << "  s_cmp_lt_u32 " << initIVStr << ", " << ubStr << "\n";
+              os << "  s_cbranch_scc0 " << exitLabel << "\n";
+            }
+            break;
+          }
+        }
+
         os << labelName << ":\n";
 
         Block &body = loopOp.getBodyBlock();
@@ -691,7 +710,8 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
               }
             }
 
-            os << "  s_cbranch_scc1 " << labelName;
+            os << "  s_cbranch_scc1 " << labelName << "\n";
+            os << exitLabel << ":";
             break;
           }
 

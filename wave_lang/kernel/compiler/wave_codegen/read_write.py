@@ -412,7 +412,13 @@ def _get_constant_value(candidate: Value):
         candidate.owner.opview, arith_d.ConstantOp
     ):
         return None
-    return candidate.owner.opview.value.value
+    attr = candidate.owner.opview.value
+    try:
+        return attr.value
+    except AttributeError:
+        # Index-type arith.constant ops return a bare Attribute object;
+        # unwrap via IntegerAttr to get the integer value.
+        return IntegerAttr(attr).value
 
 
 def _compute_branchless_valid_bytes(

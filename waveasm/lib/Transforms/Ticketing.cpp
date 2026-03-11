@@ -483,7 +483,6 @@ private:
     llvm::SmallVector<Operation *> allOps;
     collectOpsRecursive(program.getBodyBlock(), allOps);
 
-    if (ticketedWaitcnt) {
       for (Operation *op : allOps) {
         ++st.opIndex;
 
@@ -501,7 +500,6 @@ private:
         handleNonMemoryOp(op, st);
         handleLoopBoundary(op, st);
       }
-    }
 
     combineAdjacentWaitcnts(program);
   }

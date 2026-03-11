@@ -1824,6 +1824,8 @@ LogicalResult handleMemRefSubView(Operation *op, TranslationContext &ctx);
 LogicalResult handleMemRefLoad(Operation *op, TranslationContext &ctx);
 LogicalResult handleMemRefStore(Operation *op, TranslationContext &ctx);
 LogicalResult handleMemRefCast(Operation *op, TranslationContext &ctx);
+LogicalResult handleMemRefExtractStridedMetadata(Operation *op,
+                                                 TranslationContext &ctx);
 
 // From SCFHandlers.cpp
 LogicalResult handleSCFFor(Operation *op, TranslationContext &ctx);
@@ -2023,6 +2025,8 @@ void OpHandlerRegistry::registerDefaultHandlers(mlir::MLIRContext *ctx) {
   REGISTER_HANDLER(memref::LoadOp, handleMemRefLoad);
   REGISTER_HANDLER(memref::StoreOp, handleMemRefStore);
   REGISTER_HANDLER(memref::CastOp, handleMemRefCast);
+  REGISTER_HANDLER(memref::ExtractStridedMetadataOp,
+                   handleMemRefExtractStridedMetadata);
 
   // SCF dialect
   REGISTER_HANDLER(scf::ForOp, handleSCFFor);
@@ -2100,11 +2104,17 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
       }
     }
 
-    // First pass: handle binding.subspan operations to queue SRD setups
+    // First pass: handle binding.subspan, reinterpret_cast, and ops that
+    // produce values consumed by reinterpret_cast offsets (arith.constant,
+    // memref.extract_strided_metadata). Process in program order so that SSA
+    // def-use chains are satisfied (e.g. %c0 -> extract_strided_metadata ->
+    // reinterpret_cast).
     for (Operation &op : gpuFunc.getBody().front()) {
       StringRef opName = op.getName().getStringRef();
       if (opName == "stream.binding.subspan" ||
           opName == "iree_input.binding.subspan" ||
+          opName == "arith.constant" ||
+          opName == "memref.extract_strided_metadata" ||
           opName == "memref.reinterpret_cast") {
         (void)translateOperation(&op, ctx);
       }
@@ -2201,11 +2211,17 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
       }
     }
 
-    // First pass: handle binding.subspan operations to queue SRD setups
+    // First pass: handle binding.subspan, reinterpret_cast, and ops that
+    // produce values consumed by reinterpret_cast offsets (arith.constant,
+    // memref.extract_strided_metadata). Process in program order so that SSA
+    // def-use chains are satisfied (e.g. %c0 -> extract_strided_metadata ->
+    // reinterpret_cast).
     for (Operation &op : funcOp.getBody().front()) {
       StringRef opName = op.getName().getStringRef();
       if (opName == "stream.binding.subspan" ||
           opName == "iree_input.binding.subspan" ||
+          opName == "arith.constant" ||
+          opName == "memref.extract_strided_metadata" ||
           opName == "memref.reinterpret_cast") {
         (void)translateOperation(&op, ctx);
       }
@@ -2386,11 +2402,16 @@ LogicalResult translateModule(ModuleOp module,
       }
     }
 
-    // First pass: handle binding.subspan operations
+    // First pass: handle binding.subspan, reinterpret_cast, and ops that
+    // produce values consumed by reinterpret_cast offsets (arith.constant,
+    // memref.extract_strided_metadata). Process in program order so that SSA
+    // def-use chains are satisfied.
     for (Operation &op : funcOp.getBody().front()) {
       StringRef opName = op.getName().getStringRef();
       if (opName == "stream.binding.subspan" ||
           opName == "iree_input.binding.subspan" ||
+          opName == "arith.constant" ||
+          opName == "memref.extract_strided_metadata" ||
           opName == "memref.reinterpret_cast") {
         (void)translateOperation(&op, transCtx);
       }
