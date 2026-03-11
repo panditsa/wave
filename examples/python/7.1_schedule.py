@@ -438,7 +438,8 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
         del options.subs[sym]
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
-    options.backend = "llvm"
+    options.backend = "asm"
+    options.use_wave_asm_backend = True
     options.wave_runtime = True
     options.eliminate_epilogue = eliminate_epilogue
     options.dump_intermediates = "build/intermediates/"
