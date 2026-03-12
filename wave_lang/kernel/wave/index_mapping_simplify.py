@@ -22,6 +22,7 @@ The decomposition uses:
 """
 
 import sympy
+from collections.abc import Sequence
 from functools import lru_cache
 
 from ..lang.wave_types import IndexMapping
@@ -32,6 +33,39 @@ from .utils.symbol_utils import (
     IndexSymbol,
     subs_idxc,
 )
+
+
+def _get_symbol_lower_bounds(
+    constraints: Sequence,
+) -> dict[sympy.Symbol, sympy.Expr]:
+    """Extract lower bounds on symbols from Assumption constraints.
+
+    Handles ``Assumption(S >= c)`` and ``Assumption(S > c)`` patterns,
+    returning ``{S: lower_bound}`` where lower_bound is the tightest
+    bound found.
+    """
+    from .assumptions import Assumption
+
+    bounds: dict[sympy.Symbol, sympy.Expr] = {}
+    for c in constraints:
+        if not isinstance(c, Assumption):
+            continue
+        expr = c.expr
+        # Match S >= c  (GreaterThan)  or  S > c  (StrictGreaterThan).
+        if isinstance(expr, sympy.GreaterThan):  # S >= c
+            lhs, rhs = expr.args
+            if lhs.is_Symbol and rhs.is_number:
+                cur = bounds.get(lhs)
+                if cur is None or rhs > cur:
+                    bounds[lhs] = rhs
+        elif isinstance(expr, sympy.StrictGreaterThan):  # S > c
+            lhs, rhs = expr.args
+            if lhs.is_Symbol and rhs.is_number:
+                lb = rhs + 1  # S > c implies S >= c+1 for integers.
+                cur = bounds.get(lhs)
+                if cur is None or lb > cur:
+                    bounds[lhs] = lb
+    return bounds
 
 
 def _get_iterator_bounds(
@@ -216,6 +250,7 @@ def simplify_index_mapping(
     Returns (new_mapping, changed).
     """
     iter_bounds = _get_iterator_bounds(mapping, tile_sizes)
+    sym_lower_bounds = _get_symbol_lower_bounds(constraints)
     input_mapping = dict(mapping.input_mapping)
     changed = False
 
@@ -246,8 +281,25 @@ def simplify_index_mapping(
         if not lo_nonneg:
             continue
 
-        # Check hi < divisor, i.e. (hi - divisor) is negative.
-        diff = sympy.simplify(hi - divisor)
+        # Check hi < divisor.  When the divisor is symbolic, resolve
+        # it via IndexingContext.subs (e.g. K_PACKED -> K//2) and then
+        # substitute known lower bounds from constraints (e.g. K >= 2048
+        # lets us prove K//2 >= 1024).
+        try:
+            divisor_lb = subs_idxc(divisor)
+        except (IndexError, KeyError):
+            divisor_lb = divisor
+        if sym_lower_bounds:
+            divisor_lb = divisor_lb.subs(
+                {s: lb for s, lb in sym_lower_bounds.items()}
+            )
+        # Evaluate floor/ceiling after substitution.
+        try:
+            divisor_lb = sympy.Integer(int(divisor_lb))
+        except (TypeError, ValueError):
+            pass
+
+        diff = sympy.simplify(hi - divisor_lb)
         if diff.is_negative is not True:
             continue
 
