@@ -336,13 +336,12 @@ def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
             return quotient
         # Check if remainder is bounded in [0, denom).
         rem_bounds = expr_bounds(remainder)
-        if (
-            rem_bounds
-            and rem_bounds[0] >= 0
-            and rem_bounds[1] != sympy.oo
-            and rem_bounds[1] < denom
-        ):
-            return quotient
+        if rem_bounds and rem_bounds[0] >= 0 and rem_bounds[1] != sympy.oo:
+            try:
+                if rem_bounds[1] < denom:
+                    return quotient
+            except TypeError:
+                pass  # Symbolic comparison — can't determine.
         return quotient + sympy.floor(remainder / denom)
 
     def transform_mod_div(expr):
@@ -358,13 +357,12 @@ def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
             return sympy.Integer(0)
         # Check if remainder is bounded in [0, q) — then Mod is identity.
         rem_bounds = expr_bounds(remainder)
-        if (
-            rem_bounds
-            and rem_bounds[0] >= 0
-            and rem_bounds[1] != sympy.oo
-            and rem_bounds[1] < q
-        ):
-            return remainder
+        if rem_bounds and rem_bounds[0] >= 0 and rem_bounds[1] != sympy.oo:
+            try:
+                if rem_bounds[1] < q:
+                    return remainder
+            except TypeError:
+                pass  # Symbolic comparison — can't determine.
         return sympy.Mod(remainder, q, evaluate=False)
 
     expr = expr.replace(lambda e: transform_floor_div(e) is not None, transform_floor_div)
@@ -375,6 +373,19 @@ def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
 
 
 _simplify_cache: dict[sympy.Basic, sympy.Expr] = {}
+
+
+def simplify_divisor_multiples(expr: sympy.Expr) -> sympy.Expr:
+    """Factor out divisor-multiples from floor/Mod without expand/cancel.
+
+    Applies only the ``transform_floor_div`` and ``transform_mod_div``
+    rewrites from ``_custom_simplify_once``.  This is safe for complex
+    post-substitution expressions where ``sympy.expand`` / ``sympy.cancel``
+    would destroy the expression structure.
+    """
+    if not isinstance(expr, sympy.Basic) or expr.is_Atom:
+        return expr
+    return _custom_simplify_once(expr)
 
 
 def simplify(expr: sympy.Expr) -> sympy.Expr:
