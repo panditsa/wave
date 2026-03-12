@@ -22,6 +22,7 @@ from ..._support.indexing import IndexSequence, IndexSymbol
 from ..._support.tracing import CapturedTrace
 from ...lang.global_symbols import *
 from ...lang.wave_types import IndexMapping
+from ..index_mapping_simplify import simplify_index_mapping, get_tile_sizes_from_index
 from ...ops.wave_ops import (
     CustomOp,
     ExtractSlice,
@@ -1941,6 +1942,28 @@ def simplify_indices(trace: CapturedTrace, constraints: Sequence[Constraint] = (
                 )
                 if mapping_changed:
                     custom.mapping = new_mapping
+                # Try to eliminate flat//D and flat%D patterns using
+                # tile-level iterator bounds from the node's index.
+                try:
+                    node_index = custom.index
+                except (ValueError, AttributeError):
+                    node_index = None
+                if isinstance(node_index, dict):
+                    tile_sizes = get_tile_sizes_from_index(
+                        custom.mapping, node_index
+                    )
+                    if tile_sizes:
+                        new_mapping2, mapping_changed2 = simplify_index_mapping(
+                            custom.mapping, constraints, tile_sizes
+                        )
+                        if mapping_changed2:
+                            logger.debug(
+                                "simplify_index_mapping eliminated floordiv/mod"
+                                " on %s with tile_sizes=%s",
+                                node.name,
+                                tile_sizes,
+                            )
+                            custom.mapping = new_mapping2
             # Simplify index sequences.
             try:
                 index = custom.index
