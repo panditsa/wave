@@ -36,17 +36,60 @@ from .utils.symbol_utils import (
 
 def _get_iterator_bounds(
     mapping: IndexMapping,
+    tile_sizes: dict[IndexSymbol, IndexExpr] | None = None,
 ) -> dict[sympy.Symbol, tuple[sympy.Expr, sympy.Expr]]:
-    """Extract iterator bounds from the IndexMapping's iteration_shape.
+    """Extract iterator bounds from tile sizes or the iteration_shape.
+
+    When *tile_sizes* is provided (from the node's index sequences),
+    the bounds use the concrete tile size for each iterator, which is
+    typically much tighter than the full dimension from iteration_shape.
 
     Returns {iterator_symbol: (0, upper_bound - 1)} for each iterator.
     """
     bounds = {}
+    # Build reverse map: dim_symbol -> iterator_symbol.
+    dim_to_iter = {}
     for sym, idx in mapping.iters.items():
         dim = mapping.iteration_shape[idx]
         if dim is not None:
-            bounds[sym] = (sympy.Integer(0), dim - 1)
+            dim_to_iter[dim] = sym
+
+    for sym, idx in mapping.iters.items():
+        dim = mapping.iteration_shape[idx]
+        if dim is None:
+            continue
+        # Prefer tile_sizes (concrete) over iteration_shape (symbolic).
+        if tile_sizes and dim in tile_sizes:
+            upper = tile_sizes[dim] - 1
+        else:
+            upper = dim - 1
+        bounds[sym] = (sympy.Integer(0), upper)
     return bounds
+
+
+def get_tile_sizes_from_index(
+    mapping: IndexMapping,
+    index: dict,
+) -> dict[IndexSymbol, IndexExpr]:
+    """Extract tile sizes for each iterator dimension from the node's index.
+
+    The node's index dict maps dimension symbols (M, N, K) to
+    IndexSequences with start/size/stride.  The mapping's output_mapping
+    tells us which dimension each iterator corresponds to.  The size of
+    that IndexSequence is the tile size for that iterator.
+    """
+    from .utils.symbol_utils import IndexSequence
+
+    tile_sizes = {}
+    # output_mapping: {dim_sym: iterator_sym}
+    # iteration_shape maps iterator ordinal -> dim_sym
+    for dim in mapping.iteration_shape:
+        if dim is None:
+            continue
+        seq = index.get(dim)
+        if isinstance(seq, IndexSequence):
+            tile_sizes[dim] = seq.size
+    return tile_sizes
 
 
 def _expr_bounds_with_iters(
@@ -161,12 +204,18 @@ def _find_floordiv_mod_pairs(
 def simplify_index_mapping(
     mapping: IndexMapping,
     constraints=(),
+    tile_sizes: dict[IndexSymbol, IndexExpr] | None = None,
 ) -> tuple[IndexMapping, bool]:
     """Simplify flat // D and flat % D patterns in an IndexMapping.
 
+    When *tile_sizes* is provided (from a node's index sequences), uses
+    the concrete tile dimensions as iterator upper bounds.  This enables
+    proving remainder < divisor for tile-level expressions that would be
+    unprovable with the full-dimension iteration_shape.
+
     Returns (new_mapping, changed).
     """
-    iter_bounds = _get_iterator_bounds(mapping)
+    iter_bounds = _get_iterator_bounds(mapping, tile_sizes)
     input_mapping = dict(mapping.input_mapping)
     changed = False
 
