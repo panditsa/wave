@@ -112,7 +112,10 @@ def expr_bounds(expr: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
 def _is_provably_divisible(term: sympy.Expr, divisor: sympy.Expr) -> bool:
     """Check if *term* is provably an integer multiple of *divisor*.
 
-    Works for both constant and symbolic divisors.
+    Works for both constant and symbolic divisors.  For a compound divisor
+    like ``c * D`` (numeric ``c``, symbolic ``D``), the check decomposes:
+    term must contain ``D`` as a factor and its numeric coefficient must be
+    divisible by ``c``.
     """
     if term.is_zero:
         return True
@@ -126,21 +129,55 @@ def _is_provably_divisible(term: sympy.Expr, divisor: sympy.Expr) -> bool:
                 if arg.is_number and arg.is_integer and (arg % divisor == 0):
                     return True
         return False
-    # Symbolic divisor: check if term is of the form (...) * divisor (or a
-    # Mul containing divisor as a factor).
+    # Decompose the divisor into numeric and symbolic parts.
+    # E.g. 8*floor(...) -> (8, floor(...))
+    div_coeff, div_sym = _split_coeff(divisor)
+
     if isinstance(term, sympy.Mul):
-        for arg in term.args:
-            if arg == divisor:
+        # Check if term contains div_sym as a multiplicative factor
+        # (possibly nested inside a sub-Mul), and the remaining numeric
+        # coefficient is divisible by div_coeff.
+        term_coeff, term_sym_factors = _split_coeff(term)
+        # Flatten symbolic factors.
+        sym_factors = (
+            list(term_sym_factors.args)
+            if isinstance(term_sym_factors, sympy.Mul)
+            else [term_sym_factors]
+        )
+        if _contains_factor(sym_factors, div_sym):
+            if div_coeff == 1 or (term_coeff % div_coeff == 0):
                 return True
-            # Handle floor(D/c)*c*k == D*k when we can't prove D%c==0 but
-            # the product floor(D/c)*c is structurally present.
-            # More general: if arg is itself a Mul containing divisor.
-            if isinstance(arg, sympy.Mul) and divisor in arg.args:
-                return True
-        # Check if the product of numeric factors times any sub-expression
-        # that equals divisor.
-        return False
     return term == divisor
+
+
+def _split_coeff(expr: sympy.Expr) -> tuple[sympy.Integer, sympy.Expr]:
+    """Split *expr* into ``(numeric_coeff, symbolic_rest)``."""
+    if expr.is_number:
+        return (expr, sympy.Integer(1))
+    if isinstance(expr, sympy.Mul):
+        coeff = sympy.Integer(1)
+        sym_parts: list[sympy.Expr] = []
+        for arg in expr.args:
+            if arg.is_number and arg.is_integer:
+                coeff *= arg
+            else:
+                sym_parts.append(arg)
+        sym = sympy.Mul(*sym_parts) if sym_parts else sympy.Integer(1)
+        return (coeff, sym)
+    return (sympy.Integer(1), expr)
+
+
+def _contains_factor(
+    factors: list[sympy.Expr], target: sympy.Expr
+) -> bool:
+    """Check if *target* appears as a factor in *factors* (possibly nested)."""
+    for f in factors:
+        if f == target:
+            return True
+        # target might be inside a nested Mul.
+        if isinstance(f, sympy.Mul) and target in f.args:
+            return True
+    return False
 
 
 def _split_sum_by_divisibility(

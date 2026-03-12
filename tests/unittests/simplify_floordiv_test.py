@@ -56,6 +56,15 @@ class TestIsProvablyDivisible:
     def test_numeric_mul_not_divisible(self):
         assert not _is_provably_divisible(7 * x, sympy.Integer(8))
 
+    def test_compound_symbolic_divisor(self):
+        """256*f(s)*g(s) is divisible by 8*f(s) because 256/8=32."""
+        f = sympy.floor(y / 8)
+        assert _is_provably_divisible(256 * f * x, 8 * f)
+
+    def test_compound_symbolic_divisor_not_divisible(self):
+        f = sympy.floor(y / 8)
+        assert not _is_provably_divisible(7 * f * x, 8 * f)
+
 
 # ── _split_sum_by_divisibility ───────────────────────────────────────────────
 
