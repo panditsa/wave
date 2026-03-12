@@ -109,10 +109,78 @@ def expr_bounds(expr: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
     return None
 
 
+def _is_provably_divisible(term: sympy.Expr, divisor: sympy.Expr) -> bool:
+    """Check if *term* is provably an integer multiple of *divisor*.
+
+    Works for both constant and symbolic divisors.
+    """
+    if term.is_zero:
+        return True
+    if divisor.is_number and divisor.is_nonzero:
+        # Constant divisor: check if term has divisor as a factor.
+        if term.is_number:
+            return term.is_integer and (term % divisor == 0)
+        # term = coeff * rest: check if coeff is divisible.
+        if isinstance(term, sympy.Mul):
+            for arg in term.args:
+                if arg.is_number and arg.is_integer and (arg % divisor == 0):
+                    return True
+        return False
+    # Symbolic divisor: check if term is of the form (...) * divisor (or a
+    # Mul containing divisor as a factor).
+    if isinstance(term, sympy.Mul):
+        for arg in term.args:
+            if arg == divisor:
+                return True
+            # Handle floor(D/c)*c*k == D*k when we can't prove D%c==0 but
+            # the product floor(D/c)*c is structurally present.
+            # More general: if arg is itself a Mul containing divisor.
+            if isinstance(arg, sympy.Mul) and divisor in arg.args:
+                return True
+        # Check if the product of numeric factors times any sub-expression
+        # that equals divisor.
+        return False
+    return term == divisor
+
+
+def _split_sum_by_divisibility(
+    expr: sympy.Expr, divisor: sympy.Expr
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Split *expr* into ``(quotient, remainder)`` such that
+    ``expr == quotient * divisor + remainder`` and every additive term in
+    ``remainder`` is NOT a proven multiple of *divisor*.
+
+    Returns ``None`` if no term is provably divisible (nothing to split).
+    """
+    terms = expr.as_ordered_terms() if isinstance(expr, sympy.Add) else [expr]
+    quot_terms: list[sympy.Expr] = []
+    rem_terms: list[sympy.Expr] = []
+    for t in terms:
+        if _is_provably_divisible(t, divisor):
+            # t = something * divisor, extract the quotient contribution.
+            q = sympy.cancel(t / divisor)
+            quot_terms.append(q)
+        else:
+            rem_terms.append(t)
+    if not quot_terms:
+        return None
+    quotient = sympy.Add(*quot_terms) if quot_terms else sympy.Integer(0)
+    remainder = sympy.Add(*rem_terms) if rem_terms else sympy.Integer(0)
+    return (quotient, remainder)
+
+
 def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
     """Apply custom algebraic simplifications that sympy misses.
 
-    Two rewrites that sympy.simplify does not perform:
+    Three rewrites that sympy.simplify does not perform:
+
+    ``transform_floor_div``: factor out D-multiples from floor division.
+    ``floor((A*D + B) / D)  ->  A + floor(B/D)``
+    (and ``-> A`` when B is bounded in ``[0, D)``)
+
+    ``transform_mod_div``: drop D-multiple terms from Mod.
+    ``Mod(A*D + B, D)  ->  Mod(B, D)``
+    (and ``-> B`` when B is bounded in ``[0, D)``)
 
     ``transform_mod``: pull a small constant addend out of Mod when every
     other term is a multiple of the modulus divisor.
@@ -213,6 +281,57 @@ def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
             terms.append(arg)
         return sympy.floor(sum(terms))
 
+    def transform_floor_div(expr):
+        """``floor((A*D + B) / D)  ->  A + floor(B/D)``."""
+        if not isinstance(expr, sympy.floor):
+            return None
+        inner = expr.args[0]
+        # Match pattern: inner = numerator / divisor (sympy represents as
+        # numerator * divisor^(-1), i.e. a Mul with a Pow(..., -1) factor).
+        numer, denom = inner.as_numer_denom()
+        if denom == 1:
+            return None
+        result = _split_sum_by_divisibility(numer, denom)
+        if result is None:
+            return None
+        quotient, remainder = result
+        if remainder.is_zero:
+            return quotient
+        # Check if remainder is bounded in [0, denom).
+        rem_bounds = expr_bounds(remainder)
+        if (
+            rem_bounds
+            and rem_bounds[0] >= 0
+            and rem_bounds[1] != sympy.oo
+            and rem_bounds[1] < denom
+        ):
+            return quotient
+        return quotient + sympy.floor(remainder / denom)
+
+    def transform_mod_div(expr):
+        """``Mod(A*D + B, D)  ->  Mod(B, D)``."""
+        if not isinstance(expr, sympy.Mod):
+            return None
+        p, q = expr.args
+        result = _split_sum_by_divisibility(p, q)
+        if result is None:
+            return None
+        _quotient, remainder = result
+        if remainder.is_zero:
+            return sympy.Integer(0)
+        # Check if remainder is bounded in [0, q) — then Mod is identity.
+        rem_bounds = expr_bounds(remainder)
+        if (
+            rem_bounds
+            and rem_bounds[0] >= 0
+            and rem_bounds[1] != sympy.oo
+            and rem_bounds[1] < q
+        ):
+            return remainder
+        return sympy.Mod(remainder, q, evaluate=False)
+
+    expr = expr.replace(lambda e: transform_floor_div(e) is not None, transform_floor_div)
+    expr = expr.replace(lambda e: transform_mod_div(e) is not None, transform_mod_div)
     expr = expr.replace(lambda e: transform_mod(e) is not None, transform_mod)
     expr = expr.replace(lambda e: transform_floor(e) is not None, transform_floor)
     return expr
