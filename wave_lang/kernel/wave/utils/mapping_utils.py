@@ -6,6 +6,7 @@
 from typing import TypeVar
 from copy import deepcopy
 from math import gcd, lcm
+
 import sympy
 import torch.fx as fx
 
@@ -275,6 +276,80 @@ def _expand_mod(expr: sympy.Expr) -> sympy.Expr:
     )
 
 
+def _eval_concrete_floor_mod(expr: sympy.Expr) -> sympy.Expr:
+    """Evaluate ``floor`` and ``Mod`` nodes whose arguments are concrete.
+
+    SymPy sometimes leaves ``floor(4)`` or ``Mod(0, K)`` un-evaluated
+    when they were built symbolically and then substituted.  This pass
+    collapses them bottom-up so the result contains no unnecessary
+    wrappers around known integers.
+    """
+    def _try_eval(e):
+        if isinstance(e, sympy.floor):
+            inner = e.args[0]
+            if inner.is_number:
+                return sympy.Integer(int(inner))
+        if isinstance(e, sympy.Mod):
+            a, m = e.args
+            if a.is_Integer and m.is_Integer and int(m) != 0:
+                return sympy.Integer(int(a) % int(m))
+            if a.is_Integer and int(a) == 0:
+                return sympy.Integer(0)
+        return e
+
+    if not expr.has(sympy.floor) and not expr.has(sympy.Mod):
+        return expr
+    return expr.replace(
+        lambda e: isinstance(e, (sympy.floor, sympy.Mod)),
+        _try_eval,
+    )
+
+
+def mem_simplify(expr: sympy.Expr) -> sympy.Expr:
+    """Simplify an expression representing a tensor memory index.
+
+    Domain-specific alternative to ``sympy.simplify`` that applies only
+    the algebraic identities relevant to integer memory addressing:
+
+    1. Rewrite ``Mod(x, d)`` as ``x - d*floor(x/d)`` so that paired
+       floor terms cancel algebraically.
+    2. ``expand()`` to distribute products and cancel matching terms —
+       this collapses the fundamental round-trip
+       ``floor(E/D)*D + Mod(E, D) → E``.
+    3. Evaluate any ``floor`` or ``Mod`` of concrete integers left over.
+    """
+    expr = sympy.sympify(expr)
+    if expr.is_number:
+        return expr
+    if expr.has(sympy.Mod):
+        expr = _expand_mod(expr)
+    expr = sympy.expand(expr)
+    expr = _eval_concrete_floor_mod(expr)
+    return expr
+
+
+def linearize_dims(
+    dim_exprs: list[sympy.Expr],
+    strides: list[sympy.Expr],
+) -> sympy.Expr:
+    """Compute ``sum(dim_i * stride_i)`` with floor/Mod cancellation.
+
+    Preshuffle mappings produce ``floor(flat/D)`` for one dimension and
+    ``Mod(flat, D)`` for another, with the first dimension's stride
+    equal to ``D``.  The naive sum keeps SymPy's opaque ``Mod`` node
+    and ``simplify`` cannot prove the cancellation.
+
+    By expanding ``Mod`` to its floor definition first and then calling
+    ``expand``, the matching ``floor`` terms cancel algebraically::
+
+        floor(E/D)*D + Mod(E,D)
+        → floor(E/D)*D + E - D*floor(E/D)
+        → E
+    """
+    total = sum(d * s for d, s in zip(dim_exprs, strides))
+    return mem_simplify(total)
+
+
 def _infer_floor_to_exact(mem_strides: list[IndexExpr]) -> dict:
     """Infer ``floor(sym/n) → sym/n`` substitutions from memory strides.
 
@@ -298,76 +373,6 @@ def _infer_floor_to_exact(mem_strides: list[IndexExpr]) -> dict:
             subs_map[sympy.floor(exact_quot)] = exact_quot
     return subs_map
 
-
-def _extract_integer_divisors(expr: sympy.Expr) -> set[int]:
-    """Collect positive integer divisors from floor and Mod nodes in *expr*."""
-    divisors: set[int] = set()
-    for sub in sympy.preorder_traversal(expr):
-        if isinstance(sub, sympy.Mod):
-            d = sub.args[1]
-            if d.is_Integer and int(d) > 0:
-                divisors.add(int(d))
-                print(
-                    f"  [divisor FOUND]  Mod({sub.args[0]}, {d})"
-                    f"  -> integer divisor {int(d)}"
-                )
-            else:
-                print(
-                    f"  [divisor SKIPPED] Mod({sub.args[0]}, {d})"
-                    f"  -> divisor {d} is symbolic"
-                    f" (type={type(d).__name__},"
-                    f" is_Integer={d.is_Integer},"
-                    f" free={d.free_symbols})"
-                )
-        elif isinstance(sub, sympy.floor):
-            inner = sub.args[0]
-            _, denom = inner.as_numer_denom()
-            if denom.is_Integer and int(denom) > 1:
-                divisors.add(int(denom))
-                print(
-                    f"  [divisor FOUND]  floor({inner})"
-                    f"  -> integer divisor {int(denom)}"
-                )
-            elif denom != 1:
-                print(
-                    f"  [divisor SKIPPED] floor({inner})"
-                    f"  -> denom {denom} is symbolic"
-                    f" (type={type(denom).__name__},"
-                    f" is_Integer={denom.is_Integer},"
-                    f" free={denom.free_symbols})"
-                )
-    return divisors
-
-
-def _compute_probe_depth(dim_exprs: list[IndexExpr], concrete_coeff: int) -> int:
-    """Compute the minimum probe depth from mapping divisors and IV coefficient.
-
-    For each floor(expr/D) or Mod(expr, D) with integer D, the IV contribution
-    has period ``D // gcd(C, D)``.  The overall period is the LCM of all
-    individual periods — this is the exact probe depth needed to detect
-    constant or cyclic strides.
-    """
-    print(f"_compute_probe_depth  coeff(C)={concrete_coeff}  exprs:")
-    for i, expr in enumerate(dim_exprs):
-        print(f"  dim_expr[{i}] = {expr}  (free={getattr(expr, 'free_symbols', set())})")
-    all_divisors: set[int] = set()
-    for expr in dim_exprs:
-        all_divisors |= _extract_integer_divisors(expr)
-    if not all_divisors:
-        print(
-            "  *** NO integer divisors found — probe_depth defaults to 1. "
-            "If floor/Mod with symbolic divisors were skipped above, this "
-            "is a single-sample estimate, NOT a proven stride."
-        )
-        return 1
-    C = abs(concrete_coeff) if concrete_coeff != 0 else 1
-    periods = [d // gcd(C, d) for d in all_divisors]
-    depth = lcm(*periods) if periods else 1
-    print(
-        f"  integer divisors={sorted(all_divisors)}  C={C}"
-        f"  periods={periods}  probe_depth={depth}"
-    )
-    return depth
 
 
 def compute_iv_stride_through_mapping(
@@ -495,14 +500,45 @@ def compute_iv_stride_through_mapping(
         bwd_dict = dict(div_bwd)
         def _bwd(v):
             if isinstance(v, list):
-                return [simplify(sympy.sympify(x).subs(bwd_dict)) for x in v]
-            return simplify(sympy.sympify(v).subs(bwd_dict))
+                return [mem_simplify(sympy.sympify(x).subs(bwd_dict)) for x in v]
+            return mem_simplify(sympy.sympify(v).subs(bwd_dict))
         result = {k: _bwd(v) for k, v in result.items()}
 
     for iv_sym, val in result.items():
         print(f"  RESULT  {iv_sym} -> {val}")
 
     return result
+
+
+def _extract_integer_divisors(expr: sympy.Expr) -> set[int]:
+    """Collect positive integer divisors from ``floor`` and ``Mod`` nodes."""
+    divisors: set[int] = set()
+    for sub in sympy.preorder_traversal(expr):
+        if isinstance(sub, sympy.Mod):
+            d = sub.args[1]
+            if d.is_Integer and int(d) > 0:
+                divisors.add(int(d))
+        elif isinstance(sub, sympy.floor):
+            _, denom = sub.args[0].as_numer_denom()
+            if denom.is_Integer and int(denom) > 1:
+                divisors.add(int(denom))
+    return divisors
+
+
+def _compute_probe_depth(flat_expr: sympy.Expr, concrete_coeff: int) -> int:
+    """Compute the exact probe depth from divisors in *flat_expr*.
+
+    For each ``floor(expr/D)`` or ``Mod(expr, D)`` with integer D, the IV
+    contribution has period ``D / gcd(C, D)`` where ``C`` is the IV step.
+    The overall period ``P = LCM(all periods)`` is the exact number of
+    diffs needed to capture the full stride pattern.
+    """
+    divisors = _extract_integer_divisors(flat_expr)
+    if not divisors:
+        return 1
+    C = abs(concrete_coeff) if concrete_coeff != 0 else 1
+    periods = [d // gcd(C, d) for d in divisors]
+    return lcm(*periods)
 
 
 def _probe_iv_stride(
@@ -512,125 +548,96 @@ def _probe_iv_stride(
     iv_iter: sympy.Symbol,
     concrete_coeff: int,
 ) -> IndexExpr | list[IndexExpr] | None:
-    """Numerically probe the linearized address to extract the IV stride.
+    """Compute the IV stride through the linearized address.
 
-    The probe depth is derived from the mapping's floor/Mod divisors:
-    for each integer divisor D, the IV has period D/gcd(C, D) where C is the
-    IV coefficient.  The overall period P = LCM of all individual periods.
-    We need P probes to detect constant or cyclic strides.
+    1. Linearize ``dim_exprs * mem_strides`` symbolically via
+       ``linearize_dims`` + ``mem_simplify`` to obtain the flat address
+       expression (cancelling floor/Mod round-trip pairs).
+    2. Compute the exact probe depth ``P`` from the remaining integer
+       divisors in the flat expression: ``P = LCM(D_i / gcd(C, D_i))``.
+    3. Evaluate ``P + 1`` concrete addresses and detect constant or
+       cyclic stride patterns from the integer diffs.
 
-    Returns a single IndexExpr (constant stride), a list (repeating cycle),
-    or None when no repeating pattern is found.
+    If the addresses contain free symbols, this is an error — the
+    substitution context has unresolved chained dependencies.
+
+    Returns a single IndexExpr (constant stride), a list of IndexExpr
+    (repeating cycle), or ``None`` on failure.
     """
-    probe_depth = _compute_probe_depth(dim_exprs, concrete_coeff)
 
     print(
         f"_probe_iv_stride  iv_iter={iv_iter}  coeff={concrete_coeff}"
-        f"  probe_depth={probe_depth}"
     )
 
+    # Step 1: linearize symbolically, then compute probe depth from the
+    # flat expression's divisors.
+    flat_expr = mem_simplify(linearize_dims(dim_exprs, mem_strides))
+    iv_flat = flat_expr.subs({
+        it: (concrete_coeff * sympy.Symbol("_iv") if it == iv_iter else 0)
+        for it in iters.keys()
+    })
+    probe_depth = _compute_probe_depth(iv_flat, concrete_coeff)
+
+    print(f"  probe_depth={probe_depth}")
+
+    # Step 2: evaluate P+1 concrete addresses.
     def _linearized_addr(iv_val: int) -> IndexExpr:
         subs = {
             it: (concrete_coeff * iv_val if it == iv_iter else 0)
             for it in iters.keys()
         }
-        addr = sympy.Integer(0)
-        for dim_expr, stride in zip(dim_exprs, mem_strides):
-            dim_val = subs_idxc(dim_expr.subs(subs))
-            addr += simplify(dim_val) * stride
-        addr = _expand_mod(addr)
-        return simplify(subs_idxc(addr))
+        resolved = [subs_idxc(dim_expr.subs(subs)) for dim_expr in dim_exprs]
+        return mem_simplify(subs_idxc(linearize_dims(resolved, mem_strides)))
 
-    addrs = [_linearized_addr(i) for i in range(probe_depth + 1)]
-    diffs = [simplify(subs_idxc(addrs[i + 1] - addrs[i]))
-             for i in range(probe_depth)]
+    addrs: list[int] = []
+    for iv in range(probe_depth + 1):
+        a = _linearized_addr(iv)
+        if getattr(a, 'free_symbols', set()):
+            print(
+                f"  addr[iv={iv}] = {a}  (free={a.free_symbols})"
+                f"\n  *** ERROR: address contains unresolved free symbols."
+                f"  Fix chained symbolic dependencies upstream."
+            )
+            return None
+        addrs.append(int(a))
+
+    diffs = [addrs[i + 1] - addrs[i] for i in range(probe_depth)]
 
     for i, a in enumerate(addrs):
-        print(f"  addr[iv={i}] = {a}  (free={getattr(a, 'free_symbols', set())})")
+        print(f"  addr[iv={i}] = {a}")
     for i, d in enumerate(diffs):
-        print(f"  diff[{i}] = {d}  (free={getattr(d, 'free_symbols', set())})")
+        print(f"  diff[{i}] = {d}")
 
     if not diffs:
-        print("  -> no diffs (probe_depth=0?), returning None")
         return None
 
-    # Constant stride (most common case).
-    if all(simplify(d - diffs[0]) == 0 for d in diffs):
-        is_concrete = getattr(diffs[0], 'free_symbols', set()) == set()
+    # Step 3: detect constant or shortest repeating cycle.
+    for cycle_len in range(1, probe_depth // 2 + 1):
+        if all(diffs[i] == diffs[i % cycle_len] for i in range(probe_depth)):
+            cycle = [sympy.Integer(diffs[i]) for i in range(cycle_len)]
+            if cycle_len == 1:
+                print(
+                    f"  -> CONSTANT stride = {cycle[0]}"
+                    f"  (concrete=True, probe_depth={probe_depth})"
+                )
+                return cycle[0]
+            print(
+                f"  -> CYCLIC stride (len={cycle_len}): {diffs[:cycle_len]}"
+                f"  (concrete=True, probe_depth={probe_depth})"
+            )
+            return cycle
+
+    # probe_depth == 1: single diff, always constant.
+    if probe_depth == 1:
         print(
             f"  -> CONSTANT stride = {diffs[0]}"
-            f"  (concrete={is_concrete}, probe_depth={probe_depth})"
+            f"  (concrete=True, probe_depth=1)"
         )
-        if probe_depth == 1:
-            print(
-                "  *** WARNING: stride determined from only 1 diff "
-                "(probe_depth=1). If symbolic floor/Mod divisors were "
-                "skipped, this may be a single-sample guess."
-            )
-        return diffs[0]
-
-    print("  diffs are NOT all equal — checking for symbolic residuals / cycles")
-
-    # Symbolic strides may contain floor(a/d)*d + Mod(a,d) patterns that
-    # simplify can't resolve.  Substitute a concrete value for remaining
-    # free symbols; use a value that avoids aliasing with any divisor.
-    free = set()
-    for d in diffs:
-        free |= getattr(d, 'free_symbols', set())
-    if free:
-        all_divs = set()
-        for expr in dim_exprs:
-            all_divs |= _extract_integer_divisors(expr)
-        probe_val = lcm(*all_divs) * (probe_depth + 1) if all_divs else 8192
-        numeric_subs = {s: probe_val for s in free}
-
-        print(
-            f"  NUMERIC FALLBACK: free_symbols={sorted(str(s) for s in free)}"
-            f"  probe_val={probe_val}  all_divs={sorted(all_divs)}"
-        )
-        print(
-            f"  *** Substituting {probe_val} for ALL free symbols"
-            f" — aliasing between distinct symbols is possible"
-        )
-
-        try:
-            numeric_diffs = [int(d.subs(numeric_subs)) for d in diffs]
-        except (TypeError, ValueError) as exc:
-            print(f"  numeric substitution failed ({exc}), returning None")
-            return None
-
-        print(f"  numeric_diffs = {numeric_diffs}")
-
-        if len(set(numeric_diffs)) == 1:
-            print(
-                f"  -> NUMERIC CONSTANT stride = {numeric_diffs[0]}"
-                f"  (*** symbolic info LOST: original diff[0] was {diffs[0]}"
-                f" with free symbols {getattr(diffs[0], 'free_symbols', set())})"
-            )
-            return sympy.Integer(numeric_diffs[0])
-        # Detect shortest repeating cycle from numeric diffs.
-        for cycle_len in range(2, probe_depth // 2 + 1):
-            if all(numeric_diffs[i] == numeric_diffs[i % cycle_len]
-                   for i in range(probe_depth)):
-                print(
-                    f"  -> NUMERIC CYCLE (len={cycle_len}):"
-                    f" {numeric_diffs[:cycle_len]}"
-                    f"  (*** symbolic info LOST)"
-                )
-                return [sympy.Integer(numeric_diffs[i]) for i in range(cycle_len)]
-
-        print("  numeric fallback found no constant or cycle pattern")
-
-    # Detect shortest repeating cycle (symbolic).
-    for cycle_len in range(2, probe_depth // 2 + 1):
-        if all(simplify(diffs[i] - diffs[i % cycle_len]) == 0
-               for i in range(probe_depth)):
-            print(f"  -> SYMBOLIC CYCLE (len={cycle_len}): {list(diffs[:cycle_len])}")
-            return list(diffs[:cycle_len])
+        return sympy.Integer(diffs[0])
 
     print(
-        f"  -> FAILED: no constant stride or repeating cycle detected."
-        f"  diffs={diffs}  returning None"
+        f"  -> FAILED: no constant or cyclic pattern in {probe_depth}"
+        f" diffs.  diffs={diffs}"
     )
     return None
 
