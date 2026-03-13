@@ -182,9 +182,6 @@ def _create_wide_read_1d(
 
         read.replace_all_uses_with(extract)
         if read.mapping is not None:
-            import traceback
-            print(f"[preshuffle] CLEARING mapping on read '{node.name}' (site 1: wide-read merge)")
-            traceback.print_stack(limit=6)
             read.update_arg("mapping", None)
         read.erase()
 
@@ -314,20 +311,6 @@ def _transform_scale_memory(
     k_tile = global_index[global_k_dim].start
     bounds = sample_read.bounds
 
-    # Compute pre-mapping IV stride for the linearized src address.
-    # src_flat is the linearized physical address (floor/Mod cancel).
-    # The IV only enters src_flat through g_offset = floor(k_tile/8) * 256.
-    # Since the IV coefficient in k_tile is always a multiple of 8 (valid
-    # tile sizes), the per-IV-step contribution = (coeff // 8) * 256.
-    _iv_stride_info = None
-    k_tile_expanded = sympy.expand(k_tile)
-    for sym in k_tile_expanded.free_symbols:
-        if str(sym).startswith("$ARG"):
-            coeff = subs_idxc(k_tile_expanded.coeff(sym))
-            if isinstance(coeff, (int, sympy.Integer)) and int(coeff) % 8 == 0:
-                _iv_stride_info = {sym: sympy.Integer((int(coeff) // 8) * 256)}
-            break
-
     sample_write_node = write_group[0][0]
 
     wave_id = hw.linearized_thread_id // threads_per_wave
@@ -386,8 +369,6 @@ def _transform_scale_memory(
         if op_i == 0:
             common_id = id(new_write)
         new_write.pre_expansion_id = common_id
-        if _iv_stride_info is not None:
-            new_write.meta["iv_stride"] = _iv_stride_info
 
         if hasattr(sample_write_node, "tag"):
             tag = get_custom(sample_write_node).tag
@@ -406,9 +387,6 @@ def _transform_scale_memory(
                 new_deps = [d for d in user_custom._write_dependency if d != write_node]
                 new_deps.extend(all_new_writes)
                 user_custom.update_arg("_write_dependency", new_deps)
-                if _iv_stride_info is not None:
-                    print(f"[preshuffle] annotating iv_stride={_iv_stride_info} on user read '{user.name}'")
-                    user.meta["iv_stride"] = _iv_stride_info
 
         get_custom(write_node).erase()
 
@@ -469,9 +447,6 @@ def _transform_scale_memory(
             dim_1: IndexSequence(flat_lds, 1, 1),
         }
         if read.mapping is not None:
-            import traceback
-            print(f"[preshuffle] CLEARING mapping on read '{node.name}' (site 2: shared read remap)")
-            traceback.print_stack(limit=6)
             read.update_arg("mapping", None)
         remapped += 1
 
