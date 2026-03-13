@@ -34,7 +34,10 @@ from ...ops.wave_ops import (
 )
 from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
-from ..utils.mapping_utils import transform_index_on_mapping
+from ..utils.mapping_utils import (
+    compute_iv_stride_through_mapping,
+    transform_index_on_mapping,
+)
 from ..utils.tag_utils import propagate_tag
 from ..utils.general_utils import (
     all_equal,
@@ -788,6 +791,26 @@ def _check_lowering_ok(
 
 def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=None):
     """Create a merged Read node covering ``wide_ept`` elements."""
+    iv_stride = None
+    anchor_mapping = anchor_custom.mapping
+    anchor_has_mapping = anchor_mapping is not None
+    anchor_is_identity = anchor_custom.has_identity_mapping() if anchor_has_mapping else None
+    if anchor_has_mapping and not anchor_is_identity:
+        symbolic_shape = anchor_custom.type.symbolic_shape
+        iv_stride = compute_iv_stride_through_mapping(
+            anchor_mapping, symbolic_shape, anchor_custom.index, is_read=True
+        )
+
+    from ..._support.indexing import subs_idxc
+    mem_addr_space = subs_idxc(anchor_custom.memory_type.address_space)
+    print(f"  [_emit_wide_read] anchor={anchor_custom.fx_node.name}"
+          f", memory={anchor_custom.memory.name}"
+          f", addr_space={mem_addr_space}"
+          f", mapping={'present' if anchor_has_mapping else 'None'}"
+          f", identity={anchor_is_identity}"
+          f", iv_stride={iv_stride}"
+          f", wide_ept={wide_ept}")
+
     wide_read = Read(
         anchor_custom.memory,
         elements_per_thread=wide_ept,
@@ -801,6 +824,10 @@ def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=N
         wide_read.vector_shapes = deepcopy(tag_source.vector_shapes)
     if mask_expr is not None:
         wide_read.precomputed_mask_expr = mask_expr
+    if iv_stride is not None:
+        wide_read.meta["iv_stride"] = iv_stride
+    print(f"    -> created wide_read={wide_read.name}"
+          f", meta_iv_stride={'set' if iv_stride else 'NOT set'}")
     propagate_tag(tag_source, wide_read)
     return wide_read
 

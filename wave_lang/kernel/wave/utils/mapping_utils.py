@@ -253,6 +253,103 @@ def _check_contiguous_with_aligned_base(
     return True
 
 
+_INDUCTION_PREFIX = "$ARG"
+
+
+def compute_iv_stride_through_mapping(
+    mapping: IndexMapping,
+    symbolic_shape: tuple[IndexExpr, ...],
+    index: dict[IndexExpr, IndexSequence],
+    is_read: bool = True,
+) -> dict[sympy.Symbol, IndexExpr] | None:
+    """Compute each IV symbol's linearized stride through a mapping.
+
+    Before the mapping is applied, the IV appears linearly in one iterator
+    (e.g. ``$index1 = 128*$ARGK + thread_offset``).  The mapping then buries
+    the IV inside floor/Mod (preshuffle).  But because the IV coefficient is
+    always divisible by the moduli/divisors in the mapping (tile sizes are
+    multiples of the interleaving granularity), we can resolve the IV's
+    contribution by substituting ``iter = concrete_coeff * _iv`` and letting
+    sympy evaluate the Mod/floor to concrete integers.
+
+    Returns ``{iv_sym: linearized_stride_per_iv_step}`` or ``None``.
+    """
+    symbolic_shape_resolved = tuple(infer_dim(d) for d in symbolic_shape)
+    iters = mapping.iters
+
+    # Identify IV symbols and their concrete coefficients in each iterator.
+    iv_info: dict[sympy.Symbol, tuple[sympy.Symbol, int]] = {}
+    for iter_sym, seq in zip(iters.keys(), index.values()):
+        if isinstance(seq, IndexSequence):
+            start = sympy.sympify(seq.start)
+        else:
+            start = sympy.sympify(seq)
+        for sym in start.free_symbols:
+            if not str(sym).startswith(_INDUCTION_PREFIX):
+                continue
+            coeff = sympy.expand(start).coeff(sym)
+            concrete = subs_idxc(coeff)
+            if not isinstance(concrete, (int, sympy.Integer)):
+                continue
+            iv_info[sym] = (iter_sym, int(concrete))
+
+    if not iv_info:
+        starts = []
+        for iter_sym, seq in zip(iters.keys(), index.values()):
+            s = seq.start if isinstance(seq, IndexSequence) else seq
+            starts.append((iter_sym, s))
+        print(f"  [compute_iv_stride] NO IV found."
+              f" iters={list(iters.keys())},"
+              f" index_keys={list(index.keys())},"
+              f" starts={starts}")
+        return None
+
+    # Get the mapping expressions with symbolic constants resolved.
+    if is_read:
+        raw_exprs = mapping.map_input_indices(symbolic_shape_resolved)
+    else:
+        raw_exprs = mapping.map_output_indices(symbolic_shape_resolved)
+
+    idxc = IndexingContext.current()
+    dim_exprs = [subs_idxc(e) for e in raw_exprs]
+
+    mem_strides = strides_from_symbolic_shape(
+        idxc, symbolic_shape_resolved, allow_mixed_shapes=True
+    )
+
+    _iv = sympy.Symbol("_iv", integer=True, nonnegative=True)
+    result: dict[sympy.Symbol, IndexExpr] = {}
+
+    for iv_sym, (iv_iter, concrete_coeff) in iv_info.items():
+        # Substitute: IV iterator = concrete_coeff * _iv, others = 0.
+        iv_subs = {
+            it: (concrete_coeff * _iv if it == iv_iter else sympy.Integer(0))
+            for it in iters.keys()
+        }
+
+        lin_stride = sympy.Integer(0)
+        per_dim_debug = []
+        for i, (dim_expr, stride) in enumerate(zip(dim_exprs, mem_strides)):
+            substituted = subs_idxc(dim_expr.subs(iv_subs))
+            iv_coeff = sympy.expand(substituted).coeff(_iv)
+            per_dim_debug.append((i, dim_expr, substituted, iv_coeff, stride))
+            lin_stride += iv_coeff * stride
+
+        lin_stride = simplify(subs_idxc(lin_stride))
+        result[iv_sym] = lin_stride
+        print(f"  compute_iv_stride_through_mapping: {iv_sym} -> {lin_stride}"
+              f" (coeff={concrete_coeff}, iter={iv_iter},"
+              f" shape={symbolic_shape_resolved})")
+        if lin_stride == 0:
+            print(f"    BUG? stride=0 detail:")
+            for i, dim_expr, substituted, iv_coeff, stride in per_dim_debug:
+                print(f"      dim[{i}]: expr={dim_expr}"
+                      f"\n             subs={substituted}"
+                      f"\n             coeff(_iv)={iv_coeff}, stride={stride}")
+
+    return result
+
+
 def transform_index_on_mapping(
     mapping: IndexMapping,
     symbolic_shape: tuple[IndexExpr, ...],

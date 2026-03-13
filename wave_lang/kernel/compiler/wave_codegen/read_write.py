@@ -61,7 +61,10 @@ from ...ops.wave_ops import (
     MemoryAccessFlags,
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
-from ...wave.utils.mapping_utils import transform_index_on_mapping
+from ...wave.utils.mapping_utils import (
+    compute_iv_stride_through_mapping,
+    transform_index_on_mapping,
+)
 from ...wave.assumptions import get_divisibility_subs
 from ...wave.utils.symbol_utils import safe_subs, simplify, extract_iv
 from .emitter import (
@@ -844,6 +847,8 @@ def _try_iv_split_offset(
     strides: list[int | IndexExpr],
     dynamic_vals: dict[IndexExpr, Any],
     use_subs_idxc: bool = True,
+    precomputed_iv_stride: dict[sympy.Symbol, IndexExpr] | None = None,
+    **kwargs,
 ) -> Optional[Value]:
     """Compute a hoisted IV-split linearized offset for a loop-carried read.
 
@@ -851,32 +856,24 @@ def _try_iv_split_offset(
     expressions are provably affine in the loop IV, or ``None`` to fall back
     to the default address path.
 
-    Phase 1 (split-first): extract _j per dimension before linearizing.
-    Works when each dimension's index is linear in _j (the common case).
+    When *precomputed_iv_stride* is supplied (from
+    ``compute_iv_stride_through_mapping``), the IV stride is known from the
+    pre-mapping index and the extraction phase is skipped entirely.
 
-    Phase 1b (linearize-first fallback): when per-dimension extraction
-    fails (e.g. preshuffle mappings with ``floor(flat/d)`` for N and
-    ``Mod(flat, d)`` for K), linearize first using
-    ``_cancel_floordiv_mod_linearize`` to apply the identity
-    ``floor(x/d)*d + Mod(x,d) = x``, then extract _j from the combined
-    expression.  The floor/Mod cancel, exposing a clean linear stride.
+    Otherwise falls back to the original Phase 1 / Phase 1b extraction.
     """
     ip = InsertionPoint.current
     owner = ip.block.owner
     if isinstance(owner, func_d.FuncOp):
-        print("Failed to extract IV stride, owner is func_d.FuncOp")
         return None
     if owner.name != "scf.for":
-        print("Failed to extract IV stride, owner is not scf.for")
         return None
 
     # Find the IV symbol for this scf.for directly from its block argument.
     current_iv = owner.induction_variable
 
-    # do a reverse lookup of the dimension/symbol that the current IV is associated with
     dim = next((d for d, v in emitter.induction_vars.items() if v == current_iv), None)
     if dim is None:
-        print("Failed to extract IV stride, dim is None")
         return None
     iv_sym = next(
         (
@@ -887,34 +884,86 @@ def _try_iv_split_offset(
         None,
     )
     if iv_sym is None:
-        print("Failed to extract IV stride, iv_sym is None")
         return None
 
-    print("-------")
     step_int = _get_constant_value(owner.operands[2])
     if step_int is None or step_int <= 0:
-        print("Failed to extract IV stride, step_int is None or <= 0")
         return None
 
     start_exprs = _get_start_indices(index)
     if len(start_exprs) != len(strides):
-        print("Failed to extract IV stride, len(start_exprs) != len(strides)")
         return None
 
     sym_strides = [sympy.sympify(s) for s in strides]
 
-    # Extract divisibility assumptions (e.g. Assumption(Eq(Mod(K, 256), 0)))
-    # into forward subs: K → 256 * _K_div_256.  Applying these lets sympy
-    # resolve Mod(K, 256) → 0 and floor(K/256) → _K_div_256, which is
-    # critical for separating the IV from floor/Mod expressions.
+    # ------------------------------------------------------------------
+    # Fast path: pre-computed IV stride from mapping analysis.
+    # ------------------------------------------------------------------
+    has_iv = any(iv_sym in sympy.sympify(e).free_symbols for e in start_exprs)
+    if has_iv and not precomputed_iv_stride:
+        caller = kwargs.get("_caller", "?")
+        print(f"  [iv-split] has IV but no precomputed stride"
+              f" (caller={caller}, iv={iv_sym}, dims={list(index.keys())},"
+              f" strides={sym_strides})")
+    if not has_iv:
+        return None
+    if precomputed_iv_stride and iv_sym in precomputed_iv_stride:
+        k_stride_per_iv = precomputed_iv_stride[iv_sym]
+        print(f"\n{'='*72}")
+        print(f"_try_iv_split_offset [pre-computed]: iv={iv_sym}, "
+              f"dim={dim}, step={step_int}")
+        print(f"  k_stride_per_iv = {k_stride_per_iv}")
+
+        # Compute base: set IV=0 in each dim, linearize with strides.
+        base_start_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
+
+        hoist_ip = InsertionPoint(owner)
+        subs_map = add_emitter_subs(emitter, dynamic_vals)
+        overflow_flags = arith_d.IntegerOverflowFlags.nsw
+
+        with hoist_ip:
+            lin_offset = None
+            for base_expr, stride in zip(base_start_exprs, sym_strides):
+                val = gen_sympy_index(subs_map, base_expr)
+                stride_val = gen_sympy_index(subs_map, stride)
+                term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
+                lin_offset = (
+                    term
+                    if lin_offset is None
+                    else arith_d.addi(
+                        lin_offset, term, overflow_flags=overflow_flags
+                    )
+                )
+            k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
+
+        iv_mlir = subs_map.get(iv_sym)
+        if iv_mlir is None:
+            return None
+        iv_offset = arith_d.muli(
+            iv_mlir, k_stride_val, overflow_flags=overflow_flags
+        )
+        total = arith_d.addi(lin_offset, iv_offset, overflow_flags=overflow_flags)
+        print(f"{'='*72}\n")
+        return total
+
+    # ------------------------------------------------------------------
+    # Original extraction path (Phase 1 / Phase 1b).
+    # ------------------------------------------------------------------
     div_fwd, div_bwd = get_divisibility_subs(emitter.constraints)
 
     _j = sympy.Symbol("_j", integer=True, nonnegative=True)
     iv_as_j = step_int * _j
 
-    # Prepare per-dimension expressions with IV substituted.
+    dims = list(index.keys())
+    print(f"\n{'='*72}")
+    print(f"_try_iv_split_offset: iv={iv_sym}, dim={dim}, step={step_int}")
+    print(f"  index dims: {dims}")
+    print(f"  strides:    {sym_strides}")
+    if div_fwd:
+        print(f"  div_fwd:    {div_fwd}")
+
     dim_exprs = []
-    for expr, stride in zip(start_exprs, sym_strides):
+    for i, (expr, stride) in enumerate(zip(start_exprs, sym_strides)):
         e = safe_subs(expr, {iv_sym: iv_as_j})
         if use_subs_idxc:
             e = subs_idxc(e)
@@ -922,16 +971,20 @@ def _try_iv_split_offset(
             e = safe_subs(e, div_fwd)
         e = simplify(e)
         dim_exprs.append(e)
+        has_j = _j in e.free_symbols
+        print(f"  dim[{i}] ({dims[i]}): start={start_exprs[i]}")
+        print(f"         after subs: {e}  [has _j: {has_j}]")
 
-    # Phase 1: Split-first — extract _j coefficient per dimension before
-    # linearizing, so _j never enters floor/Mod from symbolic strides.
+    # Phase 1: per-dimension extract.
     iv_stride_sym = sympy.Integer(0)
     base_exprs = []
     split_first_ok = True
 
-    for e, stride in zip(dim_exprs, sym_strides):
+    print(f"\n  --- Phase 1: per-dimension extract_iv ---")
+    for i, (e, stride) in enumerate(zip(dim_exprs, sym_strides)):
         result = extract_iv(e, _j)
         if result is None:
+            print(f"  dim[{i}]: extract_iv FAILED (iv stuck in floor/Mod)")
             split_first_ok = False
             break
         j_coeff, remainder = result
@@ -940,30 +993,30 @@ def _try_iv_split_offset(
             j_coeff = safe_subs(j_coeff, div_bwd)
             remainder = safe_subs(remainder, div_bwd)
 
+        print(f"  dim[{i}]: coeff={j_coeff}, base={remainder}")
         iv_stride_sym += simplify(j_coeff * stride)
         base_exprs.append(remainder)
 
-    # Phase 1b: Linearize-first fallback.
-    # When per-dimension extraction fails (e.g. preshuffle mappings with
-    # floor(x/d) for N and Mod(x,d) for K), the floor/Mod cancel in the
-    # combined linearized expression via (x//d)*d + x%d = x.
-    #
-    # SymPy doesn't auto-simplify this identity, so we do a structural
-    # match: find floor(g*a / (g*d)) in dim i paired with g*Mod(a, d)
-    # in dim j, where stride[i] == g*d.  Then floor(g*a/(g*d))*(g*d)
-    # + g*Mod(a,d) = g*a, which is typically linear in the loop IV.
+    if split_first_ok:
+        print(f"  Phase 1 OK: iv_stride = {simplify(iv_stride_sym)}")
+
+    # Phase 1b: linearize-first fallback.
     if not split_first_ok:
+        print(f"\n  --- Phase 1b: linearize-first (floor/Mod cancellation) ---")
         fwd_strides = []
         for s in sym_strides:
             fs = safe_subs(s, div_fwd) if div_fwd else s
             fwd_strides.append(fs)
+        print(f"  fwd_strides: {fwd_strides}")
 
         lin_sym = _cancel_floordiv_mod_linearize(dim_exprs, fwd_strides)
         lin_sym = simplify(lin_sym)
+        print(f"  linearized: {lin_sym}")
 
         result = extract_iv(lin_sym, _j)
         if result is None:
-            print("Failed to extract IV stride, result is None")
+            print(f"  Phase 1b FAILED: extract_iv returned None")
+            print(f"{'='*72}\n")
             return None
         j_coeff_lin, base_lin = result
 
@@ -974,24 +1027,32 @@ def _try_iv_split_offset(
         iv_stride_sym = simplify(j_coeff_lin)
         base_exprs = None
         base_lin_expr = base_lin
+        print(f"  Phase 1b OK: coeff={iv_stride_sym}, base={base_lin_expr}")
 
     if iv_stride_sym == 0:
-        print("Failed to extract IV stride, iv_stride_sym == 0")
+        print(f"  SKIP: iv_stride == 0 (no IV dependency)")
+        print(f"{'='*72}\n")
         return None
 
-    # Compute per-IV-step stride = total_iv_coeff / step.
     if iv_stride_sym.is_Integer:
         k_stride_per_iv_int, rem = divmod(int(iv_stride_sym), step_int)
         if rem != 0:
-            print("Failed to extract IV stride, rem != 0")
+            print(f"  FAILED: iv_stride {iv_stride_sym} not divisible by step {step_int}")
+            print(f"{'='*72}\n")
             return None
         k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
     else:
         k_stride_per_iv = simplify(iv_stride_sym / step_int)
 
-    # Phase 2: Emit MLIR.
-    # base_addr (loop-invariant) is hoisted before the scf.for.
-    # iv_offset = IV * k_stride_per_iv is emitted inside the loop.
+    print(f"\n  RESULT: offset = hoisted_base + {iv_sym} * {k_stride_per_iv}")
+    if base_exprs is not None:
+        for i, (b, s) in enumerate(zip(base_exprs, sym_strides)):
+            print(f"    base[{i}] = {b}  * stride {s}")
+    else:
+        print(f"    base (linearized) = {base_lin_expr}")
+    print(f"{'='*72}\n")
+
+    # Emit MLIR.
     hoist_ip = InsertionPoint(owner)
     subs_map = add_emitter_subs(emitter, dynamic_vals)
     overflow_flags = arith_d.IntegerOverflowFlags.nsw
@@ -1012,13 +1073,10 @@ def _try_iv_split_offset(
             lin_offset = gen_sympy_index(subs_map, base_lin_expr)
         k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
 
-    # Back inside the loop: total = hoisted_base + IV * k_stride.
     iv_mlir = subs_map.get(iv_sym)
     if iv_mlir is None:
-        print("Failed to extract IV stride, iv_mlir is None")
         return None
     iv_offset = arith_d.muli(iv_mlir, k_stride_val, overflow_flags=overflow_flags)
-    print("Pass returning total offset")
     return arith_d.addi(lin_offset, iv_offset, overflow_flags=overflow_flags)
 
 
@@ -1096,9 +1154,7 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     is_global_mem = kb_src.type.memory_space is None
     buffer_ops_enabled = emitter.options.use_buffer_ops and is_global_mem
 
-    # Set by _emit_wide_read in partition_strided_operators.py when merging
-    # reads with per-element bounds.  Buffer-ops rely on SRD bounds checking
-    # instead, so the precomputed mask is only emitted for non-buffer-ops.
+    iv_stride_from_mapping = node.meta.get("iv_stride", None)
     precomputed_mask_expr = getattr(node, "precomputed_mask_expr", None)
     if precomputed_mask_expr is not None and not buffer_ops_enabled:
         mask = gen_sympy_index(add_emitter_subs(emitter), precomputed_mask_expr)
@@ -1108,6 +1164,9 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
         if mask.type != mask_vec_type:
             mask = vector_d.broadcast(mask_vec_type, mask)
     elif mapping:
+        iv_stride_from_mapping = compute_iv_stride_through_mapping(
+            mapping, input_shape, index, is_read=True
+        )
         transformed_index = transform_index_on_mapping(
             mapping, input_shape, index, is_read=True
         )
@@ -1123,9 +1182,12 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
         )
         index = transformed_index
     else:
+        iv_stride_from_mapping = None
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    is_global = get_custom(memory).type.address_space != SHARED_ADDRESS_SPACE
+    mem_custom = get_custom(memory)
+    mem_addr_space = mem_custom.type.address_space
+    is_global = mem_addr_space != SHARED_ADDRESS_SPACE
     use_llvm_load = flags != MemoryAccessFlags.NONE
 
     # IV-split fast path for global reads: hoist address before the loop.
@@ -1136,6 +1198,24 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             get_custom(node), emitter.constraints, emitter.options.target
         )
     ):
+        if iv_stride_from_mapping is None and precomputed_mask_expr is None:
+            start_exprs_dbg = {
+                k: (v.start if isinstance(v, IndexSequence) else v)
+                for k, v in index.items()
+            }
+            meta_keys = list(node.meta.keys()) if hasattr(node, "meta") else []
+            print(f"  [read-ivsplit-entry] node={node.name}"
+                  f"\n    memory={memory.name}, addr_space={mem_addr_space}"
+                  f", sym_shape={mem_custom.type.symbolic_shape}"
+                  f"\n    mapping_arg={'None' if not mapping else 'present'}"
+                  f", meta_keys={meta_keys}"
+                  f", meta_iv_stride={node.meta.get('iv_stride', 'MISSING')}"
+                  f"\n    index_dims={list(index.keys())}"
+                  f"\n    starts={start_exprs_dbg}")
+        if iv_stride_from_mapping is None and mapping:
+            print(f"  [read] iv_stride_from_mapping is None despite mapping!"
+                  f" node={node.name}, precomputed_mask={precomputed_mask_expr is not None},"
+                  f" buffer_ops={buffer_ops_enabled}")
 
         kb_type = MemRefType(kb_src.type)
         phys_strides, _ = kb_type.get_strides_and_offset()
@@ -1155,6 +1235,8 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             index,
             iv_strides,
             dynamic_vals_map_start,
+            precomputed_iv_stride=iv_stride_from_mapping,
+            _caller=f"handle_read({node.name})",
         )
         if total_offset is not None:
             ip = InsertionPoint.current
@@ -1516,11 +1598,21 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     src_dynamic_vals_map_start = {}
     dst_dynamic_vals_map_start = {}
 
+    iv_stride_from_mapping = node.meta.get("iv_stride", None)
     if src_mapping:
         dyn_vals = tuple(
             cast_vector(emitter, reg, element_type=IndexType.get())
             for reg in src_mapping_dyn_vals
         )
+        if iv_stride_from_mapping is None:
+            iv_stride_from_mapping = compute_iv_stride_through_mapping(
+                src_mapping, src_symbolic_shape, src_idx, is_read=True
+            )
+            if iv_stride_from_mapping is None:
+                print(f"  [g2s] compute_iv_stride_through_mapping returned None"
+                      f" (shape={src_symbolic_shape},"
+                      f" src_mapping={src_mapping is not None},"
+                      f" index_keys={list(src_idx.keys()) if src_idx else None})")
         new_src_idx = transform_index_on_mapping(
             src_mapping, src_symbolic_shape, src_idx, is_read=True
         )
@@ -1564,14 +1656,19 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     subs_map = add_emitter_subs(emitter, src_dynamic_vals_map_start)
     strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
 
-    # IV-split: try hoisting the src offset before the loop.
-    print("Calling _try_iv_split_offset from handle_gather_to_lds")
+    if iv_stride_from_mapping is None:
+        print(f"  [g2s] NO precomputed stride for node={node.name}"
+              f" src_mapping={'yes' if src_mapping else 'no'}"
+              f" meta_keys={list(node.meta.keys())}")
+
     src_offset = _try_iv_split_offset(
         emitter,
         new_src_idx,
         list(sym_stride_vals),
         src_dynamic_vals_map_start,
         use_subs_idxc=True,
+        precomputed_iv_stride=iv_stride_from_mapping,
+        _caller=f"handle_gather_to_lds({node.name})",
     )
 
     if src_offset is not None:

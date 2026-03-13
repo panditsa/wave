@@ -375,6 +375,104 @@ def _custom_simplify_once(expr: sympy.Expr) -> sympy.Expr:
 _simplify_cache: dict[sympy.Basic, sympy.Expr] = {}
 
 
+def extract_iv(
+    expr: sympy.Expr,
+    iv: sympy.Symbol,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Split *expr* into ``(iv_coeff, base)`` such that
+    ``expr == iv_coeff * iv + base`` and ``iv`` does not appear in ``base``.
+
+    Uses ``sympy.Expr.coeff`` for the linear case.  When *iv* survives in the
+    remainder (e.g. because ``simplify`` folded it into floor/Mod), applies the
+    general integer-division identity to pull *iv* out:
+
+    * ``floor((c*iv + r) / d) = floor(c/d)*iv + floor((Mod(c,d)*iv + r)/d)``
+    * ``Mod(c*iv + r, m)      = Mod(Mod(c,m)*iv + r, m)``
+
+    Returns ``None`` if *iv* cannot be fully separated.
+    """
+    expanded = sympy.expand(expr)
+    coeff = expanded.coeff(iv)
+    base = simplify(expanded - coeff * iv)
+    if iv not in base.free_symbols:
+        return (coeff, base)
+
+    # iv is stuck inside floor/Mod — apply decomposition identities.
+    return _extract_iv_from_floor_mod(expr, iv)
+
+
+def _extract_iv_from_floor_mod(
+    expr: sympy.Expr,
+    iv: sympy.Symbol,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Apply floor/Mod integer-division identities to separate *iv*.
+
+    Walks the expression tree.  For each ``floor(numer/denom)`` or
+    ``Mod(value, modulus)`` that contains *iv*, decomposes the *iv*-coefficient
+    using the identities:
+
+    * ``floor((c*iv + r) / d) = floor(c/d)*iv + floor((Mod(c,d)*iv + r)/d)``
+    * ``Mod(c*iv + r, m) = Mod(Mod(c,m)*iv + r, m)``
+
+    After rewriting, if *iv* remains in the base (e.g. inside
+    ``floor(Mod(c,d)*iv/d + ...)``), uses numeric probing to check whether
+    the residual coefficient ``Mod(c, d)`` is zero for all practical values.
+    When ``d | c`` (common for power-of-2 tile sizes), the probe confirms
+    zero and the *iv* term vanishes from the residual floor.
+    """
+
+    def _rewrite_floor(arg):
+        numer, denom = arg.as_numer_denom()
+        numer = sympy.expand(numer)
+        iv_coeff = numer.coeff(iv)
+        if iv_coeff == 0:
+            return sympy.floor(arg)
+        rest = numer - iv_coeff * iv
+        return (
+            sympy.floor(iv_coeff / denom) * iv
+            + sympy.floor(
+                (sympy.Mod(iv_coeff, denom, evaluate=False) * iv + rest) / denom
+            )
+        )
+
+    def _rewrite_mod(*args):
+        value, modulus = args
+        value_expanded = sympy.expand(value)
+        iv_coeff = value_expanded.coeff(iv)
+        if iv_coeff == 0:
+            return sympy.Mod(value, modulus, evaluate=False)
+        rest = value_expanded - iv_coeff * iv
+        return sympy.Mod(
+            sympy.Mod(iv_coeff, modulus, evaluate=False) * iv + rest,
+            modulus,
+            evaluate=False,
+        )
+
+    rewritten = expr.replace(sympy.floor, _rewrite_floor)
+    rewritten = rewritten.replace(sympy.Mod, _rewrite_mod)
+
+    expanded = sympy.expand(rewritten)
+    coeff = expanded.coeff(iv)
+    base = expanded - coeff * iv
+    if iv not in base.free_symbols:
+        return (simplify(coeff), simplify(base))
+
+    # iv is still in base — the residual Mod(c, d) coefficients inside
+    # floor/Mod weren't provably zero.  Try numeric probing: for several
+    # concrete iv values, check that f(iv) == coeff*iv + f(0).
+    # This catches the common case where Mod(c, d) == 0 for all practical
+    # dimension sizes (power-of-2 tile sizes where d | c).
+    base_at_zero = rewritten.subs(iv, 0)
+    for iv_val in (1, 2, 3, 5, 7, 13):
+        residual = rewritten.subs(iv, iv_val) - coeff * iv_val - base_at_zero
+        probe_result = _numeric_eval_constant(residual)
+        if probe_result != 0:
+            return None
+
+    breakpoint()
+    return (simplify(coeff), simplify(base_at_zero))
+
+
 def simplify_divisor_multiples(expr: sympy.Expr) -> sympy.Expr:
     """Factor out divisor-multiples from floor/Mod without expand/cancel.
 
