@@ -457,21 +457,7 @@ def _extract_iv_from_floor_mod(
     if iv not in base.free_symbols:
         return (simplify(coeff), simplify(base))
 
-    # iv is still in base — the residual Mod(c, d) coefficients inside
-    # floor/Mod weren't provably zero.  Try numeric probing: for several
-    # concrete iv values, check that f(iv) == coeff*iv + f(0).
-    # This catches the common case where Mod(c, d) == 0 for all practical
-    # dimension sizes (power-of-2 tile sizes where d | c).
-    base_at_zero = rewritten.subs(iv, 0)
-    for iv_val in (1, 2, 3, 5, 7, 13):
-        residual = rewritten.subs(iv, iv_val) - coeff * iv_val - base_at_zero
-        probe_result = _numeric_eval_constant(residual)
-        if probe_result != 0:
-            return None
-
-    breakpoint()
-    return (simplify(coeff), simplify(base_at_zero))
-
+    return None
 
 def simplify_divisor_multiples(expr: sympy.Expr) -> sympy.Expr:
     """Factor out divisor-multiples from floor/Mod without expand/cancel.
