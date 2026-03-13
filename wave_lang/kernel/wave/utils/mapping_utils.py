@@ -536,8 +536,8 @@ def _compute_probe_depth(flat_expr: sympy.Expr, concrete_coeff: int) -> int:
     The overall period ``P = LCM(all periods)`` is the exact number of
     diffs needed to capture the full stride pattern.
 
-    Capped at ``_MAX_PROBE_DEPTH`` to prevent combinatorial blow-up when
-    many coprime divisors are present.
+    Raises ``ValueError`` if the computed depth exceeds ``_MAX_PROBE_DEPTH``,
+    which indicates a pathological mapping with too many coprime divisors.
     """
     if concrete_coeff == 0:
         return 1
@@ -548,12 +548,12 @@ def _compute_probe_depth(flat_expr: sympy.Expr, concrete_coeff: int) -> int:
     periods = [d // gcd(C, d) for d in divisors]
     depth = lcm(*periods)
     if depth > _MAX_PROBE_DEPTH:
-        print(
-            f"  *** WARNING: probe depth {depth} exceeds cap"
-            f" {_MAX_PROBE_DEPTH} (divisors={sorted(divisors)},"
-            f" C={C}).  Clamping — stride result may be approximate."
+        raise ValueError(
+            f"Probe depth {depth} exceeds maximum {_MAX_PROBE_DEPTH}"
+            f" (divisors={sorted(divisors)}, C={C})."
+            f" The mapping has too many coprime floor/Mod divisors"
+            f" for exact stride analysis."
         )
-        depth = _MAX_PROBE_DEPTH
     return depth
 
 
