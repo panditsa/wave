@@ -62,7 +62,8 @@ from ...ops.wave_ops import (
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
 from ...wave.utils.mapping_utils import transform_index_on_mapping
-from ...wave.utils.symbol_utils import safe_subs, simplify
+from ...wave.assumptions import get_divisibility_subs
+from ...wave.utils.symbol_utils import safe_subs, simplify, extract_iv
 from .emitter import (
     WaveEmitter,
     add_emitter_subs,
@@ -771,12 +772,79 @@ def _create_vec_read_write(
             return
 
 
+def _cancel_floordiv_mod_linearize(
+    dim_exprs: list[sympy.Expr],
+    strides: list[sympy.Expr],
+) -> sympy.Expr:
+    """Compute sum(e_i * s_i) while cancelling floor/Mod pairs.
+
+    Preshuffle mappings produce ``flat // d`` for one dimension and
+    ``flat % d`` for another, where the first dimension's stride equals
+    ``d``.  SymPy doesn't auto-simplify ``floor(x/d)*d + Mod(x,d)``
+    to ``x``, so we do a structural match.
+
+    Handles the common case where SymPy factors a GCD ``g`` out of Mod
+    but not floor: ``floor(g*a/(g*d))*(g*d) + g*Mod(a,d) = g*a``.
+    """
+    result = sympy.Integer(0)
+    consumed = [False] * len(dim_exprs)
+
+    for i, (e_i, s_i) in enumerate(zip(dim_exprs, strides)):
+        if consumed[i]:
+            continue
+        for fl in e_i.atoms(sympy.floor):
+            arg = fl.args[0]
+            numer, denom = arg.as_numer_denom()
+            if denom == 1:
+                continue
+            s_ratio = simplify(s_i / denom)
+            if not s_ratio.is_integer:
+                continue
+
+            for j, (e_j, s_j) in enumerate(zip(dim_exprs, strides)):
+                if i == j or consumed[j]:
+                    continue
+                for m in e_j.atoms(sympy.Mod):
+                    m_val, m_mod = m.args
+                    g = simplify(denom / m_mod)
+                    if not g.is_integer or g <= 0:
+                        continue
+                    if simplify(sympy.expand(numer) - g * sympy.expand(m_val)) != 0:
+                        continue
+
+                    e_i_rest = e_i - fl
+                    e_j_rest = simplify(e_j.subs(m, 0))
+                    m_coeff = simplify((e_j - e_j_rest) / m)
+
+                    if simplify(m_coeff - g) == 0:
+                        result += numer * s_ratio * s_j
+                    else:
+                        result += (numer - g * m) * s_ratio
+                        result += e_j * s_j
+                        consumed[j] = False
+                    result += e_i_rest * s_i
+                    result += e_j_rest * s_j
+                    consumed[i] = True
+                    consumed[j] = True
+                    break
+                if consumed[i]:
+                    break
+            if consumed[i]:
+                break
+
+    for i, (e_i, s_i) in enumerate(zip(dim_exprs, strides)):
+        if not consumed[i]:
+            result += e_i * s_i
+
+    return sympy.expand(result)
+
+
 def _try_iv_split_offset(
     emitter: WaveEmitter,
     index: dict[IndexExpr, IndexSequence | IndexExpr],
-    strides: list[int],
+    strides: list[int | IndexExpr],
     dynamic_vals: dict[IndexExpr, Any],
-    use_subs_idxc: bool = False,
+    use_subs_idxc: bool = True,
 ) -> Optional[Value]:
     """Compute a hoisted IV-split linearized offset for a loop-carried read.
 
@@ -784,20 +852,23 @@ def _try_iv_split_offset(
     expressions are provably affine in the loop IV, or ``None`` to fall back
     to the default address path.
 
-    The caller is responsible for emitting the actual load/gather using the
-    returned offset.
+    Phase 1 (split-first): extract _j per dimension before linearizing.
+    Works when each dimension's index is linear in _j (the common case).
 
-    Parameters
-    ----------
-    strides : per-dimension integer strides for linearisation.
-    use_subs_idxc : if True, apply ``subs_idxc`` before simplification
-        (needed when expressions contain residual shape symbols).
+    Phase 1b (linearize-first fallback): when per-dimension extraction
+    fails (e.g. preshuffle mappings with ``floor(flat/d)`` for N and
+    ``Mod(flat, d)`` for K), linearize first using
+    ``_cancel_floordiv_mod_linearize`` to apply the identity
+    ``floor(x/d)*d + Mod(x,d) = x``, then extract _j from the combined
+    expression.  The floor/Mod cancel, exposing a clean linear stride.
     """
     ip = InsertionPoint.current
     owner = ip.block.owner
     if isinstance(owner, func_d.FuncOp):
+        print("Failed to extract IV stride, owner is func_d.FuncOp")
         return None
     if owner.name != "scf.for":
+        print("Failed to extract IV stride, owner is not scf.for")
         return None
 
     # Find the IV symbol for this scf.for directly from its block argument.
@@ -806,6 +877,7 @@ def _try_iv_split_offset(
     # do a reverse lookup of the dimension/symbol that the current IV is associated with
     dim = next((d for d, v in emitter.induction_vars.items() if v == current_iv), None)
     if dim is None:
+        print("Failed to extract IV stride, dim is None")
         return None
     iv_sym = next(
         (
@@ -816,74 +888,138 @@ def _try_iv_split_offset(
         None,
     )
     if iv_sym is None:
+        print("Failed to extract IV stride, iv_sym is None")
         return None
 
+    print("-------")
     step_int = _get_constant_value(owner.operands[2])
     if step_int is None or step_int <= 0:
+        print("Failed to extract IV stride, step_int is None or <= 0")
         return None
 
     start_exprs = _get_start_indices(index)
     if len(start_exprs) != len(strides):
+        print("Failed to extract IV stride, len(start_exprs) != len(strides)")
         return None
 
-    # Phase 1: Symbolic linearity proof w.r.t. the current loop's IV only.
-    # substitute IV = step*_j and check
-    # that the linearized index is c*_j + remainder (no _j in remainder).
+    sym_strides = [sympy.sympify(s) for s in strides]
+
+    # Extract divisibility assumptions (e.g. Assumption(Eq(Mod(K, 256), 0)))
+    # into forward subs: K → 256 * _K_div_256.  Applying these lets sympy
+    # resolve Mod(K, 256) → 0 and floor(K/256) → _K_div_256, which is
+    # critical for separating the IV from floor/Mod expressions.
+    div_fwd, div_bwd = get_divisibility_subs(emitter.constraints)
+
     _j = sympy.Symbol("_j", integer=True, nonnegative=True)
     iv_as_j = step_int * _j
-    lin_sym = sympy.Integer(0)
-    for expr, ps in zip(start_exprs, strides):
+
+    # Prepare per-dimension expressions with IV substituted.
+    dim_exprs = []
+    for expr, stride in zip(start_exprs, sym_strides):
         e = safe_subs(expr, {iv_sym: iv_as_j})
         if use_subs_idxc:
             e = subs_idxc(e)
+        if div_fwd:
+            e = safe_subs(e, div_fwd)
         e = simplify(e)
-        lin_sym += e * ps
-    lin_sym = simplify(lin_sym)
+        dim_exprs.append(e)
 
-    coeff = lin_sym.coeff(_j)
-    remainder = simplify(lin_sym - coeff * _j)
-    if not coeff.is_Integer or coeff == 0 or _j in remainder.free_symbols:
+    # Phase 1: Split-first — extract _j coefficient per dimension before
+    # linearizing, so _j never enters floor/Mod from symbolic strides.
+    iv_stride_sym = sympy.Integer(0)
+    base_exprs = []
+    split_first_ok = True
+
+    for e, stride in zip(dim_exprs, sym_strides):
+        result = extract_iv(e, _j)
+        if result is None:
+            split_first_ok = False
+            break
+        j_coeff, remainder = result
+
+        if div_bwd:
+            j_coeff = safe_subs(j_coeff, div_bwd)
+            remainder = safe_subs(remainder, div_bwd)
+
+        iv_stride_sym += simplify(j_coeff * stride)
+        base_exprs.append(remainder)
+
+    # Phase 1b: Linearize-first fallback.
+    # When per-dimension extraction fails (e.g. preshuffle mappings with
+    # floor(x/d) for N and Mod(x,d) for K), the floor/Mod cancel in the
+    # combined linearized expression via (x//d)*d + x%d = x.
+    #
+    # SymPy doesn't auto-simplify this identity, so we do a structural
+    # match: find floor(g*a / (g*d)) in dim i paired with g*Mod(a, d)
+    # in dim j, where stride[i] == g*d.  Then floor(g*a/(g*d))*(g*d)
+    # + g*Mod(a,d) = g*a, which is typically linear in the loop IV.
+    if not split_first_ok:
+        fwd_strides = []
+        for s in sym_strides:
+            fs = safe_subs(s, div_fwd) if div_fwd else s
+            fwd_strides.append(fs)
+
+        lin_sym = _cancel_floordiv_mod_linearize(dim_exprs, fwd_strides)
+        lin_sym = simplify(lin_sym)
+
+        result = extract_iv(lin_sym, _j)
+        if result is None:
+            print("Failed to extract IV stride, result is None")
+            return None
+        j_coeff_lin, base_lin = result
+
+        if div_bwd:
+            j_coeff_lin = safe_subs(j_coeff_lin, div_bwd)
+            base_lin = safe_subs(base_lin, div_bwd)
+
+        iv_stride_sym = simplify(j_coeff_lin)
+        base_exprs = None
+        base_lin_expr = base_lin
+
+    if iv_stride_sym == 0:
+        print("Failed to extract IV stride, iv_stride_sym == 0")
         return None
-    k_stride_per_iv, rem = divmod(int(coeff), step_int)
-    if rem != 0:
-        return None
 
-    # Phase 2: Substitute IV=0 to get the loop-invariant base offset.
-    iv_zero_subs = {iv_sym: 0}
-    index_no_iv = {}
-    for dim, seq in index.items():
-        start = _get_start_index(seq)
-        new_start = safe_subs(start, iv_zero_subs)
-        if isinstance(seq, IndexSequence):
-            index_no_iv[dim] = IndexSequence(new_start, seq.size)
-        else:
-            index_no_iv[dim] = new_start
+    # Compute per-IV-step stride = total_iv_coeff / step.
+    if iv_stride_sym.is_Integer:
+        k_stride_per_iv_int, rem = divmod(int(iv_stride_sym), step_int)
+        if rem != 0:
+            print("Failed to extract IV stride, rem != 0")
+            return None
+        k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
+    else:
+        k_stride_per_iv = simplify(iv_stride_sym / step_int)
 
-    # Emit the hoisted linearized offset BEFORE the scf.for.
+    # Phase 2: Emit MLIR.
+    # base_addr (loop-invariant) is hoisted before the scf.for.
+    # iv_offset = IV * k_stride_per_iv is emitted inside the loop.
     hoist_ip = InsertionPoint(owner)
     subs_map = add_emitter_subs(emitter, dynamic_vals)
     overflow_flags = arith_d.IntegerOverflowFlags.nsw
 
     with hoist_ip:
-        iv0_exprs = _get_start_indices(index_no_iv)
-        lin_offset = None
-        for expr, ps in zip(iv0_exprs, strides):
-            val = gen_sympy_index(subs_map, expr)
-            stride_c = arith_d.constant(IndexType.get(), ps)
-            term = arith_d.muli(val, stride_c, overflow_flags=overflow_flags)
-            lin_offset = (
-                term
-                if lin_offset is None
-                else arith_d.addi(lin_offset, term, overflow_flags=overflow_flags)
-            )
+        if base_exprs is not None:
+            lin_offset = None
+            for base_expr, stride in zip(base_exprs, sym_strides):
+                val = gen_sympy_index(subs_map, base_expr)
+                stride_val = gen_sympy_index(subs_map, stride)
+                term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
+                lin_offset = (
+                    term
+                    if lin_offset is None
+                    else arith_d.addi(lin_offset, term, overflow_flags=overflow_flags)
+                )
+        else:
+            lin_offset = gen_sympy_index(subs_map, base_lin_expr)
+        k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
 
     # Back inside the loop: total = hoisted_base + IV * k_stride.
     iv_mlir = subs_map.get(iv_sym)
     if iv_mlir is None:
+        print("Failed to extract IV stride, iv_mlir is None")
         return None
-
-    k_stride_val = arith_d.constant(IndexType.get(), k_stride_per_iv)
     iv_offset = arith_d.muli(iv_mlir, k_stride_val, overflow_flags=overflow_flags)
+    print("Pass returning total offset")
     return arith_d.addi(lin_offset, iv_offset, overflow_flags=overflow_flags)
 
 
@@ -1002,51 +1138,63 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             get_custom(node), emitter.constraints, emitter.options.target
         )
     ):
+
         kb_type = MemRefType(kb_src.type)
         phys_strides, _ = kb_type.get_strides_and_offset()
         dyn_sentinel = ShapedType.get_dynamic_stride_or_offset()
-        if not any(s == dyn_sentinel for s in phys_strides):
-            total_offset = _try_iv_split_offset(
-                emitter,
-                index,
-                list(phys_strides),
-                dynamic_vals_map_start,
+        if any(s == dyn_sentinel for s in phys_strides):
+            iv_strides = list(
+                strides_from_symbolic_shape(
+                    IndexingContext.current(),
+                    input_shape,
+                    allow_mixed_shapes=True,
+                )
             )
-            if total_offset is not None:
-                ip = InsertionPoint.current
-                owner = ip.block.owner
-                hoist_ip = InsertionPoint(owner)
-                with hoist_ip:
-                    strides_vals = [
-                        arith_d.constant(IndexType.get(), s) for s in phys_strides
-                    ]
-                    zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(
-                        phys_strides
+        else:
+            iv_strides = [sympy.Integer(s) for s in phys_strides]
+        print("Calling _try_iv_split_offset from handle_read")
+        total_offset = _try_iv_split_offset(
+            emitter,
+            index,
+            iv_strides,
+            dynamic_vals_map_start,
+        )
+        if total_offset is not None:
+            print("Total offset is not None")
+            ip = InsertionPoint.current
+            owner = ip.block.owner
+            hoist_ip = InsertionPoint(owner)
+            subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
+            with hoist_ip:
+                strides_vals = [gen_sympy_index(subs_map, s) for s in iv_strides]
+                zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(
+                    iv_strides
+                )
+                lin_src, _ = _linearize_memref(
+                    kb_src, zero_indices, zero_indices, strides_vals
+                )
+
+                # With epilogue elimination the loop runs extra iterations
+                # whose offsets can exceed the actual buffer.  Wrap the
+                # linearised memref in a fat_raw_buffer_cast so that the
+                # SRD's NUM_RECORDS = real buffer size and OOB loads safely
+                # return zero instead of faulting.
+                if buffer_ops_enabled and emitter.options.eliminate_epilogue:
+                    valid_bytes = _compute_valid_bytes(
+                        lin_src,
+                        element_type,
+                        input_shape,
+                        emitter,
                     )
-                    lin_src, _ = _linearize_memref(
-                        kb_src, zero_indices, zero_indices, strides_vals
+                    lin_src = _cast_buffer_and_encode_stride(
+                        lin_src,
+                        strides_vals,
+                        element_type,
+                        valid_bytes,
                     )
-                    # With epilogue elimination the loop runs extra iterations
-                    # whose offsets can exceed the actual buffer.  Wrap the
-                    # linearised memref in a fat_raw_buffer_cast so that the
-                    # SRD's NUM_RECORDS = real buffer size and OOB loads safely
-                    # return zero instead of faulting.
-                    if buffer_ops_enabled and emitter.options.eliminate_epilogue:
-                        valid_bytes = _compute_valid_bytes(
-                            lin_src,
-                            element_type,
-                            input_shape,
-                            emitter,
-                        )
-                        lin_src = _cast_buffer_and_encode_stride(
-                            lin_src,
-                            strides_vals,
-                            element_type,
-                            valid_bytes,
-                        )
-                result = vector_d.load(vector_type, lin_src, [total_offset])
-                emitter.bind_node_proxy(node, IRProxyValue(result))
-                return
+            result = vector_d.load(vector_type, lin_src, [total_offset])
+            emitter.bind_node_proxy(node, IRProxyValue(result))
+            return
 
     start_indices, start_indices_wg, start_indices_th = _build_start_indices(
         emitter, index, dynamic_vals_map_start
@@ -1432,20 +1580,14 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
 
     # IV-split: try hoisting the src offset before the loop.
-    try:
-        sym_strides_int = [int(subs_idxc(s)) for s in sym_stride_vals]
-    except (TypeError, ValueError):
-        sym_strides_int = []
-
-    src_offset = None
-    if sym_strides_int:
-        src_offset = _try_iv_split_offset(
-            emitter,
-            new_src_idx,
-            sym_strides_int,
-            src_dynamic_vals_map_start,
-            use_subs_idxc=True,
-        )
+    print("Calling _try_iv_split_offset from handle_gather_to_lds")
+    src_offset = _try_iv_split_offset(
+        emitter,
+        new_src_idx,
+        list(sym_stride_vals),
+        src_dynamic_vals_map_start,
+        use_subs_idxc=True,
+    )
 
     if src_offset is not None:
         # IV-split path: offset=0 reinterpret_cast, full address in src_offset.
