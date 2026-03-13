@@ -796,20 +796,19 @@ def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=N
     anchor_has_mapping = anchor_mapping is not None
     anchor_is_identity = anchor_custom.has_identity_mapping() if anchor_has_mapping else None
     if anchor_has_mapping and not anchor_is_identity:
-        symbolic_shape = anchor_custom.type.symbolic_shape
-        iv_stride = compute_iv_stride_through_mapping(
-            anchor_mapping, symbolic_shape, anchor_custom.index, is_read=True
-        )
+        from ..._support.indexing import IndexingContext
+        from ...compiler.utils import strides_from_symbolic_shape
 
-    from ..._support.indexing import subs_idxc
-    mem_addr_space = subs_idxc(anchor_custom.memory_type.address_space)
-    print(f"  [_emit_wide_read] anchor={anchor_custom.fx_node.name}"
-          f", memory={anchor_custom.memory.name}"
-          f", addr_space={mem_addr_space}"
-          f", mapping={'present' if anchor_has_mapping else 'None'}"
-          f", identity={anchor_is_identity}"
-          f", iv_stride={iv_stride}"
-          f", wide_ept={wide_ept}")
+        symbolic_shape = anchor_custom.type.symbolic_shape
+        mem_sym_shape = get_custom(anchor_custom.memory).type.symbolic_shape
+        idxc = IndexingContext.current()
+        phys_strides = strides_from_symbolic_shape(
+            idxc, mem_sym_shape, allow_mixed_shapes=True
+        )
+        iv_stride = compute_iv_stride_through_mapping(
+            anchor_mapping, symbolic_shape, anchor_custom.index,
+            is_read=True, mem_strides=phys_strides,
+        )
 
     wide_read = Read(
         anchor_custom.memory,
@@ -826,8 +825,6 @@ def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=N
         wide_read.precomputed_mask_expr = mask_expr
     if iv_stride is not None:
         wide_read.meta["iv_stride"] = iv_stride
-    print(f"    -> created wide_read={wide_read.name}"
-          f", meta_iv_stride={'set' if iv_stride else 'NOT set'}")
     propagate_tag(tag_source, wide_read)
     return wide_read
 

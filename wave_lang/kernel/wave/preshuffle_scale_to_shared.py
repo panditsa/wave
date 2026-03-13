@@ -318,20 +318,12 @@ def _transform_scale_memory(
     # tile sizes), the per-IV-step contribution = (coeff // 8) * 256.
     _iv_stride_info = None
     k_tile_expanded = sympy.expand(k_tile)
-    print(f"  [preshuffle_scale] k_tile={k_tile}, expanded={k_tile_expanded}")
-    print(f"    free_symbols={k_tile_expanded.free_symbols}")
     for sym in k_tile_expanded.free_symbols:
         if str(sym).startswith("$ARG"):
             coeff = subs_idxc(k_tile_expanded.coeff(sym))
-            print(f"    found IV {sym}, coeff={coeff} (type={type(coeff).__name__})")
             if isinstance(coeff, (int, sympy.Integer)) and int(coeff) % 8 == 0:
                 _iv_stride_info = {sym: sympy.Integer((int(coeff) // 8) * 256)}
-                print(f"    -> iv_stride_info={_iv_stride_info}")
-            else:
-                print(f"    -> SKIPPED (not concrete or not divisible by 8)")
             break
-    if _iv_stride_info is None:
-        print(f"    -> NO IV FOUND in k_tile")
 
     sample_write_node = write_group[0][0]
 
@@ -402,19 +394,12 @@ def _transform_scale_memory(
         all_new_writes.append(new_write)
 
     for write_node, write, input_read in write_group:
-        print(f"  [preshuffle_scale] erasing write={write_node.name}"
-              f", global_read={input_read.fx_node.name}"
-              f", global_read_memory={input_read.memory.name}"
-              f", mapping={'present' if input_read.mapping else 'None'}")
         for user in list(write_node.users):
             user_custom = get_custom(user)
             if (
                 isinstance(user_custom, Read)
                 and user_custom._write_dependency is not None
             ):
-                print(f"    updating write_dep for shared_read={user.name}"
-                      f", memory={user_custom.memory.name}"
-                      f", addr_space={subs_idxc(user_custom.memory_type.address_space)}")
                 new_deps = [d for d in user_custom._write_dependency if d != write_node]
                 new_deps.extend(all_new_writes)
                 user_custom.update_arg("_write_dependency", new_deps)
@@ -426,24 +411,13 @@ def _transform_scale_memory(
             erased_reads.add(read_id)
             input_read.update_arg("mapping", None)
             get_custom(input_read.fx_node).erase()
-        else:
-            print(f"    global_read already erased (duplicate)")
 
-    # --- Transform reads ---
-    # LDS data is now in preshuffle physical order.  Each MMA read needs
-    # one scale byte at logical (k, m).  The preshuffle formula decomposes
-    # into constant_base + lane_id * 4 when k_offset is a multiple of 4
-    # and m_offset is a multiple of 16 (guaranteed by MMA tiling).
-    print(f"  [preshuffle_scale] --- scanning reads for alloc={alloc_node.name} ---")
     read_infos = []
-    _skipped_reads = []
     for node in trace.walk(lambda n: isinstance(get_custom(n), Read)):
         read = get_custom(node)
         if read.memory != alloc_node:
-            _skipped_reads.append((node.name, read.memory.name, "wrong_memory"))
             continue
         if subs_idxc(read.memory_type.address_space) != SHARED_ADDRESS_SPACE:
-            _skipped_reads.append((node.name, read.memory.name, "not_shared"))
             continue
 
         local_index = remove_global_indexing(read.index, constraints)
@@ -474,18 +448,6 @@ def _transform_scale_memory(
 
         read_infos.append((node, read, flat_lds, constant_base))
 
-    print(f"  [preshuffle_scale] found {len(read_infos)} shared reads to remap:")
-    for node, read, flat_lds, cbase in read_infos:
-        print(f"    {node.name}: mapping={'present' if read.mapping else 'None'}"
-              f", index_keys={list(read.index.keys())}")
-    if _skipped_reads:
-        scale_skipped = [(n, m, r) for n, m, r in _skipped_reads
-                         if 'scale' in n.lower() or 'read' == n or n.startswith('read_')]
-        if scale_skipped:
-            print(f"  [preshuffle_scale] skipped reads (possibly relevant):")
-            for name, mem, reason in scale_skipped[:10]:
-                print(f"    {name}: memory={mem}, reason={reason}")
-
     # Group by dword-aligned base for wide 4-byte reads.
     row_groups: dict[int, list] = defaultdict(list)
     for info in read_infos:
@@ -496,18 +458,12 @@ def _transform_scale_memory(
     remapped = 0
     for info in read_infos:
         node, read, flat_lds, cbase = info
-        had_mapping = read.mapping is not None
         read.index = {
             dim_0: IndexSequence(0, 1, 1),
             dim_1: IndexSequence(flat_lds, 1, 1),
         }
-        if had_mapping:
-            print(f"  [preshuffle_scale] remap {node.name}: clearing mapping,"
-                  f" new_index={{dim_0: 0, dim_1: {flat_lds}}}")
+        if read.mapping is not None:
             read.update_arg("mapping", None)
-        else:
-            print(f"  [preshuffle_scale] remap {node.name}: mapping was already None,"
-                  f" new_index={{dim_0: 0, dim_1: {flat_lds}}}")
         remapped += 1
 
     logger.info(f"Remapped {remapped} shared reads to preshuffle addressing")
