@@ -61,7 +61,11 @@ from ...ops.wave_ops import (
     MemoryAccessFlags,
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
-from ...wave.utils.mapping_utils import transform_index_on_mapping
+from ...wave.utils.mapping_utils import (
+    linearize_dims,
+    mem_simplify,
+    transform_index_on_mapping,
+)
 from ...wave.assumptions import get_divisibility_subs
 from ...wave.utils.symbol_utils import safe_subs, simplify, extract_iv
 from .emitter import (
@@ -776,67 +780,13 @@ def _cancel_floordiv_mod_linearize(
     dim_exprs: list[sympy.Expr],
     strides: list[sympy.Expr],
 ) -> sympy.Expr:
-    """Compute sum(e_i * s_i) while cancelling floor/Mod pairs.
+    """Compute ``sum(e_i * s_i)`` while cancelling floor/Mod pairs.
 
-    Preshuffle mappings produce ``flat // d`` for one dimension and
-    ``flat % d`` for another, where the first dimension's stride equals
-    ``d``.  SymPy doesn't auto-simplify ``floor(x/d)*d + Mod(x,d)``
-    to ``x``, so we do a structural match.
-
-    Handles the common case where SymPy factors a GCD ``g`` out of Mod
-    but not floor: ``floor(g*a/(g*d))*(g*d) + g*Mod(a,d) = g*a``.
+    Delegates to :func:`linearize_dims` which expands ``Mod(x, d)``
+    into ``x - d*floor(x/d)`` so that the matching ``floor`` terms
+    cancel algebraically under ``expand()``.
     """
-    result = sympy.Integer(0)
-    consumed = [False] * len(dim_exprs)
-
-    for i, (e_i, s_i) in enumerate(zip(dim_exprs, strides)):
-        if consumed[i]:
-            continue
-        for fl in e_i.atoms(sympy.floor):
-            arg = fl.args[0]
-            numer, denom = arg.as_numer_denom()
-            if denom == 1:
-                continue
-            s_ratio = simplify(s_i / denom)
-            if not s_ratio.is_integer:
-                continue
-
-            for j, (e_j, s_j) in enumerate(zip(dim_exprs, strides)):
-                if i == j or consumed[j]:
-                    continue
-                for m in e_j.atoms(sympy.Mod):
-                    m_val, m_mod = m.args
-                    g = simplify(denom / m_mod)
-                    if not g.is_integer or g <= 0:
-                        continue
-                    if simplify(sympy.expand(numer) - g * sympy.expand(m_val)) != 0:
-                        continue
-
-                    e_i_rest = e_i - fl
-                    e_j_rest = simplify(e_j.subs(m, 0))
-                    m_coeff = simplify((e_j - e_j_rest) / m)
-
-                    if simplify(m_coeff - g) == 0:
-                        result += numer * s_ratio * s_j
-                    else:
-                        result += (numer - g * m) * s_ratio
-                        result += e_j * s_j
-                        consumed[j] = False
-                    result += e_i_rest * s_i
-                    result += e_j_rest * s_j
-                    consumed[i] = True
-                    consumed[j] = True
-                    break
-                if consumed[i]:
-                    break
-            if consumed[i]:
-                break
-
-    for i, (e_i, s_i) in enumerate(zip(dim_exprs, strides)):
-        if not consumed[i]:
-            result += e_i * s_i
-
-    return sympy.expand(result)
+    return linearize_dims(dim_exprs, strides)
 
 
 def _emit_cycle_offset(
@@ -1003,7 +953,7 @@ def _try_iv_split_offset(
             e = subs_idxc(e)
         if div_fwd:
             e = safe_subs(e, div_fwd)
-        e = simplify(e)
+        e = mem_simplify(e)
         dim_exprs.append(e)
 
     # Phase 1: per-dimension extract.
@@ -1022,7 +972,7 @@ def _try_iv_split_offset(
             j_coeff = safe_subs(j_coeff, div_bwd)
             remainder = safe_subs(remainder, div_bwd)
 
-        iv_stride_sym += simplify(j_coeff * stride)
+        iv_stride_sym += mem_simplify(j_coeff * stride)
         base_exprs.append(remainder)
 
     # Phase 1b: linearize-first fallback.
@@ -1033,7 +983,7 @@ def _try_iv_split_offset(
             fwd_strides.append(fs)
 
         lin_sym = _cancel_floordiv_mod_linearize(dim_exprs, fwd_strides)
-        lin_sym = simplify(lin_sym)
+        lin_sym = mem_simplify(lin_sym)
 
         result = extract_iv(lin_sym, _j)
         if result is None:
@@ -1044,7 +994,7 @@ def _try_iv_split_offset(
             j_coeff_lin = safe_subs(j_coeff_lin, div_bwd)
             base_lin = safe_subs(base_lin, div_bwd)
 
-        iv_stride_sym = simplify(j_coeff_lin)
+        iv_stride_sym = mem_simplify(j_coeff_lin)
         base_exprs = None
         base_lin_expr = base_lin
 
@@ -1057,7 +1007,7 @@ def _try_iv_split_offset(
             return None
         k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
     else:
-        k_stride_per_iv = simplify(iv_stride_sym / step_int)
+        k_stride_per_iv = mem_simplify(iv_stride_sym / step_int)
 
     # Emit MLIR.
     hoist_ip = InsertionPoint(owner)
