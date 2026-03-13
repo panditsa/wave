@@ -1132,7 +1132,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     # IV-split fast path for global reads: hoist address before the loop.
     if (
         is_global
-        and mask is None
         and not use_llvm_load
         and not read_meets_hw_transpose_requirements(
             get_custom(node), emitter.constraints, emitter.options.target
@@ -1152,7 +1151,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             )
         else:
             iv_strides = [sympy.Integer(s) for s in phys_strides]
-        print("Calling _try_iv_split_offset from handle_read")
         total_offset = _try_iv_split_offset(
             emitter,
             index,
@@ -1160,7 +1158,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             dynamic_vals_map_start,
         )
         if total_offset is not None:
-            print("Total offset is not None")
             ip = InsertionPoint.current
             owner = ip.block.owner
             hoist_ip = InsertionPoint(owner)
@@ -1192,7 +1189,15 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
                         element_type,
                         valid_bytes,
                     )
-            result = vector_d.load(vector_type, lin_src, [total_offset])
+            if mask is None:
+                result = vector_d.load(vector_type, lin_src, [total_offset])
+            else:
+                element_type = vector_type.element_type
+                zero = arith_d.constant(element_type, get_constant_attr(0, element_type))
+                passthru = vector_d.broadcast(vector_type, zero)
+                result = vector_d.maskedload(
+                    vector_type, lin_src, [total_offset], mask, passthru
+                )
             emitter.bind_node_proxy(node, IRProxyValue(result))
             return
 
