@@ -256,34 +256,38 @@ def _check_contiguous_with_aligned_base(
 _INDUCTION_PREFIX = "$ARG"
 
 
+_PROBE_DEPTH = 8
+
+
 def compute_iv_stride_through_mapping(
     mapping: IndexMapping,
     symbolic_shape: tuple[IndexExpr, ...],
     index: dict[IndexExpr, IndexSequence],
     is_read: bool = True,
-) -> dict[sympy.Symbol, IndexExpr] | None:
+    mem_strides: list[IndexExpr] | None = None,
+) -> dict[sympy.Symbol, IndexExpr | list[IndexExpr]] | None:
     """Compute each IV symbol's linearized stride through a mapping.
 
-    Before the mapping is applied, the IV appears linearly in one iterator
-    (e.g. ``$index1 = 128*$ARGK + thread_offset``).  The mapping then buries
-    the IV inside floor/Mod (preshuffle).  But because the IV coefficient is
-    always divisible by the moduli/divisors in the mapping (tile sizes are
-    multiples of the interleaving granularity), we can resolve the IV's
-    contribution by substituting ``iter = concrete_coeff * _iv`` and letting
-    sympy evaluate the Mod/floor to concrete integers.
+    Uses numerical probing: evaluates the linearized address at iv=0,1,...,P,
+    takes consecutive differences, and detects constant or cyclic stride
+    patterns.  This handles symbolic divisors (e.g. ``floor(K/32)``) that
+    defeat the old ``sympy.coeff(_iv)`` approach.
 
-    Returns ``{iv_sym: linearized_stride_per_iv_step}`` or ``None``.
+    Parameters
+    ----------
+    mem_strides : optional physical memory strides.  When provided these are
+        used for linearization instead of strides derived from
+        ``symbolic_shape``.  Callers with access to the physical memory
+        layout should pass these to ensure floor/Mod cancellation.
+
+    Returns ``{iv_sym: stride}`` (constant) or ``{iv_sym: [s0, s1, ...]}``
+    (repeating cycle), or ``None`` when no IV is found.
     """
-    symbolic_shape_resolved = tuple(infer_dim(d) for d in symbolic_shape)
     iters = mapping.iters
 
-    # Identify IV symbols and their concrete coefficients in each iterator.
     iv_info: dict[sympy.Symbol, tuple[sympy.Symbol, int]] = {}
     for iter_sym, seq in zip(iters.keys(), index.values()):
-        if isinstance(seq, IndexSequence):
-            start = sympy.sympify(seq.start)
-        else:
-            start = sympy.sympify(seq)
+        start = sympy.sympify(seq.start if isinstance(seq, IndexSequence) else seq)
         for sym in start.free_symbols:
             if not str(sym).startswith(_INDUCTION_PREFIX):
                 continue
@@ -294,60 +298,86 @@ def compute_iv_stride_through_mapping(
             iv_info[sym] = (iter_sym, int(concrete))
 
     if not iv_info:
-        starts = []
-        for iter_sym, seq in zip(iters.keys(), index.values()):
-            s = seq.start if isinstance(seq, IndexSequence) else seq
-            starts.append((iter_sym, s))
-        print(f"  [compute_iv_stride] NO IV found."
-              f" iters={list(iters.keys())},"
-              f" index_keys={list(index.keys())},"
-              f" starts={starts}")
         return None
 
-    # Get the mapping expressions with symbolic constants resolved.
-    if is_read:
-        raw_exprs = mapping.map_input_indices(symbolic_shape_resolved)
-    else:
-        raw_exprs = mapping.map_output_indices(symbolic_shape_resolved)
+    # Resolve mapping expressions.  Use the mapping's own dimension keys
+    # so that the returned expressions are ordered by the mapping's
+    # input/output declaration, independent of the caller's shape.
+    map_dims = (
+        mapping.input_shape if is_read else mapping.output_shape
+    )
+    raw_exprs = (
+        mapping.map_input_indices(map_dims) if is_read
+        else mapping.map_output_indices(map_dims)
+    )
 
     idxc = IndexingContext.current()
     dim_exprs = [subs_idxc(e) for e in raw_exprs]
 
-    mem_strides = strides_from_symbolic_shape(
-        idxc, symbolic_shape_resolved, allow_mixed_shapes=True
-    )
+    if mem_strides is None:
+        symbolic_shape_resolved = tuple(infer_dim(d) for d in symbolic_shape)
+        mem_strides = strides_from_symbolic_shape(
+            idxc, symbolic_shape_resolved, allow_mixed_shapes=True
+        )
 
-    _iv = sympy.Symbol("_iv", integer=True, nonnegative=True)
-    result: dict[sympy.Symbol, IndexExpr] = {}
+    result: dict[sympy.Symbol, IndexExpr | list[IndexExpr]] = {}
 
     for iv_sym, (iv_iter, concrete_coeff) in iv_info.items():
-        # Substitute: IV iterator = concrete_coeff * _iv, others = 0.
-        iv_subs = {
-            it: (concrete_coeff * _iv if it == iv_iter else sympy.Integer(0))
-            for it in iters.keys()
-        }
-
-        lin_stride = sympy.Integer(0)
-        per_dim_debug = []
-        for i, (dim_expr, stride) in enumerate(zip(dim_exprs, mem_strides)):
-            substituted = subs_idxc(dim_expr.subs(iv_subs))
-            iv_coeff = sympy.expand(substituted).coeff(_iv)
-            per_dim_debug.append((i, dim_expr, substituted, iv_coeff, stride))
-            lin_stride += iv_coeff * stride
-
-        lin_stride = simplify(subs_idxc(lin_stride))
-        result[iv_sym] = lin_stride
-        print(f"  compute_iv_stride_through_mapping: {iv_sym} -> {lin_stride}"
-              f" (coeff={concrete_coeff}, iter={iv_iter},"
-              f" shape={symbolic_shape_resolved})")
-        if lin_stride == 0:
-            print(f"    BUG? stride=0 detail:")
-            for i, dim_expr, substituted, iv_coeff, stride in per_dim_debug:
-                print(f"      dim[{i}]: expr={dim_expr}"
-                      f"\n             subs={substituted}"
-                      f"\n             coeff(_iv)={iv_coeff}, stride={stride}")
+        stride_or_cycle = _probe_iv_stride(
+            dim_exprs, mem_strides, iters, iv_iter, concrete_coeff
+        )
+        if stride_or_cycle is None:
+            return None
+        result[iv_sym] = stride_or_cycle
 
     return result
+
+
+def _probe_iv_stride(
+    dim_exprs: list[IndexExpr],
+    mem_strides: list[IndexExpr],
+    iters: dict,
+    iv_iter: sympy.Symbol,
+    concrete_coeff: int,
+) -> IndexExpr | list[IndexExpr] | None:
+    """Numerically probe the linearized address to extract the IV stride.
+
+    Evaluates addr(iv) for iv = 0 .. _PROBE_DEPTH, takes consecutive
+    differences, and returns:
+      - A single IndexExpr  when all differences are equal (constant stride).
+      - A list[IndexExpr]   for a repeating cyclic stride pattern.
+      - None                when no repeating pattern is found.
+    """
+
+    def _linearized_addr(iv_val: int) -> IndexExpr:
+        subs = {
+            it: (concrete_coeff * iv_val if it == iv_iter else 0)
+            for it in iters.keys()
+        }
+        addr = sympy.Integer(0)
+        for dim_expr, stride in zip(dim_exprs, mem_strides):
+            dim_val = subs_idxc(dim_expr.subs(subs))
+            addr += simplify(dim_val) * stride
+        return simplify(subs_idxc(addr))
+
+    addrs = [_linearized_addr(i) for i in range(_PROBE_DEPTH + 1)]
+    diffs = [simplify(subs_idxc(addrs[i + 1] - addrs[i]))
+             for i in range(_PROBE_DEPTH)]
+
+    if not diffs:
+        return None
+
+    # Constant stride (most common case).
+    if all(simplify(d - diffs[0]) == 0 for d in diffs):
+        return diffs[0]
+
+    # Detect shortest repeating cycle.
+    for cycle_len in range(2, _PROBE_DEPTH // 2 + 1):
+        if all(simplify(diffs[i] - diffs[i % cycle_len]) == 0
+               for i in range(_PROBE_DEPTH)):
+            return list(diffs[:cycle_len])
+
+    return None
 
 
 def transform_index_on_mapping(
