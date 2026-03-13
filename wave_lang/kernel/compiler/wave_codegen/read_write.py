@@ -971,7 +971,7 @@ def _try_iv_split_offset(
             j_coeff = safe_subs(j_coeff, div_bwd)
             remainder = safe_subs(remainder, div_bwd)
 
-        iv_stride_sym += mem_simplify(j_coeff * stride)
+        iv_stride_sym += simplify(mem_simplify(j_coeff * stride))
         base_exprs.append(remainder)
 
     # Phase 1b: linearize-first fallback.
@@ -993,7 +993,7 @@ def _try_iv_split_offset(
             j_coeff_lin = safe_subs(j_coeff_lin, div_bwd)
             base_lin = safe_subs(base_lin, div_bwd)
 
-        iv_stride_sym = mem_simplify(j_coeff_lin)
+        iv_stride_sym = simplify(mem_simplify(j_coeff_lin))
         base_exprs = None
         base_lin_expr = base_lin
 
@@ -1006,7 +1006,7 @@ def _try_iv_split_offset(
             return None
         k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
     else:
-        k_stride_per_iv = mem_simplify(iv_stride_sym / step_int)
+        k_stride_per_iv = simplify(mem_simplify(iv_stride_sym / step_int))
 
     # Emit MLIR.
     hoist_ip = InsertionPoint(owner)
