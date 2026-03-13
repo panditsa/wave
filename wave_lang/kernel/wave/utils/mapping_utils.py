@@ -5,6 +5,7 @@
 
 from typing import TypeVar
 from copy import deepcopy
+from math import gcd, lcm
 import sympy
 import torch.fx as fx
 
@@ -256,7 +257,37 @@ def _check_contiguous_with_aligned_base(
 _INDUCTION_PREFIX = "$ARG"
 
 
-_PROBE_DEPTH = 8
+def _extract_integer_divisors(expr: sympy.Expr) -> set[int]:
+    """Collect positive integer divisors from floor and Mod nodes in *expr*."""
+    divisors: set[int] = set()
+    for sub in sympy.preorder_traversal(expr):
+        if isinstance(sub, sympy.Mod):
+            d = sub.args[1]
+            if d.is_Integer and int(d) > 0:
+                divisors.add(int(d))
+        elif isinstance(sub, sympy.floor):
+            _, denom = sub.args[0].as_numer_denom()
+            if denom.is_Integer and int(denom) > 1:
+                divisors.add(int(denom))
+    return divisors
+
+
+def _compute_probe_depth(dim_exprs: list[IndexExpr], concrete_coeff: int) -> int:
+    """Compute the minimum probe depth from mapping divisors and IV coefficient.
+
+    For each floor(expr/D) or Mod(expr, D) with integer D, the IV contribution
+    has period ``D // gcd(C, D)``.  The overall period is the LCM of all
+    individual periods — this is the exact probe depth needed to detect
+    constant or cyclic strides.
+    """
+    all_divisors: set[int] = set()
+    for expr in dim_exprs:
+        all_divisors |= _extract_integer_divisors(expr)
+    if not all_divisors:
+        return 1
+    C = abs(concrete_coeff) if concrete_coeff != 0 else 1
+    periods = [d // gcd(C, d) for d in all_divisors]
+    return lcm(*periods) if periods else 1
 
 
 def compute_iv_stride_through_mapping(
@@ -286,7 +317,10 @@ def compute_iv_stride_through_mapping(
     iters = mapping.iters
 
     iv_info: dict[sympy.Symbol, tuple[sympy.Symbol, int]] = {}
-    for iter_sym, seq in zip(iters.keys(), index.values()):
+    for dim_sym, iter_sym in mapping.output_mapping.items():
+        seq = index.get(dim_sym)
+        if seq is None:
+            continue
         start = sympy.sympify(seq.start if isinstance(seq, IndexSequence) else seq)
         for sym in start.free_symbols:
             if not str(sym).startswith(_INDUCTION_PREFIX):
@@ -342,12 +376,15 @@ def _probe_iv_stride(
 ) -> IndexExpr | list[IndexExpr] | None:
     """Numerically probe the linearized address to extract the IV stride.
 
-    Evaluates addr(iv) for iv = 0 .. _PROBE_DEPTH, takes consecutive
-    differences, and returns:
-      - A single IndexExpr  when all differences are equal (constant stride).
-      - A list[IndexExpr]   for a repeating cyclic stride pattern.
-      - None                when no repeating pattern is found.
+    The probe depth is derived from the mapping's floor/Mod divisors:
+    for each integer divisor D, the IV has period D/gcd(C, D) where C is the
+    IV coefficient.  The overall period P = LCM of all individual periods.
+    We need P probes to detect constant or cyclic strides.
+
+    Returns a single IndexExpr (constant stride), a list (repeating cycle),
+    or None when no repeating pattern is found.
     """
+    probe_depth = _compute_probe_depth(dim_exprs, concrete_coeff)
 
     def _linearized_addr(iv_val: int) -> IndexExpr:
         subs = {
@@ -360,9 +397,9 @@ def _probe_iv_stride(
             addr += simplify(dim_val) * stride
         return simplify(subs_idxc(addr))
 
-    addrs = [_linearized_addr(i) for i in range(_PROBE_DEPTH + 1)]
+    addrs = [_linearized_addr(i) for i in range(probe_depth + 1)]
     diffs = [simplify(subs_idxc(addrs[i + 1] - addrs[i]))
-             for i in range(_PROBE_DEPTH)]
+             for i in range(probe_depth)]
 
     if not diffs:
         return None
@@ -371,10 +408,34 @@ def _probe_iv_stride(
     if all(simplify(d - diffs[0]) == 0 for d in diffs):
         return diffs[0]
 
-    # Detect shortest repeating cycle.
-    for cycle_len in range(2, _PROBE_DEPTH // 2 + 1):
+    # Symbolic strides may contain floor(a/d)*d + Mod(a,d) patterns that
+    # simplify can't resolve.  Substitute a concrete value for remaining
+    # free symbols; use a value that avoids aliasing with any divisor.
+    free = set()
+    for d in diffs:
+        free |= d.free_symbols
+    if free:
+        all_divs = set()
+        for expr in dim_exprs:
+            all_divs |= _extract_integer_divisors(expr)
+        probe_val = lcm(*all_divs) * (probe_depth + 1) if all_divs else 8192
+        numeric_subs = {s: probe_val for s in free}
+        try:
+            numeric_diffs = [int(d.subs(numeric_subs)) for d in diffs]
+        except (TypeError, ValueError):
+            return None
+        if len(set(numeric_diffs)) == 1:
+            return sympy.Integer(numeric_diffs[0])
+        # Detect shortest repeating cycle from numeric diffs.
+        for cycle_len in range(2, probe_depth // 2 + 1):
+            if all(numeric_diffs[i] == numeric_diffs[i % cycle_len]
+                   for i in range(probe_depth)):
+                return [sympy.Integer(numeric_diffs[i]) for i in range(cycle_len)]
+
+    # Detect shortest repeating cycle (symbolic).
+    for cycle_len in range(2, probe_depth // 2 + 1):
         if all(simplify(diffs[i] - diffs[i % cycle_len]) == 0
-               for i in range(_PROBE_DEPTH)):
+               for i in range(probe_depth)):
             return list(diffs[:cycle_len])
 
     return None
