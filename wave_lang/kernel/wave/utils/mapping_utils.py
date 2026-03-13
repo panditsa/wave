@@ -288,7 +288,7 @@ def _eval_concrete_floor_mod(expr: sympy.Expr) -> sympy.Expr:
         if isinstance(e, sympy.floor):
             inner = e.args[0]
             if inner.is_number:
-                return sympy.Integer(int(inner))
+                return sympy.Integer(int(sympy.floor(inner)))
         if isinstance(e, sympy.Mod):
             a, m = e.args
             if a.is_Integer and m.is_Integer and int(m) != 0:
@@ -525,6 +525,9 @@ def _extract_integer_divisors(expr: sympy.Expr) -> set[int]:
     return divisors
 
 
+_MAX_PROBE_DEPTH = 1024
+
+
 def _compute_probe_depth(flat_expr: sympy.Expr, concrete_coeff: int) -> int:
     """Compute the exact probe depth from divisors in *flat_expr*.
 
@@ -532,13 +535,26 @@ def _compute_probe_depth(flat_expr: sympy.Expr, concrete_coeff: int) -> int:
     contribution has period ``D / gcd(C, D)`` where ``C`` is the IV step.
     The overall period ``P = LCM(all periods)`` is the exact number of
     diffs needed to capture the full stride pattern.
+
+    Capped at ``_MAX_PROBE_DEPTH`` to prevent combinatorial blow-up when
+    many coprime divisors are present.
     """
+    if concrete_coeff == 0:
+        return 1
     divisors = _extract_integer_divisors(flat_expr)
     if not divisors:
         return 1
-    C = abs(concrete_coeff) if concrete_coeff != 0 else 1
+    C = abs(concrete_coeff)
     periods = [d // gcd(C, d) for d in divisors]
-    return lcm(*periods)
+    depth = lcm(*periods)
+    if depth > _MAX_PROBE_DEPTH:
+        print(
+            f"  *** WARNING: probe depth {depth} exceeds cap"
+            f" {_MAX_PROBE_DEPTH} (divisors={sorted(divisors)},"
+            f" C={C}).  Clamping — stride result may be approximate."
+        )
+        depth = _MAX_PROBE_DEPTH
+    return depth
 
 
 def _probe_iv_stride(
@@ -570,12 +586,16 @@ def _probe_iv_stride(
     )
 
     # Step 1: linearize symbolically, then compute probe depth from the
-    # flat expression's divisors.
+    # flat expression's divisors.  Apply subs_idxc to iv_flat so the
+    # probe-depth computation sees the same symbol resolution as the
+    # concrete address evaluations (prevents under-probing when a
+    # divisor is symbolic pre-subs but integer post-subs).
     flat_expr = mem_simplify(linearize_dims(dim_exprs, mem_strides))
     iv_flat = flat_expr.subs({
         it: (concrete_coeff * sympy.Symbol("_iv") if it == iv_iter else 0)
         for it in iters.keys()
     })
+    iv_flat = subs_idxc(iv_flat)
     probe_depth = _compute_probe_depth(iv_flat, concrete_coeff)
 
     print(f"  probe_depth={probe_depth}")
@@ -612,7 +632,9 @@ def _probe_iv_stride(
         return None
 
     # Step 3: detect constant or shortest repeating cycle.
-    for cycle_len in range(1, probe_depth // 2 + 1):
+    # The probe depth is the analytically-proven period, so one full
+    # repetition is sufficient — use range(1, probe_depth + 1).
+    for cycle_len in range(1, probe_depth + 1):
         if all(diffs[i] == diffs[i % cycle_len] for i in range(probe_depth)):
             cycle = [sympy.Integer(diffs[i]) for i in range(cycle_len)]
             if cycle_len == 1:
@@ -626,14 +648,6 @@ def _probe_iv_stride(
                 f"  (concrete=True, probe_depth={probe_depth})"
             )
             return cycle
-
-    # probe_depth == 1: single diff, always constant.
-    if probe_depth == 1:
-        print(
-            f"  -> CONSTANT stride = {diffs[0]}"
-            f"  (concrete=True, probe_depth=1)"
-        )
-        return sympy.Integer(diffs[0])
 
     print(
         f"  -> FAILED: no constant or cyclic pattern in {probe_depth}"

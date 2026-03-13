@@ -109,7 +109,7 @@ def _resolve_chained_subs(
             if not isinstance(val, sympy.Basic):
                 ready.append(key)
                 continue
-            deps = val.free_symbols & all_keys - {key} - set(resolved.keys())
+            deps = (val.free_symbols & all_keys) - {key} - set(resolved.keys())
             if not deps:
                 ready.append(key)
 
@@ -122,10 +122,18 @@ def _resolve_chained_subs(
                 val = piecewise_aware_subs(val, resolved)
             resolved[key] = val
 
-    for key, val in pending.items():
-        if isinstance(val, sympy.Basic) and resolved:
-            val = piecewise_aware_subs(val, resolved)
-        resolved[key] = val
+    if pending:
+        import warnings
+        cycle_keys = sorted(str(k) for k in pending.keys())
+        warnings.warn(
+            f"_resolve_chained_subs: circular dependency among"
+            f" {cycle_keys} — substitution may be incomplete",
+            stacklevel=2,
+        )
+        for key, val in pending.items():
+            if isinstance(val, sympy.Basic) and resolved:
+                val = piecewise_aware_subs(val, resolved)
+            resolved[key] = val
 
     return resolved
 
