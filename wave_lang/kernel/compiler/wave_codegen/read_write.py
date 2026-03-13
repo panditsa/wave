@@ -955,11 +955,13 @@ def _try_iv_split_offset(
     # ------------------------------------------------------------------
     # Fast path: pre-computed IV stride from mapping analysis.
     # ------------------------------------------------------------------
+    _caller = kwargs.get("_caller", "unknown")
     has_iv = any(iv_sym in sympy.sympify(e).free_symbols for e in start_exprs)
     if not has_iv:
         return None
     if precomputed_iv_stride and iv_sym in precomputed_iv_stride:
         k_stride_per_iv = precomputed_iv_stride[iv_sym]
+        print(f"[iv-split] {_caller}: PRECOMPUTED stride={k_stride_per_iv}")
 
         base_start_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
 
@@ -1037,8 +1039,15 @@ def _try_iv_split_offset(
         iv_stride_sym += simplify(j_coeff * stride)
         base_exprs.append(remainder)
 
+    if split_first_ok:
+        print(f"[iv-split] {_caller}: PHASE 1 succeeded, iv_stride_sym={iv_stride_sym}")
+
     # Phase 1b: linearize-first fallback.
     if not split_first_ok:
+        print(f"[iv-split] {_caller}: Phase 1 FAILED, falling back to 1b")
+        print(f"  index = {{{', '.join(f'{k}: {v}' for k, v in index.items())}}}")
+        print(f"  dim_exprs (after iv sub) = {dim_exprs}")
+        print(f"  sym_strides = {sym_strides}")
         fwd_strides = []
         for s in sym_strides:
             fs = safe_subs(s, div_fwd) if div_fwd else s
@@ -1049,6 +1058,7 @@ def _try_iv_split_offset(
 
         result = extract_iv(lin_sym, _j)
         if result is None:
+            print(f"[iv-split] {_caller}: PHASE 1b FAILED (extract_iv returned None)")
             return None
         j_coeff_lin, base_lin = result
 
@@ -1059,6 +1069,7 @@ def _try_iv_split_offset(
         iv_stride_sym = simplify(j_coeff_lin)
         base_exprs = None
         base_lin_expr = base_lin
+        print(f"[iv-split] {_caller}: PHASE 1b succeeded, iv_stride_sym={iv_stride_sym}")
 
     if iv_stride_sym == 0:
         return None
@@ -1174,6 +1185,8 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     buffer_ops_enabled = emitter.options.use_buffer_ops and is_global_mem
 
     iv_stride_from_mapping = node.meta.get("iv_stride", None)
+    if iv_stride_from_mapping is not None:
+        print(f"[handle_read] {node.name}: iv_stride from meta = {iv_stride_from_mapping}")
     precomputed_mask_expr = getattr(node, "precomputed_mask_expr", None)
     if precomputed_mask_expr is not None and not buffer_ops_enabled:
         mask = gen_sympy_index(add_emitter_subs(emitter), precomputed_mask_expr)
@@ -1186,9 +1199,16 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
         iv_stride_from_mapping = compute_iv_stride_through_mapping(
             mapping, input_shape, index, is_read=True
         )
+        print(f"[handle_read] {node.name}: iv_stride from mapping = {iv_stride_from_mapping}")
+        if iv_stride_from_mapping is None:
+            print(f"  index = {{{', '.join(f'{k}: {v}' for k, v in index.items())}}}")
+            print(f"  mapping.input  = {dict(mapping.input_mapping)}")
+            print(f"  mapping.output = {dict(mapping.output_mapping)}")
         transformed_index = transform_index_on_mapping(
             mapping, input_shape, index, is_read=True
         )
+        if iv_stride_from_mapping is None:
+            print(f"  transformed    = {{{', '.join(f'{k}: {v}' for k, v in transformed_index.items())}}}")
         mask = _build_mask_with_mapping(
             emitter,
             mapping,
@@ -1615,6 +1635,8 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
     dst_dynamic_vals_map_start = {}
 
     iv_stride_from_mapping = node.meta.get("iv_stride", None)
+    if iv_stride_from_mapping is not None:
+        print(f"[handle_g2l] {node.name}: iv_stride from meta = {iv_stride_from_mapping}")
     if src_mapping:
         dyn_vals = tuple(
             cast_vector(emitter, reg, element_type=IndexType.get())
@@ -1624,6 +1646,7 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
             iv_stride_from_mapping = compute_iv_stride_through_mapping(
                 src_mapping, src_symbolic_shape, src_idx, is_read=True
             )
+            print(f"[handle_g2l] {node.name}: iv_stride from mapping = {iv_stride_from_mapping}")
         new_src_idx = transform_index_on_mapping(
             src_mapping, src_symbolic_shape, src_idx, is_read=True
         )
