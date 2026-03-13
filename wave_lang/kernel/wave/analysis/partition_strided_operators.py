@@ -34,10 +34,7 @@ from ...ops.wave_ops import (
 )
 from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
-from ..utils.mapping_utils import (
-    compute_iv_stride_through_mapping,
-    transform_index_on_mapping,
-)
+from ..utils.mapping_utils import transform_index_on_mapping
 from ..utils.tag_utils import propagate_tag
 from ..utils.general_utils import (
     all_equal,
@@ -791,25 +788,6 @@ def _check_lowering_ok(
 
 def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=None):
     """Create a merged Read node covering ``wide_ept`` elements."""
-    iv_stride = None
-    anchor_mapping = anchor_custom.mapping
-    anchor_has_mapping = anchor_mapping is not None
-    anchor_is_identity = anchor_custom.has_identity_mapping() if anchor_has_mapping else None
-    if anchor_has_mapping and not anchor_is_identity:
-        from ..._support.indexing import IndexingContext
-        from ...compiler.utils import strides_from_symbolic_shape
-
-        symbolic_shape = anchor_custom.type.symbolic_shape
-        mem_sym_shape = get_custom(anchor_custom.memory).type.symbolic_shape
-        idxc = IndexingContext.current()
-        phys_strides = strides_from_symbolic_shape(
-            idxc, mem_sym_shape, allow_mixed_shapes=True
-        )
-        iv_stride = compute_iv_stride_through_mapping(
-            anchor_mapping, symbolic_shape, anchor_custom.index,
-            is_read=True, mem_strides=phys_strides,
-        )
-
     wide_read = Read(
         anchor_custom.memory,
         elements_per_thread=wide_ept,
@@ -823,8 +801,9 @@ def _emit_wide_read(anchor_custom, wide_index, wide_ept, tag_source, mask_expr=N
         wide_read.vector_shapes = deepcopy(tag_source.vector_shapes)
     if mask_expr is not None:
         wide_read.precomputed_mask_expr = mask_expr
-    if iv_stride is not None:
-        wide_read.meta["iv_stride"] = iv_stride
+    anchor_iv_stride = anchor_custom.fx_node.meta.get("iv_stride")
+    if anchor_iv_stride is not None:
+        wide_read.meta["iv_stride"] = anchor_iv_stride
     propagate_tag(tag_source, wide_read)
     return wide_read
 

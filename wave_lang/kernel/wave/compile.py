@@ -37,6 +37,7 @@ from .analysis.index_sequence_analysis import (
     set_node_indices_water_checked,
     set_post_expansion_indices,
 )
+from .analysis.annotate_iv_strides import annotate_iv_strides
 from .analysis.partition_strided_operators import (
     merge_contiguous_reads,
     partition_gather_like_ops,
@@ -593,6 +594,7 @@ def build_graph_passes(
             launchable.constraints,
             launchable.reordering_constraints,
         ),
+        partial(annotate_iv_strides, trace, launchable.constraints),
         partial(
             merge_contiguous_reads,
             trace,
