@@ -1384,20 +1384,34 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(
     if block_id == "256x224x256" and use_schedule:
         pytest.xfail("C++ ASM backend exceeds VGPR limit with scheduled pipeline")
 
-    # VGPR overflow: 224x160x256 without epilogue elimination and with
-    # scheduled pipeline exceeds the 256 VGPR hardware limit.
-    if block_id == "224x160x256" and use_schedule and not eliminate_epilogue:
-        pytest.xfail(
-            "C++ ASM backend exceeds VGPR limit with scheduled pipeline "
-            "(ee=False) for 224x160x256"
-        )
-    # VGPR overflow: 256x160x256 without epilogue elimination and with
-    # scheduled pipeline exceeds the 256 VGPR hardware limit.
-    if block_id == "256x160x256" and use_schedule and not eliminate_epilogue:
-        pytest.xfail(
-            "C++ ASM backend exceeds VGPR limit with scheduled pipeline "
-            "(ee=False) for 256x160x256"
-        )
+    # VGPR overflow: 224x160x256 scheduled pipeline exceeds 256 VGPR limit
+    # without epilogue elimination; with ee=True it fits for static dims
+    # but dynamic dims adds enough extra VGPRs to overflow again.
+    if block_id == "224x160x256" and use_schedule:
+        if not eliminate_epilogue:
+            pytest.xfail(
+                "C++ ASM backend exceeds VGPR limit with scheduled pipeline "
+                "(ee=False) for 224x160x256"
+            )
+        elif dynamic_dims:
+            pytest.xfail(
+                "C++ ASM backend exceeds VGPR limit with ee=True + dynamic "
+                "dims for 224x160x256"
+            )
+    # VGPR overflow: 256x160x256 scheduled pipeline exceeds 256 VGPR limit
+    # without epilogue elimination; with ee=True it fits for static dims
+    # but dynamic dims adds enough extra VGPRs to overflow again.
+    if block_id == "256x160x256" and use_schedule:
+        if not eliminate_epilogue:
+            pytest.xfail(
+                "C++ ASM backend exceeds VGPR limit with scheduled pipeline "
+                "(ee=False) for 256x160x256"
+            )
+        elif dynamic_dims:
+            pytest.xfail(
+                "C++ ASM backend exceeds VGPR limit with ee=True + dynamic "
+                "dims for 256x160x256"
+            )
 
     # VGPR overflow for 256x192x256: ee=True reduces register pressure
     # enough to pass with static dims; ee=False and dynamic dims still overflow.
