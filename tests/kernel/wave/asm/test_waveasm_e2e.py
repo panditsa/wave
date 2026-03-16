@@ -1261,12 +1261,8 @@ def _dbuf_mxfp4_helper(
         "amdgpu.scaled_mfma" in kernel_info.mlir_text
     ), "Expected amdgpu.scaled_mfma operation in MLIR"
     if dynamic_dims:
-        if use_schedule:
-            expected_idx = r"function_type = \([^)]*index, index\) -> \(\)"
-            expected_msg = "M and N"
-        else:
-            expected_idx = r"function_type = \([^)]*index, index, index\) -> \(\)"
-            expected_msg = "M, N, and K"
+        expected_idx = r"function_type = \([^)]*index, index, index\) -> \(\)"
+        expected_msg = "M, N, and K"
         assert re.search(expected_idx, kernel_info.mlir_text), (
             f"Expected dynamic-dims MLIR signature to carry trailing dynamic "
             f"{expected_msg} index arguments, got:\n{kernel_info.mlir_text[:400]}"

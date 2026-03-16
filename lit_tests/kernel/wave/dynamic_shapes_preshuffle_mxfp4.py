@@ -51,17 +51,20 @@ def test_dynamic_preshuffle_b_mxfp4():
     # 1. Dynamic index arguments for M, N, K in function signature.
     # CHECK: func.func @gemm(%arg0: {{.*}}, %arg1: {{.*}}, %arg2: {{.*}}, %arg3: {{.*}}, %arg4: {{.*}}, %arg5: index, %arg6: index, %arg7: index)
 
-    # 2. Prologue gather_to_lds prefetch (no scf.if guard — simplification
-    #    proves the pipeline guard is always satisfied).
+    # 2. No scf.if guard — simplification proves the pipeline guard
+    #    is always satisfied.
+    # CHECK-NOT: scf.if
+
+    # 3. Prologue gather_to_lds prefetch.
     # CHECK: amdgpu.gather_to_lds
     # CHECK: amdgpu.gather_to_lds
 
-    # 3. Main pipelined loop with scaled_mfma.
+    # 4. Main pipelined loop with scaled_mfma.
     # CHECK: scf.for
     # CHECK: amdgpu.scaled_mfma
     # CHECK: scf.yield
 
-    # 4. Epilogue scaled_mfma after the loop.
+    # 5. Epilogue scaled_mfma after the loop.
     # CHECK: amdgpu.scaled_mfma
 
 
@@ -95,23 +98,25 @@ def test_dynamic_preshuffle_b_mxfp4_eliminate_epilogue():
     # 1. Dynamic index arguments for M, N, K in function signature.
     # CHECK: func.func @gemm(%arg0: {{.*}}, %arg1: {{.*}}, %arg2: {{.*}}, %arg3: {{.*}}, %arg4: {{.*}}, %arg5: index, %arg6: index, %arg7: index)
 
-    # 2. Pipelined loop steps by 1 (no epilogue to peel off).
-    #    No scf.if guard — simplification proves it always satisfied.
+    # 2. No scf.if guard — simplification proves it always satisfied.
+    # CHECK-NOT: scf.if
+
+    # 3. Pipelined loop steps by 1 (no epilogue to peel off).
     # CHECK: scf.for %{{.*}} = %c0 to %{{.*}} step %c1
 
-    # 3. Loop carries shared-memory buffers as iter_args (epilogue folded in).
+    # 4. Loop carries shared-memory buffers as iter_args (epilogue folded in).
     # CHECK-SAME: memref<{{.*}}, #gpu.address_space<workgroup>>
 
-    # 4. OOB guard: arith.select chooses real validBytes vs 0 for out-of-range
+    # 5. OOB guard: arith.select chooses real validBytes vs 0 for out-of-range
     #    iterations, so the hardware returns zeros on OOB loads.
     # CHECK: arith.select %{{.*}}, %c2147483646_i64, %c0_i64 : i64
 
-    # 5. fat_raw_buffer_cast uses the dynamically selected validBytes.
+    # 6. fat_raw_buffer_cast uses the dynamically selected validBytes.
     # CHECK: amdgpu.fat_raw_buffer_cast %{{.*}} validBytes(%{{.*}})
 
-    # 6. scaled_mfma inside the pipelined loop.
+    # 7. scaled_mfma inside the pipelined loop.
     # CHECK: amdgpu.scaled_mfma
 
-    # 7. Loop body ends; no epilogue mfma between loop end and scf.yield.
+    # 8. Loop body ends; no epilogue mfma between loop end and scf.yield.
     # CHECK: scf.yield
     # CHECK-NEXT: }
