@@ -197,18 +197,30 @@ def _find_mergeable_groups(
     yield_operands = list(yield_op.operands)
 
     # Collect per-arg info: (iter_index, offset, init_source, yield_source).
+    # yield_source may be None when the yield value doesn't trace back to
+    # extract_strided_slice (e.g. pipelined sub-word loads from a swapped
+    # double-buffer).  Such groups are still mergeable — we construct the
+    # yield vector from individual bytes later.
     eligible = []
     for i, iter_arg in enumerate(for_view.inner_iter_args):
         if iter_arg.type != v1xi8:
             continue
         init_info = _trace_extract_strided_slice(init_args[i])
-        yield_info = _trace_extract_strided_slice(yield_operands[i])
-        if init_info is None or yield_info is None:
+        if init_info is None:
             continue
         init_src, init_off = init_info
-        yield_src, yield_off = yield_info
-        if init_off != yield_off:
-            continue
+        yield_info = _trace_extract_strided_slice(yield_operands[i])
+        if yield_info is not None:
+            yield_src, yield_off = yield_info
+            if init_off != yield_off:
+                continue
+        else:
+            yield_src = None
+            logger.debug(
+                f"iter_arg {i}: init traces to offset {init_off} but yield "
+                f"value does not trace to extract_strided_slice — will "
+                f"construct yield vector from individual bytes"
+            )
         eligible.append((i, init_off, init_src, yield_src))
 
     by_init_src = defaultdict(list)
@@ -232,13 +244,21 @@ def _find_mergeable_groups(
             init_source = None
             yield_owners = set()
             yield_source = None
+            has_untraceable_yield = False
             for o in present_offsets:
                 idx, _, isrc, ysrc = by_offset[o].pop(0)
                 members[o] = idx
                 init_source = isrc
-                yield_source = ysrc
-                yield_owners.add(id(ysrc.owner))
-            if len(yield_owners) == 1:
+                if ysrc is not None:
+                    yield_source = ysrc
+                    yield_owners.add(id(ysrc.owner))
+                else:
+                    has_untraceable_yield = True
+            if has_untraceable_yield:
+                # Some yield values don't trace — the yield vector will be
+                # constructed from individual bytes during coalescing.
+                result.append((init_source, None, members))
+            elif len(yield_owners) == 1:
                 result.append((init_source, yield_source, members))
             present_offsets = [o for o in range(SCALE_VECTOR_WIDTH) if by_offset[o]]
 
@@ -380,6 +400,42 @@ def _coalesce_vector_iter_args(module: Module) -> None:
             continue
 
         logger.debug(f"Coalescing {len(groups)} group(s) of vector<1xi8> iter_args")
+
+        # For groups whose yield values don't trace to extract_strided_slice
+        # (e.g. pipelined sub-word loads from a swapped double-buffer),
+        # create a single wide vector<4xi8> load at the same base address
+        # as the byte-0 yield load.  This replaces the sub-word loads with
+        # one dword load that waveasm can map to a ds_read_b32.
+        old_yield_operands = list(yield_op.operands)
+        for g_idx, (init_source, yield_source, members) in enumerate(groups):
+            if yield_source is not None:
+                continue
+            if 0 not in members:
+                logger.debug(
+                    f"Group {g_idx}: no byte-0 member, cannot determine base "
+                    f"address for wide load — skipping"
+                )
+                continue
+            byte0_yield = old_yield_operands[members[0]]
+            byte0_op = byte0_yield.owner
+            if not _is_op_named(byte0_op, "vector.load"):
+                logger.debug(
+                    f"Group {g_idx}: byte-0 yield is not a vector.load "
+                    f"({byte0_op.name}) — skipping"
+                )
+                continue
+            load_view = byte0_op.opview
+            memref = load_view.base
+            indices = list(load_view.indices)
+            v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
+            with InsertionPoint(yield_op):
+                wide_load = vector_d.load(v4xi8, memref, indices)
+            groups[g_idx] = (init_source, wide_load, members)
+            logger.debug(
+                f"Created wide vector<{SCALE_VECTOR_WIDTH}xi8> load for "
+                f"group {g_idx} yield value (replaces {len(members)} "
+                f"sub-word loads)"
+            )
 
         plan = _build_coalesce_plan(groups, for_view, yield_op)
         old_iter_args = list(for_view.inner_iter_args)
