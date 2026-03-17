@@ -1346,7 +1346,7 @@ def _generate_asm_code(mb, options):
         # TODO: improve Ticketing logic (better latency-covering heuristics,
         # smarter coalescing) so ticketed waitcnt can be always-on without
         # a performance hit, removing this wave-shape conditional.
-        use_ticketed_waitcnt = waves_in_m >= 2 and waves_in_n >= 2
+        use_ticketed_waitcnt = False 
         waitcnt_flag = (
             "--waveasm-insert-waitcnt"
             if use_ticketed_waitcnt
