@@ -487,6 +487,119 @@ def _coalesce_vector_iter_args(module: Module) -> None:
         for_op.erase()
 
 
+def _get_affine_constant_offset(op) -> Optional[int]:
+    """Extract the trailing integer constant from an affine.apply's map.
+
+    For ``affine_map<()[s0,s1] -> (expr + 2)>`` returns ``2``.
+    For ``affine_map<()[s0,s1] -> (expr)>`` (no trailing constant) returns ``0``.
+    Returns ``None`` if *op* is not an affine.apply or the map cannot be parsed.
+    """
+    if not _is_op_named(op, "affine.apply"):
+        return None
+    import re
+
+    map_str = str(op.attributes["map"])
+    m = re.search(r"\+\s*(\d+)\)\s*>\s*$", map_str)
+    if m:
+        return int(m.group(1))
+    if re.search(r"\)\s*>\s*$", map_str):
+        return 0
+    return None
+
+
+def _merge_scale_byte_loads(module: Module) -> None:
+    """Merge adjacent vector<1/2xi8> LDS loads into vector<4xi8> + extract.
+
+    Handles the unrolled-iteration pattern where sub-word scale loads
+    aren't loop-carried and thus not covered by _coalesce_vector_iter_args.
+    """
+    i8 = IntegerType.get_signless(8)
+    i64 = IntegerType.get_signless(64)
+
+    byte_loads: list[Operation] = []
+    for op in _walk_operations(module.operation):
+        if not _is_op_named(op, "vector.load"):
+            continue
+        rtype = op.results[0].type
+        if not isinstance(rtype, VectorType) or rtype.element_type != i8:
+            continue
+        if rtype.shape[0] > 2:
+            continue
+        view = op.opview
+        addr = view.indices[-1]
+        if _get_affine_constant_offset(addr.owner) is None:
+            continue
+        byte_loads.append(op)
+
+    if not byte_loads:
+        return
+
+    def _memref_key(base_value: Value):
+        """Stable grouping key for a memref Value across opview accesses."""
+        owner = base_value.owner
+        if isinstance(owner, Block):
+            return (id(owner), base_value.arg_number)
+        return id(owner)
+
+    by_memref: dict = defaultdict(list)
+    for op in byte_loads:
+        by_memref[_memref_key(op.opview.base)].append(op)
+
+    for loads in by_memref.values():
+        if len(loads) < 2:
+            continue
+
+        addr_to_offset: dict[int, int] = {}
+        base_op: Optional[Operation] = None
+        for load_op in loads:
+            addr_val = load_op.opview.indices[-1]
+            off = _get_affine_constant_offset(addr_val.owner)
+            if off is None:
+                continue
+            addr_to_offset[id(load_op)] = off
+            if off == 0:
+                base_op = load_op
+
+        if base_op is None:
+            continue
+
+        base_view = base_op.opview
+        v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
+
+        earliest = base_op
+        for load_op in loads:
+            if id(load_op) in addr_to_offset:
+                earliest = load_op
+                break
+
+        with InsertionPoint(earliest):
+            wide = vector_d.load(v4xi8, base_view.base, list(base_view.indices))
+
+        replaced = 0
+        for load_op in loads:
+            if id(load_op) not in addr_to_offset:
+                continue
+            off = addr_to_offset[id(load_op)]
+            rtype = load_op.results[0].type
+            n = rtype.shape[0]
+            if off + n > SCALE_VECTOR_WIDTH:
+                continue
+            with InsertionPoint(load_op):
+                offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
+                sizes = ArrayAttr.get([IntegerAttr.get(i64, n)])
+                strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                ext = vector_d.ExtractStridedSliceOp(rtype, wide, offsets, sizes, strides)
+            load_op.results[0].replace_all_uses_with(ext.result)
+            load_op.erase()
+            replaced += 1
+
+        if replaced:
+            logger.debug(
+                f"Merged {replaced} sub-word LDS loads into one "
+                f"vector<{SCALE_VECTOR_WIDTH}xi8> load"
+            )
+
+
 def apply_opsel_scaled_mfma(module: Module):
     """Walk the MLIR module and apply the opsel optimization to scaled_mfma ops.
 
@@ -500,6 +613,7 @@ def apply_opsel_scaled_mfma(module: Module):
 
     with mlir_ctx, Location.unknown():
         _coalesce_vector_iter_args(module)
+        _merge_scale_byte_loads(module)
 
         f8e8m0 = Float8E8M0FNUType.get()
 
