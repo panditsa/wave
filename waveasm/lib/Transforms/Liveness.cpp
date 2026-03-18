@@ -668,11 +668,19 @@ LivenessInfo computeLiveness(ProgramOp program) {
     }
   }
 
-  // Sort by (start, end) for linear scan
+  // Sort by (start, -size, -alignment, -end) for linear scan.
+  // At the same start point, allocate larger and more constrained ranges
+  // first to reduce fragmentation — a 16-wide aligned range has very few
+  // valid slots, so giving it priority prevents smaller ranges from
+  // blocking its only valid position.
   auto sortByStart = [](const LiveRange &a, const LiveRange &b) {
     if (a.start != b.start)
       return a.start < b.start;
-    return a.end < b.end;
+    if (a.size != b.size)
+      return a.size > b.size;
+    if (a.alignment != b.alignment)
+      return a.alignment > b.alignment;
+    return a.end > b.end;
   };
 
   llvm::sort(info.vregRanges, sortByStart);
