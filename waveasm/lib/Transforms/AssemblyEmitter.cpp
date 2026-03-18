@@ -703,10 +703,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
 
               SmallVector<bool> handled(pendingCopies.size(), false);
 
-              // Allocate swap temps once and reuse across all swaps.
-              // Swaps are emitted sequentially so the temp is dead after
-              // each 3-instruction sequence and can be reused.
-              int64_t vSwapTemp = -1;
+              // SGPR swaps still need a temp; VGPR swaps use v_swap_b32.
               int64_t sSwapTemp = -1;
 
               for (size_t i = 0; i < pendingCopies.size(); ++i) {
@@ -736,13 +733,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                     }
                     int64_t regA = pendingCopies[i].dst;
                     int64_t regB = pendingCopies[j].dst;
-                    if (vSwapTemp < 0) {
-                      vSwapTemp = peakVGPRs;
-                      peakVGPRs = std::max(peakVGPRs, vSwapTemp + 1);
-                    }
-                    os << "  v_mov_b32 v" << vSwapTemp << ", v" << regA << "\n";
-                    os << "  v_mov_b32 v" << regA << ", v" << regB << "\n";
-                    os << "  v_mov_b32 v" << regB << ", v" << vSwapTemp << "\n";
+                    os << "  v_swap_b32 v" << regA << ", v" << regB << "\n";
                     handled[i] = true;
                     handled[j] = true;
                     break;
@@ -850,13 +841,21 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
       .Case<YieldOp>(
           [&](YieldOp) -> std::optional<std::string> { return std::nullopt; })
       .Case<S_CMP_LT_U32, S_CMP_EQ_U32, S_CMP_LE_U32, S_CMP_GT_U32,
-            S_CMP_GE_U32, S_CMP_LT_I32, S_CMP_EQ_I32, S_CMP_LE_I32,
-            S_CMP_GT_I32, S_CMP_GE_I32>(
+            S_CMP_GE_U32, S_CMP_NE_U32, S_CMP_LT_I32, S_CMP_EQ_I32,
+            S_CMP_LE_I32, S_CMP_GT_I32, S_CMP_GE_I32, S_CMP_NE_I32>(
           [&](auto cmpOp) -> std::optional<std::string> {
             llvm::StringRef opName = cmpOp->getName().getStringRef();
             llvm::StringRef mnemonic = opName;
             if (opName.starts_with("waveasm.")) {
               mnemonic = opName.drop_front(8);
+            }
+            // s_cmp_ne_* → s_cmp_lg_* (ISA mnemonic)
+            std::string mnemStr;
+            if (mnemonic.contains("_ne_")) {
+              mnemStr = mnemonic.str();
+              size_t pos = mnemStr.find("_ne_");
+              mnemStr.replace(pos, 4, "_lg_");
+              mnemonic = mnemStr;
             }
             llvm::SmallVector<std::string> operands;
             for (Value operand : cmpOp->getOperands()) {
