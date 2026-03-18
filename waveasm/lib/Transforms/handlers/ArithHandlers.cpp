@@ -188,16 +188,23 @@ LogicalResult handleArithOrI(Operation *op, TranslationContext &ctx) {
   if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
     return failure();
 
-  // OR has no SALU equivalent in current use — only used on VGPRs
-  // (thread ID bit manipulation with non-overlapping ranges).
-  auto vregType = ctx.createVRegType();
-  auto result = V_OR_B32::create(builder, loc, vregType, *lhs, *rhs);
+  auto result = emitOr(*lhs, *rhs, builder, loc, ctx);
   ctx.getMapper().mapValue(typedOp.getResult(), result);
   return success();
 }
 
 LogicalResult handleArithXorI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::XOrIOp, V_XOR_B32>(op, ctx);
+  auto typedOp = cast<arith::XOrIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitXor(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -270,11 +277,9 @@ LogicalResult handleArithDivUI(Operation *op, TranslationContext &ctx) {
   if (auto constOp = rhs->getDefiningOp<ConstantOp>()) {
     int64_t divisor = constOp.getValue();
     if (isPowerOf2(divisor)) {
-      auto vregType = ctx.createVRegType();
       int64_t shiftAmt = log2(divisor);
       Value shiftConst = createImmConst(shiftAmt, builder, loc, ctx);
-      auto result =
-          V_LSHRREV_B32::create(builder, loc, vregType, shiftConst, *lhs);
+      auto result = emitLshr(*lhs, shiftConst, builder, loc, ctx);
       ctx.getMapper().mapValue(divOp.getResult(), result);
       return success();
     }
@@ -308,7 +313,7 @@ LogicalResult handleArithRemUI(Operation *op, TranslationContext &ctx) {
     int64_t modulus = constOp.getValue();
     if (isPowerOf2(modulus)) {
       Value maskConst = createImmConst(modulus - 1, builder, loc, ctx);
-      auto result = V_AND_B32::create(builder, loc, vregType, *lhs, maskConst);
+      auto result = emitAnd(*lhs, maskConst, builder, loc, ctx);
       ctx.getMapper().mapValue(remOp.getResult(), result);
       return success();
     }
