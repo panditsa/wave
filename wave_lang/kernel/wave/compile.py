@@ -1320,6 +1320,10 @@ def _generate_asm_code(mb, options):
         mlir_file.write(kernel_mlir)
         mlir_path = mlir_file.name
 
+    # Debug: save a copy of the MLIR input to waveasm-translate
+    import shutil
+    shutil.copy(mlir_path, "/tmp/waveasm_input.mlir")
+
     try:
         base_passes = [
             "--mlir-cse",
@@ -1353,6 +1357,7 @@ def _generate_asm_code(mb, options):
             else "--waveasm-insert-waitcnt=ticketed-waitcnt=false"
         )
         tail_passes = [
+            "--waveasm-scc-verifier",
             "--waveasm-linear-scan=max-vgprs=512 max-agprs=512",
             waitcnt_flag,
             f"--waveasm-hazard-mitigation=target={options.target}",
