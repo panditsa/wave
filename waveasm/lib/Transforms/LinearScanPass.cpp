@@ -56,6 +56,86 @@ static Type makePhysicalType(MLIRContext *ctx, Type virtualType,
   return virtualType;
 }
 
+//===----------------------------------------------------------------------===//
+// Rematerialization
+//===----------------------------------------------------------------------===//
+
+/// Check if an operation can be cheaply rematerialized (cloned near each
+/// use to shorten its live range). Targets V_MOV_B32 with immediate-only
+/// operands — 1-cycle scalar moves common in accumulator zero-initialization.
+static bool isRematerializableOp(Operation *op) {
+  if (!isa<V_MOV_B32>(op))
+    return false;
+  if (op->getNumResults() != 1)
+    return false;
+  for (Value operand : op->getOperands()) {
+    auto *defOp = operand.getDefiningOp();
+    if (!defOp || !isa<ConstantOp>(defOp))
+      return false;
+  }
+  return true;
+}
+
+/// Rematerialize cheap-to-compute VGPR values by cloning their defining ops
+/// near each use site, shortening live ranges and reducing peak register
+/// pressure at the cost of slightly increased code size.
+///
+/// A `v_mov_b32 %v, 0` defined at instruction 5 and used at instruction 100
+/// holds a VGPR for 95 instructions. After rematerialization the clone
+/// appears at instruction 99 with a 1-instruction live range, freeing the
+/// VGPR(s) for the other 94 instructions. For multi-register results
+/// (e.g. 4-wide accumulators) this frees 4 VGPRs across that span.
+static void rematerializeCheapOps(ProgramOp program) {
+  constexpr int64_t kMinRematRangeLength = 10;
+
+  LivenessInfo liveness = computeLiveness(program);
+
+  llvm::SmallVector<Operation *> candidates;
+  program.walk([&](Operation *op) {
+    if (!isRematerializableOp(op))
+      return;
+    Value result = op->getResult(0);
+    if (!isVGPRType(result.getType()))
+      return;
+    const LiveRange *range = liveness.getRange(result);
+    if (!range || range->length() <= kMinRematRangeLength)
+      return;
+    candidates.push_back(op);
+  });
+
+  for (Operation *op : candidates) {
+    Value result = op->getResult(0);
+
+    llvm::SmallVector<OpOperand *> uses;
+    for (OpOperand &use : result.getUses())
+      uses.push_back(&use);
+
+    if (uses.empty())
+      continue;
+
+    // Clone once per unique user operation to avoid redundant copies when
+    // the same op references the value in multiple operand slots.
+    llvm::DenseMap<Operation *, Value> cloneCache;
+
+    for (OpOperand *use : uses) {
+      Operation *user = use->getOwner();
+      auto it = cloneCache.find(user);
+      if (it != cloneCache.end()) {
+        use->set(it->second);
+      } else {
+        OpBuilder builder(user);
+        Operation *clone = builder.clone(*op);
+        Value cloned = clone->getResult(0);
+        use->set(cloned);
+        cloneCache[user] = cloned;
+      }
+    }
+
+    if (result.use_empty())
+      op->erase();
+  }
+}
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -214,6 +294,12 @@ private:
         }
       }
     });
+
+    // Rematerialize cheap VGPR ops (v_mov_b32 from immediates) near their
+    // use sites to shorten live ranges and reduce peak register pressure.
+    // This must run after duplicate-init-arg handling (which creates new
+    // V_MOV_B32 ops) and before allocation (which consumes the IR).
+    rematerializeCheapOps(program);
 
     // Create allocator with precolored values and tied operands.
     // MFMA ties come from the local tiedPairs map; loop ties come from
