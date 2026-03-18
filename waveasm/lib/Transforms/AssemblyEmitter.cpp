@@ -533,16 +533,18 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             std::string src = resolveValue(srcVal);
             std::string lines;
             if (isAGPR) {
-              // v_accvgpr_write_b32 requires a VGPR source in this backend.
-              // Materialize immediate sources into the reserved scratch VGPR.
+              auto [isLit, litVal] = getLiteralValue(srcVal);
               std::string writeSrc = src;
-              if (srcIsImm) {
+              if (srcIsImm && !(isLit && isInlineConstant(litVal))) {
+                // Non-inline literal: materialize into scratch VGPR first.
                 lines += "  v_mov_b32 " + formatVGPRRange(kScratchVGPR, 1) +
                          ", " + src;
                 writeSrc = formatVGPRRange(kScratchVGPR, 1);
                 peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
                 invalidateScratchCache();
               }
+              // Inline constants (e.g. 0) go directly into
+              // v_accvgpr_write_b32 without a scratch VGPR.
               for (int64_t i = 0; i < size; ++i) {
                 if (!lines.empty())
                   lines += "\n";
@@ -563,6 +565,12 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         if (isAGPR) {
           if (srcIsImm) {
             std::string src = resolveValue(srcVal);
+            auto [isLit, litVal] = getLiteralValue(srcVal);
+            if (isLit && isInlineConstant(litVal)) {
+              // Inline constant: emit directly without scratch VGPR.
+              return "  v_accvgpr_write_b32 " + resolveValue(result) + ", " +
+                     src;
+            }
             std::string scratch = formatVGPRRange(kScratchVGPR, 1);
             peakVGPRs = std::max(peakVGPRs, kScratchVGPR + 1);
             invalidateScratchCache();
