@@ -247,6 +247,20 @@ def WAVEASMExtractScalarization
 }
 
 //===----------------------------------------------------------------------===//
+// SCC Verifier Pass
+//===----------------------------------------------------------------------===//
+
+def WAVEASMSCCVerifier : Pass<"waveasm-scc-verifier"> {
+  let summary = "Verify SCC (Scalar Condition Code) liveness invariants";
+  let description = [{
+    Checks that no SCC-clobbering SALU instruction sits between an
+    SCC-producing op and its consumer.  Uses isa<> checks (not traits)
+    to avoid changing ODS-generated code for existing op classes.
+  }];
+  let dependentDialects = ["::waveasm::WaveASMDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // Memory Offset Optimization Pass
 //===----------------------------------------------------------------------===//
 
