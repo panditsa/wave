@@ -727,6 +727,8 @@ def WaveASM_S_ADDC_U32 : SALUBinaryWithCarryOp<"s_addc_u32">;
 def WaveASM_S_ADD_I32 : SALUBinaryWithCarryOp<"s_add_i32">;
 def WaveASM_S_SUB_U32 : SALUBinaryWithCarryOp<"s_sub_u32">;
 def WaveASM_S_SUB_I32 : SALUBinaryWithCarryOp<"s_sub_i32">;
+// Conditional select: dst = SCC ? src0 : src1 (reads SCC, no SCC write)
+def WaveASM_S_CSELECT_B32 : SALUBinaryOp<"s_cselect_b32">;
 // Multiplication does not set SCC
 def WaveASM_S_MUL_I32 : SALUBinaryOp<"s_mul_i32">;
 def WaveASM_S_MUL_HI_U32 : SALUBinaryOp<"s_mul_hi_u32">;
