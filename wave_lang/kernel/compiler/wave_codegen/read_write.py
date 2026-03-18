@@ -434,18 +434,36 @@ def _compute_branchless_valid_bytes(
 
     We emit:
         cond = gen_sympy_index(guard_condition)   # index type, nonzero=true
-        real_valid = compute_static_validBytes()
+        real_valid = actual_buffer_size_bytes      # NOT 0x7FFFFFFE
         validBytes = select(cond != 0, real_valid, 0)
 
     When the condition is false (last iterations), validBytes=0 makes the
     SRD's NUM_RECORDS=0 so gather_to_lds DMA is a hardware no-op.
+
+    When the condition is true, NUM_RECORDS=real buffer size so the
+    hardware clamps any OOB flat addresses to return 0 — no per-load
+    software bounds checking needed.
     """
     uint64 = IntegerType.get_signless(64)
     total_bytes = _compute_total_valid_bytes(
         elem_type, symbolic_shape, use_real_bounds=True
     )
 
-    real_valid = arith_d.constant(uint64, get_constant_attr(total_bytes, uint64))
+    hw_max = _valid_bytes_buffer(elem_type)
+    if total_bytes == hw_max and symbolic_shape is not None:
+        # Static path returned the hardware-max fallback — shape is dynamic.
+        # Compute actual buffer size at runtime so num_records provides
+        # real bounds clamping (matching AITER's approach).
+        elem_bytes = _elem_bytes(elem_type)
+        total_bytes_expr = sympy.prod(s for s in symbolic_shape) * elem_bytes
+        subs_map = add_emitter_subs(emitter)
+        real_valid_index = gen_sympy_index(subs_map, total_bytes_expr)
+        real_valid = arith_d.index_cast(uint64, real_valid_index)
+    else:
+        real_valid = arith_d.constant(
+            uint64, get_constant_attr(total_bytes, uint64)
+        )
+
     zero_valid = arith_d.constant(uint64, get_constant_attr(0, uint64))
 
     cond_val = gen_sympy_index(add_emitter_subs(emitter), guard_condition)
@@ -1639,18 +1657,26 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         ),
     )
 
-    mask = _build_mask(
-        emitter,
-        src_idx,
-        elements_per_thread=1,
-        bounds=src_bounds,
-        dynamic_values=src_dynamic_vals_map_start,
-    )
-    if mask:
-        mask = vector_d.extract(mask, static_position=[0], dynamic_position=[])
-        oob_index_value = _get_out_of_bounds_index(element_type)
-        oob_index = arith_d.constant(IndexType.get(), oob_index_value)
-        src_offset = arith_d.select(mask, src_offset, oob_index)
+    # When the SRD validBytes encodes the real buffer size (via
+    # _compute_branchless_valid_bytes with dynamic shape), hardware
+    # num_records clamping returns 0 for OOB addresses.  Skip the
+    # per-load software mask to eliminate ~4 VALU instructions and
+    # temporary VGPRs per gather_to_lds call.
+    if valid_bytes_override is None:
+        mask = _build_mask(
+            emitter,
+            src_idx,
+            elements_per_thread=1,
+            bounds=src_bounds,
+            dynamic_values=src_dynamic_vals_map_start,
+        )
+        if mask:
+            mask = vector_d.extract(
+                mask, static_position=[0], dynamic_position=[]
+            )
+            oob_index_value = _get_out_of_bounds_index(element_type)
+            oob_index = arith_d.constant(IndexType.get(), oob_index_value)
+            src_offset = arith_d.select(mask, src_offset, oob_index)
 
     amdgpu_d.gather_to_lds(
         src=lin_src,
