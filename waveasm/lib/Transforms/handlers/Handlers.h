@@ -390,6 +390,36 @@ inline mlir::Value emitAnd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
   return V_AND_B32::create(builder, loc, vregType, a, b);
 }
 
+/// Emit bitwise OR: S_OR_B32 when both scalar, V_OR_B32 otherwise.
+/// Commutative: swaps to put immediate in src1.
+inline mlir::Value emitOr(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
+                          mlir::Location loc, TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_OR_B32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_OR_B32::create(builder, loc, vregType, a, b);
+}
+
+/// Emit bitwise XOR: S_XOR_B32 when both scalar, V_XOR_B32 otherwise.
+/// Commutative: swaps to put immediate in src1.
+inline mlir::Value emitXor(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
+                           mlir::Location loc, TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_XOR_B32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_XOR_B32::create(builder, loc, vregType, a, b);
+}
+
 /// Emit mulhi: S_MUL_HI_U32 when both scalar, V_MUL_HI_U32 otherwise.
 /// Commutative: swaps to put immediate in src1.
 inline mlir::Value emitMulHi(mlir::Value a, mlir::Value b,
