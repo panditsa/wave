@@ -83,6 +83,10 @@ class VALUCmpOp<string mnemonic, list<Trait> traits = []>
 }
 
 // SALU Unary: dst = op(src)
+// Pure — does NOT clobber SCC on hardware.
+// Used for: s_mov_b32, s_mov_b64, s_sext_i32_i8, s_sext_i32_i16.
+// NOTE: Also used for SCC-clobbering ops (s_not, s_brev, etc.) until
+// SALUUnaryWithSCCOp migration is validated.
 class SALUUnaryOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([Pure, WaveASM_ArithmeticOp], traits)> {
   let arguments = (ins WaveASM_SRegOrImm:$src);
@@ -90,9 +94,37 @@ class SALUUnaryOp<string mnemonic, list<Trait> traits = []>
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
 }
 
+// SALU Unary with SCC clobber: dst = op(src), SCC = f(result)
+// NOT Pure — writes SCC on hardware (typically SCC = result != 0).
+// CSE-eligible via ArithmeticOp (result depends only on operands).
+// TODO: Migrate SCC-clobbering unary ops here once MLIR pass interactions
+// are validated (removing Pure changes --canonicalize/LICM behavior).
+class SALUUnaryWithSCCOp<string mnemonic, list<Trait> traits = []>
+    : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef], traits)> {
+  let arguments = (ins WaveASM_SRegOrImm:$src);
+  let results = (outs WaveASM_AnySGPR:$dst);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
+}
+
 // SALU Binary: dst = op(src0, src1)
+// Pure — does NOT clobber SCC on hardware.
+// Used for: s_mul_i32, s_mul_hi_*, s_bfm_*, s_pack_*, s_cselect_b32.
+// NOTE: Also used for SCC-clobbering ops (s_and, s_or, s_lshl, etc.)
+// until SALUBinaryWithSCCOp migration is validated.
 class SALUBinaryOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([Pure, WaveASM_ArithmeticOp], traits)> {
+  let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
+  let results = (outs WaveASM_AnySGPR:$dst);
+  let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst)";
+}
+
+// SALU Binary with SCC clobber: dst = op(src0, src1), SCC = f(result)
+// NOT Pure — writes SCC on hardware.
+// CSE-eligible via ArithmeticOp (result depends only on operands).
+// TODO: Migrate SCC-clobbering binary ops here once MLIR pass interactions
+// are validated (removing Pure changes --canonicalize/LICM behavior).
+class SALUBinaryWithSCCOp<string mnemonic, list<Trait> traits = []>
+    : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
   let results = (outs WaveASM_AnySGPR:$dst);
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst)";
