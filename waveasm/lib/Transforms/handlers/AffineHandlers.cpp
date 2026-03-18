@@ -46,6 +46,8 @@ namespace waveasm {
 Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
                            TranslationContext &ctx) {
   auto vregType = ctx.createVRegType();
+  x = ensureVGPR(builder, x.getLoc(), ctx, x);
+  d = ensureVGPR(builder, d.getLoc(), ctx, d);
   Value zeroConst = createImmConst(0, builder, loc, ctx);
 
   // --- Step 1: float reciprocal seed ---
@@ -118,7 +120,6 @@ Value emitConstantUnsignedFloordiv(Value x, int64_t divisor, OpBuilder &builder,
                  << ") exceeds 32 bits in emitConstantUnsignedFloordiv\n";
   }
 
-  auto vregType = ctx.createVRegType();
   llvm::APInt divisorAPInt(32, static_cast<uint64_t>(divisor));
   auto mag = llvm::UnsignedDivisionByConstantInfo::get(
       divisorAPInt, /*LeadingZeros=*/0,
@@ -133,23 +134,21 @@ Value emitConstantUnsignedFloordiv(Value x, int64_t divisor, OpBuilder &builder,
   int64_t magicVal = static_cast<int64_t>(mag.Magic.getZExtValue());
   Value magicConst = createImmConst(magicVal, builder, loc, ctx);
 
-  Value q = V_MUL_HI_U32::create(builder, loc, vregType, x, magicConst);
+  Value q = emitMulHi(x, magicConst, builder, loc, ctx);
 
   auto emitShiftRight = [&](Value val, unsigned amount) -> Value {
     if (amount == 0)
       return val;
     Value shiftConst =
         createImmConst(static_cast<int64_t>(amount), builder, loc, ctx);
-    return V_LSHRREV_B32::create(builder, loc, vregType, shiftConst, val);
+    return emitLshr(val, shiftConst, builder, loc, ctx);
   };
 
   if (mag.IsAdd) {
-    // add form: (mulhi(x,m) + ((x - mulhi(x,m)) >> 1)) >> PostShift
-    Value xSubQ = V_SUB_U32::create(builder, loc, vregType, x, q);
+    Value xSubQ = emitSub(x, q, builder, loc, ctx);
     Value oneConst = createImmConst(1, builder, loc, ctx);
-    Value halfDiff =
-        V_LSHRREV_B32::create(builder, loc, vregType, oneConst, xSubQ);
-    Value sum = V_ADD_U32::create(builder, loc, vregType, q, halfDiff);
+    Value halfDiff = emitLshr(xSubQ, oneConst, builder, loc, ctx);
+    Value sum = emitAdd(q, halfDiff, builder, loc, ctx);
     return emitShiftRight(sum, mag.PostShift);
   }
 
@@ -170,7 +169,23 @@ Value emitConstantUnsignedFloordiv(Value x, int64_t divisor, OpBuilder &builder,
 static Value emitCeilFromFloorQuotient(Value q, Value x, Value d,
                                        OpBuilder &builder, Location loc,
                                        TranslationContext &ctx) {
+  bool allScalar = isScalarOrImm(q) && isScalarOrImm(x) && isScalarOrImm(d);
+  if (allScalar) {
+    // Fully scalar path: rem = x - q*d; SCC = (rem != 0); q += SCC
+    Value qd = emitMul(q, d, builder, loc, ctx);
+    Value rem = emitSub(x, qd, builder, loc, ctx);
+    Value zeroConst = createImmConst(0, builder, loc, ctx);
+    // s_cmp_lg_u32 sets SCC = (rem != 0)
+    S_CMP_NE_U32::create(builder, loc, ctx.createSRegType(), rem, zeroConst);
+    // s_addc_u32: dst = q + 0 + SCC (carry-in from SCC)
+    auto sregType = ctx.createSRegType();
+    return S_ADDC_U32::create(builder, loc, sregType, sregType, q, zeroConst)
+        .getDst();
+  }
   auto vregType = ctx.createVRegType();
+  q = ensureVGPR(builder, loc, ctx, q);
+  x = ensureVGPR(builder, loc, ctx, x);
+  d = ensureVGPR(builder, loc, ctx, d);
   Value qd = V_MUL_LO_U32::create(builder, loc, vregType, q, d);
   Value rem = V_SUB_U32::create(builder, loc, vregType, x, qd);
   Value zeroConst = createImmConst(0, builder, loc, ctx);
@@ -338,6 +353,12 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
       BitRange lhsRange = lhsResult.range;
       BitRange rhsRange = rhsResult.range;
 
+      // Helper: coerce both operands to VGPR for VALU binary ops.
+      auto ensureBothVGPR = [&]() {
+        lhs = ensureVGPR(builder, loc, ctx, lhs);
+        rhs = ensureVGPR(builder, loc, ctx, rhs);
+      };
+
       switch (binExpr.getKind()) {
       case AffineExprKind::Add: {
         if (!lhsRange.overlaps(rhsRange)) {
@@ -362,8 +383,11 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
                     auto shiftConst =
                         ConstantOp::create(builder, loc, shiftImm, shiftAmount);
                     // v_lshl_or_b32: dst = (src << shift) | orend
+                    Value base = ensureVGPR(builder, loc, ctx,
+                                            baseResult.value);
+                    orend = ensureVGPR(builder, loc, ctx, orend);
                     Value fusedResult = V_LSHL_OR_B32::create(
-                        builder, loc, vregType, baseResult.value, shiftConst,
+                        builder, loc, vregType, base, shiftConst,
                         orend);
                     BitRange shiftedRange =
                         baseResult.range.shiftLeft(shiftAmount);
@@ -382,8 +406,11 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
                     auto shiftImm = ctx.createImmType(shiftAmount);
                     auto shiftConst =
                         ConstantOp::create(builder, loc, shiftImm, shiftAmount);
+                    Value base2 = ensureVGPR(builder, loc, ctx,
+                                             baseResult.value);
+                    orend = ensureVGPR(builder, loc, ctx, orend);
                     Value fusedResult = V_LSHL_OR_B32::create(
-                        builder, loc, vregType, baseResult.value, shiftConst,
+                        builder, loc, vregType, base2, shiftConst,
                         orend);
                     BitRange shiftedRange =
                         baseResult.range.shiftLeft(shiftAmount);
@@ -407,13 +434,14 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           }
 
           // No fusion possible, emit regular v_or_b32
+          ensureBothVGPR();
           Value orResult = V_OR_B32::create(builder, loc, vregType, lhs, rhs);
           BitRange resultRange = lhsRange.merge(rhsRange);
           ctx.setBitRange(orResult, resultRange);
           return ExprResult(orResult, resultRange);
         }
         // Overlapping ranges - must use ADD
-        Value addResult = V_ADD_U32::create(builder, loc, vregType, lhs, rhs);
+        Value addResult = emitAdd(lhs, rhs, builder, loc, ctx);
         BitRange resultRange = lhsRange.extendForAdd(rhsRange);
         ctx.setBitRange(addResult, resultRange);
         return ExprResult(addResult, resultRange);
@@ -443,10 +471,8 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           int64_t mask = ~(N - 1) & 0xFFFFFFFF;
           auto maskImm = ctx.createImmType(mask);
           auto maskConst = ConstantOp::create(builder, loc, maskImm, mask);
-          // NOTE: constant must be src0 (first operand) for VOP2 encoding.
-          // src1 must be a VGPR on AMDGCN.
-          Value andResult = V_AND_B32::create(builder, loc, vregType, maskConst,
-                                              innerResult.value);
+          Value andResult =
+              emitAnd(maskConst, innerResult.value, builder, loc, ctx);
           // Result has same bit range as inner, but low bits cleared
           BitRange resultRange = innerResult.range;
           // Clear bits below log2(N) -- conservative: use inner range
@@ -481,14 +507,12 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             auto shiftConst =
                 ConstantOp::create(builder, loc, shiftAmt, shiftAmount);
             Value shiftResult =
-                V_LSHLREV_B32::create(builder, loc, vregType, shiftConst, lhs);
-            // Shift the bit range left by shiftAmount
+                emitLshl(lhs, shiftConst, builder, loc, ctx);
             BitRange resultRange = lhsRange.shiftLeft(shiftAmount);
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
           }
         }
-        // Also check LHS for power of 2 multiply
         if (auto constLhs = dyn_cast<AffineConstantExpr>(binExpr.getLHS())) {
           int64_t val = constLhs.getValue();
           if (isPowerOf2(val)) {
@@ -497,14 +521,13 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             auto shiftConst =
                 ConstantOp::create(builder, loc, shiftAmt, shiftAmount);
             Value shiftResult =
-                V_LSHLREV_B32::create(builder, loc, vregType, shiftConst, rhs);
+                emitLshl(rhs, shiftConst, builder, loc, ctx);
             BitRange resultRange = rhsRange.shiftLeft(shiftAmount);
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
           }
         }
-        Value mulResult =
-            V_MUL_LO_U32::create(builder, loc, vregType, lhs, rhs);
+        Value mulResult = emitMul(lhs, rhs, builder, loc, ctx);
         return ExprResult(mulResult, BitRange()); // Conservative: full range
       }
 
@@ -532,7 +555,7 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             auto shiftConst =
                 ConstantOp::create(builder, loc, shiftAmt, shiftAmount);
             Value shiftResult =
-                V_LSHRREV_B32::create(builder, loc, vregType, shiftConst, lhs);
+                emitLshr(lhs, shiftConst, builder, loc, ctx);
             BitRange resultRange = lhsRange.shiftRight(shiftAmount);
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
@@ -561,13 +584,21 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           if (isPowerOf2(divisor)) {
             int64_t shiftAmount = log2(divisor);
             Value shiftConst = createImmConst(shiftAmount, builder, loc, ctx);
-            Value q =
-                V_LSHRREV_B32::create(builder, loc, vregType, shiftConst, lhs);
+            Value q = emitLshr(lhs, shiftConst, builder, loc, ctx);
             int64_t mask = divisor - 1;
             Value maskConst = createImmConst(mask, builder, loc, ctx);
-            Value rem =
-                V_AND_B32::create(builder, loc, vregType, maskConst, lhs);
+            Value rem = emitAnd(lhs, maskConst, builder, loc, ctx);
             Value zeroConst = createImmConst(0, builder, loc, ctx);
+            if (isScalarOrImm(rem)) {
+              S_CMP_NE_U32::create(builder, loc, ctx.createSRegType(), rem,
+                                   zeroConst);
+              auto sregType = ctx.createSRegType();
+              Value result =
+                  S_ADDC_U32::create(builder, loc, sregType, sregType, q,
+                                     zeroConst)
+                      .getDst();
+              return ExprResult(result, BitRange());
+            }
             V_CMP_NE_U32::create(builder, loc, rem, zeroConst);
             Value oneConst = createImmConst(1, builder, loc, ctx);
             Value oneVgpr = V_MOV_B32::create(builder, loc, vregType, oneConst);
@@ -601,8 +632,7 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           int64_t val = constRhs.getValue();
           if (isPowerOf2(val)) {
             Value maskConst = createImmConst(val - 1, builder, loc, ctx);
-            Value andResult =
-                V_AND_B32::create(builder, loc, vregType, lhs, maskConst);
+            Value andResult = emitAnd(lhs, maskConst, builder, loc, ctx);
             BitRange resultRange = BitRange(0, log2(val) - 1);
             ctx.setBitRange(andResult, resultRange);
             return ExprResult(andResult, resultRange);
@@ -612,16 +642,16 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           if (val >= 2) {
             Value q = emitConstantUnsignedFloordiv(lhs, val, builder, loc, ctx);
             Value dConst = createImmConst(val, builder, loc, ctx);
-            Value qd = V_MUL_LO_U32::create(builder, loc, vregType, q, dConst);
-            Value rem = V_SUB_U32::create(builder, loc, vregType, lhs, qd);
+            Value qd = emitMul(q, dConst, builder, loc, ctx);
+            Value rem = emitSub(lhs, qd, builder, loc, ctx);
             return ExprResult(rem, BitRange());
           }
         }
         // Symbolic divisor fallback: x mod d = x - floordiv(x, d) * d
         {
           Value q = emitUnsignedFloordiv(lhs, rhs, builder, loc, ctx);
-          Value qd = V_MUL_LO_U32::create(builder, loc, vregType, q, rhs);
-          Value rem = V_SUB_U32::create(builder, loc, vregType, lhs, qd);
+          Value qd = emitMul(q, rhs, builder, loc, ctx);
+          Value rem = emitSub(lhs, qd, builder, loc, ctx);
           return ExprResult(rem, BitRange());
         }
       }

@@ -108,15 +108,45 @@ LogicalResult handleArithConstant(Operation *op, TranslationContext &ctx) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult handleArithAddI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::AddIOp, V_ADD_U32>(op, ctx);
+  auto typedOp = cast<arith::AddIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitAdd(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithSubI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::SubIOp, V_SUB_U32>(op, ctx);
+  auto typedOp = cast<arith::SubIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitSub(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithMulI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::MulIOp, V_MUL_LO_U32>(op, ctx);
+  auto typedOp = cast<arith::MulIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitMul(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithMinSI(Operation *op, TranslationContext &ctx) {
@@ -136,11 +166,34 @@ LogicalResult handleArithMaxUI(Operation *op, TranslationContext &ctx) {
 }
 
 LogicalResult handleArithAndI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::AndIOp, V_AND_B32>(op, ctx);
+  auto typedOp = cast<arith::AndIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitAnd(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithOrI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::OrIOp, V_OR_B32>(op, ctx);
+  auto typedOp = cast<arith::OrIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  // OR has no SALU equivalent in current use — only used on VGPRs
+  // (thread ID bit manipulation with non-overlapping ranges).
+  auto vregType = ctx.createVRegType();
+  auto result = V_OR_B32::create(builder, loc, vregType, *lhs, *rhs);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithXorI(Operation *op, TranslationContext &ctx) {
@@ -152,11 +205,31 @@ LogicalResult handleArithXorI(Operation *op, TranslationContext &ctx) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult handleArithShLI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALURev<arith::ShLIOp, V_LSHLREV_B32>(op, ctx);
+  auto typedOp = cast<arith::ShLIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitLshl(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithShRUI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALURev<arith::ShRUIOp, V_LSHRREV_B32>(op, ctx);
+  auto typedOp = cast<arith::ShRUIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+
+  auto result = emitLshr(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithShRSI(Operation *op, TranslationContext &ctx) {
@@ -341,13 +414,17 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
     return failure();
   }
 
-  // When both operands are scalar (SGPR or immediate), use S_CMP which
-  // produces an SGPR result directly.  This is required for scf.if/scf.for
-  // conditions that feed waveasm.if/waveasm.condition (which require SGPRs).
+  // When both operands are scalar AND the result feeds a ConditionOp (loop
+  // back-edge), use S_CMP which writes SCC directly. The assembly emitter
+  // emits s_cbranch_scc1 that reads SCC.  Do NOT use S_CMP when the result
+  // feeds handleArithSelect, because the S_CMP "result" is a phantom SGPR
+  // (SCC has no physical register) and V_CMP_NE_U32 would read garbage.
   bool lhsScalar = isSGPRType(lhs->getType()) || isImmType(lhs->getType());
   bool rhsScalar = isSGPRType(rhs->getType()) || isImmType(rhs->getType());
+  bool usedByCondition = cmpOp.getResult().hasOneUse() &&
+      isa<ConditionOp>(*cmpOp.getResult().getUsers().begin());
 
-  if (lhsScalar && rhsScalar) {
+  if (lhsScalar && rhsScalar && usedByCondition) {
     auto sregType = ctx.createSRegType();
     // S_CMP requires SGPR operands; move immediates to SGPRs first.
     Value lhsOp = *lhs;
@@ -393,38 +470,41 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
-  // Vector path: at least one operand is a VGPR, so use V_CMP which writes
-  // to VCC implicitly.
+  // Vector path: use V_CMP which writes to VCC implicitly.
+  // Coerce at least one operand to VGPR to satisfy constant bus restrictions
+  // (V_CMP VOP3 can only read one SGPR from the scalar constant bus).
+  Value lhsV = ensureVGPR(builder, loc, ctx, *lhs);
+  Value rhsV = *rhs;
   switch (cmpOp.getPredicate()) {
   case arith::CmpIPredicate::eq:
-    V_CMP_EQ_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_EQ_U32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::ne:
-    V_CMP_NE_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_NE_U32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::slt:
-    V_CMP_LT_I32::create(builder, loc, *lhs, *rhs);
+    V_CMP_LT_I32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::sle:
-    V_CMP_LE_I32::create(builder, loc, *lhs, *rhs);
+    V_CMP_LE_I32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::sgt:
-    V_CMP_GT_I32::create(builder, loc, *lhs, *rhs);
+    V_CMP_GT_I32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::sge:
-    V_CMP_GE_I32::create(builder, loc, *lhs, *rhs);
+    V_CMP_GE_I32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::ult:
-    V_CMP_LT_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_LT_U32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::ule:
-    V_CMP_LE_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_LE_U32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::ugt:
-    V_CMP_GT_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_GT_U32::create(builder, loc, lhsV, rhsV);
     break;
   case arith::CmpIPredicate::uge:
-    V_CMP_GE_U32::create(builder, loc, *lhs, *rhs);
+    V_CMP_GE_U32::create(builder, loc, lhsV, rhsV);
     break;
   }
 
@@ -447,12 +527,36 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     return op->emitError("operands not mapped");
   }
 
-  // Restore the materialized boolean VGPR (0/1) back into VCC
-  Value zeroConst = createImmConst(0, builder, loc, ctx);
-  V_CMP_NE_U32::create(builder, loc, *cond, zeroConst);
+  // Scalar path: when condition and both values are scalar, use
+  // s_cmp_lg_u32 + s_cselect_b32 (no VGPR needed).
+  if (isScalarOrImm(*cond) && isScalarOrImm(*trueVal) &&
+      isScalarOrImm(*falseVal)) {
+    Value zeroConst = createImmConst(0, builder, loc, ctx);
+    Value condV = *cond;
+    if (isImmType(condV.getType()))
+      condV = S_MOV_B32::create(builder, loc, ctx.createSRegType(), condV);
+    S_CMP_NE_U32::create(builder, loc, ctx.createSRegType(), condV, zeroConst);
+    auto sregType = ctx.createSRegType();
+    Value trueV = *trueVal;
+    Value falseV = *falseVal;
+    if (isImmType(trueV.getType()))
+      trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
+    auto result = S_CSELECT_B32::create(builder, loc, sregType, trueV, falseV);
+    ctx.getMapper().mapValue(selectOp.getResult(), result);
+    return success();
+  }
 
+  // Vector path: restore the materialized boolean VGPR (0/1) back into VCC
+  Value zeroConst = createImmConst(0, builder, loc, ctx);
+  Value condV = ensureVGPR(builder, loc, ctx, *cond);
+  V_CMP_NE_U32::create(builder, loc, condV, zeroConst);
+
+  // v_cndmask_b32 VOP2: src1 must be VGPR. VOP3 has constant bus limit
+  // (only one SGPR + vcc). Coerce both to VGPR to be safe.
+  Value trueVgpr = ensureVGPR(builder, loc, ctx, *trueVal);
+  Value falseVgpr = ensureVGPR(builder, loc, ctx, *falseVal);
   auto result =
-      V_CNDMASK_B32::create(builder, loc, vregType, *falseVal, *trueVal, *cond);
+      V_CNDMASK_B32::create(builder, loc, vregType, falseVgpr, trueVgpr, *cond);
   ctx.getMapper().mapValue(selectOp.getResult(), result);
   return success();
 }
