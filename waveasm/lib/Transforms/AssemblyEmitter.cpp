@@ -166,9 +166,16 @@ std::string KernelGenerator::emitBufferStore(Operation *op,
   // Use VMEMStoreOpInterface to access operands by name
   if (auto storeOp = dyn_cast<VMEMStoreOpInterface>(op)) {
     std::string vdata = resolveValue(storeOp.getData());
-    std::string voffset = resolveValue(storeOp.getVoffset());
+    Value voffsetVal = storeOp.getVoffset();
     std::string srd = resolveValue(storeOp.getSaddr());
-    result += " " + vdata + ", " + voffset + ", " + srd + ", 0 offen";
+
+    if (isa<ImmType>(voffsetVal.getType())) {
+      result += " " + vdata + ", off, " + srd + ", 0";
+    } else {
+      std::string voffset = resolveValue(voffsetVal);
+      result += " " + vdata + ", " + voffset + ", " + srd + ", 0 offen";
+    }
+
     if (auto instOffsetAttr = op->getAttrOfType<IntegerAttr>("instOffset")) {
       int64_t offset = instOffsetAttr.getInt();
       if (offset > 0) {
