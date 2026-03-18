@@ -1034,12 +1034,20 @@ LogicalResult handleVectorTransferWrite(Operation *op,
       voffset = ConstantOp::create(builder, loc, immType, 0);
     }
 
+    Value storeData = *data;
+    if (isAGPRType(storeData.getType())) {
+      auto vregType =
+          ctx.createVRegType(numDwords, numDwords > 1 ? numDwords : 1);
+      storeData =
+          V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
+    }
+
     if (numDwords == 1) {
-      BUFFER_STORE_DWORD::create(builder, loc, *data, srd, voffset);
+      BUFFER_STORE_DWORD::create(builder, loc, storeData, srd, voffset);
     } else if (numDwords == 2) {
-      BUFFER_STORE_DWORDX2::create(builder, loc, *data, srd, voffset);
+      BUFFER_STORE_DWORDX2::create(builder, loc, storeData, srd, voffset);
     } else {
-      BUFFER_STORE_DWORDX4::create(builder, loc, *data, srd, voffset);
+      BUFFER_STORE_DWORDX4::create(builder, loc, storeData, srd, voffset);
     }
   }
 
