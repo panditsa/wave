@@ -476,10 +476,12 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
   }
 
   // Vector path: use V_CMP which writes to VCC implicitly.
-  // Coerce at least one operand to VGPR to satisfy constant bus restrictions
-  // (V_CMP VOP3 can only read one SGPR from the scalar constant bus).
-  Value lhsV = ensureVGPR(builder, loc, ctx, *lhs);
+  // V_CMP VOP3 can read one SGPR from the constant bus — only coerce
+  // to VGPR when BOTH operands are SGPR (two constant bus slots).
+  Value lhsV = *lhs;
   Value rhsV = *rhs;
+  if (isSGPRType(lhsV.getType()) && isSGPRType(rhsV.getType()))
+    lhsV = ensureVGPR(builder, loc, ctx, lhsV);
   switch (cmpOp.getPredicate()) {
   case arith::CmpIPredicate::eq:
     V_CMP_EQ_U32::create(builder, loc, lhsV, rhsV);
@@ -551,13 +553,15 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
-  // Vector path: restore the materialized boolean VGPR (0/1) back into VCC
+  // Vector path: restore the materialized boolean VGPR (0/1) back into VCC.
+  // V_CMP can take one SGPR via the constant bus; zeroConst is an immediate
+  // (no bus slot), so an SGPR cond is fine without coercion.
   Value zeroConst = createImmConst(0, builder, loc, ctx);
-  Value condV = ensureVGPR(builder, loc, ctx, *cond);
+  Value condV = *cond;
   V_CMP_NE_U32::create(builder, loc, condV, zeroConst);
 
-  // v_cndmask_b32 VOP2: src1 must be VGPR. VOP3 has constant bus limit
-  // (only one SGPR + vcc). Coerce both to VGPR to be safe.
+  // v_cndmask_b32: coerce both to VGPR.  VOP3 constant bus allows one SGPR
+  // but interacts with vcc slot; keeping both as VGPR is safest.
   Value trueVgpr = ensureVGPR(builder, loc, ctx, *trueVal);
   Value falseVgpr = ensureVGPR(builder, loc, ctx, *falseVal);
   auto result =
