@@ -36,31 +36,10 @@ namespace waveasm {
 namespace {
 
 /// Returns true if the operation writes the SCC flag on hardware.
+/// Uses hasTrait<SCCDef> for ops that carry the trait (carry ops, cmp ops),
+/// and isa<> for ops still on SALUBinaryOp/SALUUnaryOp (pending migration).
 static bool writesSCC(Operation *op) {
-  if (isa<S_ADD_U32, S_ADDC_U32, S_ADD_I32, S_SUB_U32, S_SUB_I32>(op))
-    return true;
-  if (isa<S_CMP_LT_U32, S_CMP_EQ_U32, S_CMP_LE_U32, S_CMP_GT_U32,
-          S_CMP_GE_U32, S_CMP_NE_U32, S_CMP_LT_I32, S_CMP_EQ_I32,
-          S_CMP_LE_I32, S_CMP_GT_I32, S_CMP_GE_I32, S_CMP_NE_I32>(op))
-    return true;
-  if (isa<S_AND_B32, S_AND_B64, S_OR_B32, S_OR_B64, S_XOR_B32, S_XOR_B64,
-          S_ANDN2_B32, S_ANDN2_B64, S_ORN2_B32, S_ORN2_B64,
-          S_NAND_B32, S_NAND_B64, S_NOR_B32, S_NOR_B64,
-          S_XNOR_B32, S_XNOR_B64>(op))
-    return true;
-  if (isa<S_LSHL_B32, S_LSHL_B64, S_LSHR_B32, S_LSHR_B64,
-          S_ASHR_I32, S_ASHR_I64>(op))
-    return true;
-  if (isa<S_MIN_I32, S_MIN_U32, S_MAX_I32, S_MAX_U32>(op))
-    return true;
-  if (isa<S_BFE_U32, S_BFE_I32, S_BFE_U64, S_BFE_I64>(op))
-    return true;
-  if (isa<S_NOT_B32, S_NOT_B64, S_BREV_B32, S_BREV_B64,
-          S_BCNT0_I32_B32, S_BCNT0_I32_B64, S_BCNT1_I32_B32, S_BCNT1_I32_B64,
-          S_FF0_I32_B32, S_FF0_I32_B64, S_FF1_I32_B32, S_FF1_I32_B64,
-          S_FLBIT_I32_B32, S_FLBIT_I32_B64, S_ABS_I32>(op))
-    return true;
-  return false;
+  return op->hasTrait<OpTrait::SCCDef>();
 }
 
 struct SCCVerifierPass
