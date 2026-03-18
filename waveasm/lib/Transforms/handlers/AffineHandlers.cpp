@@ -648,9 +648,8 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             return *result;
           }
 
-          // No fusion possible, emit regular v_or_b32
-          ensureBothVGPR();
-          Value orResult = V_OR_B32::create(builder, loc, vregType, lhs, rhs);
+          // No fusion possible — emitOr picks S_OR_B32 when both scalar.
+          Value orResult = emitOr(lhs, rhs, builder, loc, ctx);
           BitRange resultRange = lhsRange.merge(rhsRange);
           ctx.setBitRange(orResult, resultRange);
           return ExprResult(orResult, resultRange);
