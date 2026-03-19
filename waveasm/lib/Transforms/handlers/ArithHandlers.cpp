@@ -475,6 +475,34 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
+  // When both operands are scalar and ALL users are arith.select ops with
+  // scalar true/false values, the fusion in handleArithSelect will emit
+  // s_cmp + s_cselect directly. Skip the VALU path entirely — map the
+  // result to a dummy so the mapper doesn't complain.
+  if (lhsScalar && rhsScalar) {
+    bool allUsersFused = true;
+    for (auto &use : cmpOp.getResult().getUses()) {
+      auto *user = use.getOwner();
+      if (auto selectUser = dyn_cast<arith::SelectOp>(user)) {
+        auto trueMap = ctx.getMapper().getMapped(selectUser.getTrueValue());
+        auto falseMap = ctx.getMapper().getMapped(selectUser.getFalseValue());
+        if (!trueMap || !falseMap ||
+            !isScalarOrImm(*trueMap) || !isScalarOrImm(*falseMap)) {
+          allUsersFused = false;
+          break;
+        }
+      } else {
+        allUsersFused = false;
+        break;
+      }
+    }
+    if (allUsersFused) {
+      Value dummy = createImmConst(0, builder, loc, ctx);
+      ctx.getMapper().mapValue(cmpOp.getResult(), dummy);
+      return success();
+    }
+  }
+
   // Vector path: use V_CMP which writes to VCC implicitly.
   // V_CMP VOP3 can read one SGPR from the constant bus — only coerce
   // to VGPR when BOTH operands are SGPR (two constant bus slots).
