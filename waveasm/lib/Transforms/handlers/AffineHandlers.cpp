@@ -259,8 +259,11 @@ static AffineExpr normalizeExpr(AffineExpr e, MLIRContext *ctx) {
 //   1. Float rcp seed  →  Newton-Raphson refinement  →  exact reciprocal
 //   2. q = mulhi(x, recip)
 //   3. Two remainder-based correction steps
+// When both inputs are scalar, extracts the result back to SGPR via
+// v_readfirstlane_b32 so downstream arithmetic stays in SALU.
 Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
                            TranslationContext &ctx) {
+  bool bothScalar = isScalarOrImm(x) && isScalarOrImm(d);
   auto vregType = ctx.createVRegType();
   x = ensureVGPR(builder, x.getLoc(), ctx, x);
   d = ensureVGPR(builder, d.getLoc(), ctx, d);
@@ -306,6 +309,11 @@ Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
   Value inc2 = V_CNDMASK_B32::create(builder, loc, vregType, zeroConst, oneVgpr,
                                      zeroConst);
   q = V_ADD_U32::create(builder, loc, vregType, q, inc2);
+
+  if (bothScalar) {
+    auto sregType = ctx.createSRegType();
+    q = V_READFIRSTLANE_B32::create(builder, loc, sregType, q);
+  }
 
   return q;
 }
