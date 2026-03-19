@@ -28,38 +28,6 @@ using namespace mlir;
 
 namespace waveasm {
 
-// Emits S_CMP_* for the given predicate with SGPR operands (sets SCC).
-// Both lhs and rhs must be SGPRs (not immediates) before calling.
-// Returns the S_CMP result value (phantom SCC).
-static Value emitScalarCmp(OpBuilder &builder, Location loc,
-                           arith::CmpIPredicate pred, Value lhs, Value rhs,
-                           TranslationContext &ctx) {
-  auto sregType = ctx.createSRegType();
-  switch (pred) {
-  case arith::CmpIPredicate::eq:
-    return S_CMP_EQ_U32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::ne:
-    return S_CMP_NE_U32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::slt:
-    return S_CMP_LT_I32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::sle:
-    return S_CMP_LE_I32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::sgt:
-    return S_CMP_GT_I32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::sge:
-    return S_CMP_GE_I32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::ult:
-    return S_CMP_LT_U32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::ule:
-    return S_CMP_LE_U32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::ugt:
-    return S_CMP_GT_U32::create(builder, loc, sregType, lhs, rhs);
-  case arith::CmpIPredicate::uge:
-    return S_CMP_GE_U32::create(builder, loc, sregType, lhs, rhs);
-  }
-  llvm_unreachable("unhandled CmpIPredicate");
-}
-
 // Materializes VCC (set by a preceding V_CMP) into a VGPR holding 0 or 1.
 // V_CNDMASK_B32 implicitly reads VCC; the op definition lacks Pure/ArithmeticOp
 // traits so CSE will never merge distinct instances.
