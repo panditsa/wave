@@ -351,15 +351,20 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
 
 /// Emit the SRD NUM_RECORDS field (word 2) from the validBytes operand.
 /// Static constants emit s_mov_b32; dynamic values (e.g. from arith.select
-/// for the branchless g2s guard) go through v_readfirstlane_b32 + s_add_u32
-/// (non-Pure to avoid DCE). Falls back to hardware maximum if absent.
+/// for the branchless g2s guard) go through v_readfirstlane_b32.
+/// Falls back to hardware maximum if absent.
 ///
 /// TODO: Detect arith.select(arith.cmpi(scalar, scalar), scalar, scalar)
 /// and emit s_cmp + s_cselect directly to avoid the VGPR round-trip.
-/// This saves ~7 VALU ops per SRD in the loop body.  Previous attempts
-/// caused memory faults — the pattern matching is correct but something
-/// in the interaction between the new s_cselect ops and register allocation
-/// corrupts a buffer descriptor.  Needs investigation with IR dumps.
+/// This would save ~7 VALU ops per SRD in the loop body.
+/// Multiple approaches tried (direct PSRegType, s_mov copy, s_add copy,
+/// fresh SGPR copy inside loop) — all produce correct-looking assembly
+/// (s_cmp + s_cselect into SRD word 2) but cause "Write access to
+/// read-only page" GPU faults.  The SCC chain is verified safe.
+/// The register allocation diff shows the validBytes SGPR is correctly
+/// kept alive.  Root cause unknown — needs WaveASM IR dumps after
+/// register allocation to compare the full register assignment between
+/// passing (v_readfirstlane) and failing (s_cselect) versions.
 static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
                               Operation *op, TranslationContext &ctx) {
   auto castOp = cast<amdgpu::FatRawBufferCastOp>(op);
