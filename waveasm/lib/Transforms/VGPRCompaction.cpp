@@ -318,7 +318,13 @@ computeCompaction(llvm::SmallVectorImpl<PhysVGPRRange> &ranges,
     int64_t sz = r.size;
     int64_t align = r.alignment;
 
+    // v15 is the scratch VGPR for literal materialization in the assembly
+    // emitter (AssemblyEmitter.h KernelGenerator::kScratchVGPR). Must stay
+    // excluded so compaction never places a live value there.
+    constexpr int64_t kScratchVGPR = 15;
     llvm::BitVector occupied(maxRegs, false);
+    if (kScratchVGPR < maxRegs)
+      occupied.set(kScratchVGPR);
     for (size_t j = 0; j < ranges.size(); ++j) {
       if (newAssignment[j] < 0)
         continue;

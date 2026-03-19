@@ -428,7 +428,7 @@ def _coalesce_vector_iter_args(module: Module) -> None:
             memref = load_view.base
             indices = list(load_view.indices)
             v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
-            with InsertionPoint(yield_op):
+            with InsertionPoint(byte0_op):
                 wide_load = vector_d.load(v4xi8, memref, indices)
             groups[g_idx] = (init_source, wide_load, members)
             logger.debug(
@@ -650,7 +650,6 @@ def apply_opsel_scaled_mfma(module: Module):
 
     with mlir_ctx, Location.unknown():
         _coalesce_vector_iter_args(module)
-        _merge_scale_byte_loads(module)
 
         f8e8m0 = Float8E8M0FNUType.get()
 
