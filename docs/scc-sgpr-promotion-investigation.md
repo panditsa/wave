@@ -2,145 +2,147 @@
 
 ## Summary
 
-This document captures the findings from investigating SCC (Scalar Condition Code) tracking and VGPR→SGPR promotion in the WaveASM backend. The goal is to reduce VGPR pressure by ~40-49 registers to match the aiter reference kernel.
+This document captures the findings from investigating SCC (Scalar Condition Code) tracking and VGPR→SGPR promotion in the WaveASM backend. The work spans SCC infrastructure, handler-level SALU promotions, and the unresolved SRD scalar select issue.
 
-## What was built
+## What Was Built
 
 ### SCC Infrastructure (committed, working)
 
-1. **SCCDef / SCCUse traits** — every SALU op now correctly declares its SCC behavior via ODS traits
-2. **SALUBinaryWithSCCOp / SALUUnaryWithSCCOp** — op classes with `NoMemoryEffect + AlwaysSpeculatableImplTrait + SCCDef` (equivalent to Pure for MLIR passes, but identifiable as SCC-clobbering)
-3. **SCC verifier pass** (`--waveasm-scc-verifier`) — walks IR in emission order, catches SCC clobber between producer and consumer
-4. **ScopedCSE guard** — SCCUse ops excluded from CSE (result depends on implicit SCC)
-
-Key insight: `Pure` in MLIR ODS = `NoMemoryEffect + AlwaysSpeculatableImplTrait`. Composing these with `SCCDef` keeps MLIR pass behavior (DCE, LICM) identical while enabling trait-based SCC verification. Adding `NativeOpTrait` to non-Pure ops (SALUBinaryWithCarryOp, SALUCmpOp) is safe; adding it to Pure ops requires the explicit composition to avoid changing codegen.
+- **SCCDef / SCCUse traits** on all SALU ops — every op now declares whether it writes or reads SCC
+- **SCC verifier pass** (`--waveasm-scc-verifier`) — walks IR in emission order, catches SCC clobbers between producer and consumer
+- Key insight: `Pure` in MLIR ODS = `NoMemoryEffect + AlwaysSpeculatableImplTrait`. Composing these with `SCCDef` gives identical MLIR pass behavior while enabling SCC verification. Adding bare `NativeOpTrait` to existing ODS classes changes tablegen output and alters MLIR pass behavior — must use the explicit composition.
+- `S_CSELECT_B32` carries `SCCUse` trait (not Pure, not CSE-eligible — result depends on implicit SCC)
 
 ### Handler SALU Promotions (committed, working)
 
 | Handler | Change | Impact |
 |---------|--------|--------|
-| `handleArithOrI` | `emitOr` (S_OR_B32 when scalar) | No trigger in GEMM kernel |
-| `handleArithXorI` | `emitXor` (S_XOR_B32 when scalar) | No trigger in GEMM kernel |
-| `handleArithDivUI` | `emitLshr` for power-of-2 | No trigger (VGPR operands) |
-| `handleArithRemUI` | `emitAnd` for power-of-2 | No trigger (VGPR operands) |
-| `handleArithMaxSI/UI/MinSI/UI` | `emitMaxI32` etc. | 1 promotion: `v_max_i32 → s_max_i32` |
-
-### V_CMP Constant Bus Fix (committed, working)
-
-`handleArithCmpI` vector path: only `ensureVGPR` when BOTH operands are SGPR (V_CMP VOP3 accepts one SGPR via constant bus). Eliminates 2 `v_mov_b32 sN→vN` instructions.
-
-`handleArithSelect` vector path: don't `ensureVGPR` cond before `V_CMP_NE_U32` when other operand is immediate.
+| `handleArithOrI` | `emitOr` helper (S_OR_B32 when both scalar) | No trigger in GEMM kernel |
+| `handleArithXorI` | `emitXor` helper (S_XOR_B32) | No trigger |
+| `handleArithDivUI` | Uses `emitLshr` (has scalar path) | No trigger |
+| `handleArithRemUI` | Uses `emitAnd` (has scalar path) | No trigger |
+| `handleArithMaxSI/UI` | `emitMaxI32/U32` (S_MAX_I32 when scalar) | **1 v_max → s_max** |
+| `handleArithMinSI/UI` | `emitMinI32/U32` (S_MIN_I32 when scalar) | No trigger |
+| `handleArithCmpI` | SGPR accepted in V_CMP (constant bus) | **2 v_mov_b32 eliminated** |
+| `handleArithSelect` | SGPR cond accepted in V_CMP_NE_U32 | No trigger |
+| AffineHandlers OR | `emitOr` instead of `ensureBothVGPR + V_OR_B32` | No trigger |
 
 ### `emitScalarCmp` Helper (committed)
 
-Shared `inline` function in `Handlers.h` that emits `S_CMP_*` for any `arith::CmpIPredicate`. Used by `handleArithCmpI` and available for `AMDGPUHandlers.cpp`.
+Shared inline function in `Handlers.h` that emits `S_CMP_*` for any `arith::CmpIPredicate`. Used by `handleArithCmpI` and available for `AMDGPUHandlers.cpp`.
 
-## What was attempted but failed
+## The VGPR Pressure Problem
 
-### 1. CmpI Fusion in handleArithCmpI (all-scalar cmpi → SGPR boolean)
+### Numbers (256x192 GEMM, our kernel vs aiter reference)
 
-**Approach:** When both cmpi operands are scalar (not just ConditionOp use), emit `s_cmp + s_cselect(1, 0)` to produce an SGPR boolean instead of V_CMP + VGPR boolean.
-
-**Result:** Memory fault. The SGPR boolean propagates through the type system (via arith.extui, arith.addi, arith.select) and changes register allocation for buffer descriptors downstream. The cascading SGPR changes corrupt an SRD.
-
-**Root cause:** Unknown. The assembly logic is correct, SCC chains are valid. The issue is in how the changed register allocation (from keeping more values in SGPRs) shifts physical register assignments for precolored SRD registers.
-
-### 2. CmpI Fusion in handleArithSelect (scalar cmpi → s_cmp + s_cselect)
-
-**Approach:** In `handleArithSelect`, when the condition comes from `arith.cmpi` with scalar operands and select values are scalar, re-emit `s_cmp + s_cselect` directly.
-
-**Result:** Memory fault (same root cause as #1). Also tried with `allUsersScalarSafe` check — when restricted enough to not change register allocation, no patterns fire.
-
-### 3. SRD Scalar Select in emitSrdNumRecords
-
-**Approach:** In `emitSrdNumRecords`, detect `arith.select(arith.cmpi(scalar, scalar), scalar, scalar)` feeding `fat_raw_buffer_cast`'s `validBytes`, and emit `s_cmp + s_cselect` directly into the SRD num_records SGPR (PSRegType).
-
-**Result:** Memory fault. Tried multiple emission approaches:
-- Direct PSRegType result with DCEProtectOp
-- Virtual SGPR + s_mov_b32 copy to PSRegType
-- Virtual SGPR + s_add_u32 copy (discovered s_add_u32 clobbers SCC — eliminated as cause)
-- Fresh SGPR copy inside loop body (to avoid cross-loop liveness issues)
-
-All produce correct-looking assembly: `s_cmp_lt_i32 s37, s10` → `s_cselect_b32 s66, s26, 0` (SRD word 2 = num_records). SCC chain is valid (no clobber between s_cmp and s_cselect). SCC verifier reports no hazards. The register allocator keeps the validBytes SGPR alive. Both individual SRDs fail when targeted separately.
-
-**Fault pattern:** "Write access to a read-only page" on various GPU addresses. Consistent with an SRD corruption (wrong num_records allowing access beyond buffer allocation).
-
-## The VGPR Pressure Gap (analysis)
-
-### Loop Body VGPR Breakdown: Our Code vs aiter Reference
-
-| Category | Our Code | Reference | Delta |
-|----------|----------|-----------|-------|
-| MFMA data operands | 180 | 160 | +20 |
+| Category | Ours | Reference | Delta |
+|----------|------|-----------|-------|
+| VALU address/control in loop | 21 VGPRs | 0 | **+21** |
 | MFMA scale operands | 24 | 10 | +14 |
-| buffer_load destinations (B prefetch) | 58 | 34 | +24 |
 | buffer_load voffset addresses | 24 | 10 | +14 |
-| buffer_load_lds voffsets | 18 | 10 | +8 |
-| **VALU address/control in loop** | **21** | **0** | **+21** |
-| Total | ~276 | ~227 | ~49 |
+| Peak arch VGPRs | ~276 | ~227 | **+49** |
 
-### How the reference achieves zero loop-body VALU
+The biggest single win is eliminating VALU from the loop body (+21 VGPRs).
 
-The aiter reference kernel does ALL in-loop address computation with SALU:
+### Root Cause: cmpi→select→fat_raw_buffer_cast Chain
 
-```asm
-; aiter: 2 SALU ops, 0 VGPRs
-s_cmp_lt_u32 0x200, s51          ; scalar comparison
-s_cselect_b32 s61, s61, 0        ; scalar select into SRD soffset
-```
-
-Our code does the same thing with 7 VALU ops and 3+ wasted VGPRs:
-
-```asm
-; our code: 7 VALU ops, 3+ VGPRs
-v_mov_b32 v151, s27             ; SGPR→VGPR (wasted)
-v_cmp_lt_i32 vcc, v151, s37     ; uniform comparison in VALU
-v_mov_b32 v151, 1               ; constant→VGPR (wasted)
-v_cndmask_b32 v152, 0, v151     ; bool→VGPR (wasted)
-v_cmp_ne_u32 vcc, v152, 0       ; re-restore VCC (wasted)
-v_cndmask_b32 v151, 0, v29      ; select validBytes or 0
-v_readfirstlane_b32 s66, v151   ; back to SGPR for SRD word 2
-```
-
-The root cause: `handleArithCmpI` materializes VCC→VGPR boolean, then `handleArithSelect` re-materializes VGPR→VCC for v_cndmask.
-
-### The MLIR pattern
+In the MLIR, the loop body has:
 
 ```mlir
-%1377 = affine.apply (s0 + 2)[%arg8]                    ; next K step (uniform)
-%1378 = arith.cmpi slt, %1377, %238 : index             ; uniform comparison
-%1379 = arith.select %1378, %323, %c0_i64 : i64         ; validBytes or 0
-%1380 = amdgpu.fat_raw_buffer_cast ... validBytes(%1379) ; SRD setup
+%next_K = affine.apply (s0 + 2)[%loop_iv]       // scalar
+%K_bound = affine.apply (s0 ceildiv 256)[%K]     // scalar  
+%cond = arith.cmpi slt, %next_K, %K_bound        // uniform comparison
+%validBytes = arith.select %cond, %bufSize, 0     // branchless guard
+%srd = amdgpu.fat_raw_buffer_cast ... validBytes(%validBytes)
 ```
 
-Both `%1377` and `%238` are provably uniform (derived from kernel args + loop IV). The select values (`%323` = `(M*K)/2`, `%c0_i64` = 0) are also scalar constants.
+All values are provably uniform (scalar). The aiter reference emits this as 2 SALU ops:
 
-## Next Steps
+```asm
+s_cmp_lt_u32 0x200, s51          ; scalar comparison
+s_cselect_b32 s61, s61, 0        ; scalar select → SRD soffset
+```
 
-### To debug the s_cselect memory fault
+Our code emits 7 VALU ops + v_readfirstlane because:
+1. `handleArithCmpI` emits `V_CMP + materializeVCCToBoolVGPR` (VGPR boolean)
+2. `handleArithSelect` emits `V_CMP_NE_U32 + V_CNDMASK_B32` (VGPR result)
+3. `emitSrdNumRecords` does `v_readfirstlane_b32` to extract back to SGPR
 
-1. Add `--mlir-print-ir-after=waveasm-linear-scan` support to `compile.py` (pipe stderr to file)
-2. Generate IR dumps for both passing (v_readfirstlane) and failing (s_cselect) versions
-3. Diff the IR after register allocation to find which physical register assignment changed
-4. The diff will reveal the SRD corruption path — likely a precolored SGPR that got displaced
+## What Was Tried (and Failed)
 
-### Alternative approaches to reduce VGPR pressure
+### Approach 1: CmpI Fusion in handleArithCmpI
 
-1. **Schedule-level fix:** In the Python schedule (`gemm_mxfp4_double_buffer.py`), avoid `arith.select` for the branchless guard and instead directly produce scalar validBytes values that the WaveASM backend can keep in SGPRs.
+**Idea:** When both cmpi operands are scalar, emit `s_cmp + s_cselect(1, 0)` to produce an SGPR boolean instead of VGPR.
 
-2. **Post-translation SGPR promotion pass:** A WaveASM-level pass that identifies uniform v_cmp + v_cndmask + v_readfirstlane chains and converts them to s_cmp + s_cselect. This would run after translation but before register allocation, avoiding the handler-level issues.
+**Result:** Memory fault. The SGPR boolean propagates through `arith.extui` and `arith.addi` chains, changing the type of downstream values from VGPR to SGPR. This cascading type change alters register allocation for buffer descriptors, corrupting SRD addresses.
 
-3. **Buffer soffset approach (matching aiter):** Instead of modifying num_records, use the buffer soffset field for the branchless guard. The aiter kernel uses `s_cselect_b32 s61, s61, 0` on the SOFFSET, not num_records. This may bypass the PSRegType interaction that causes the fault.
+**Why:** The SGPR result enters the mapper and changes every downstream consumer's type decision. Values that were VGPR (with v_readfirstlane extraction) become SGPR, shifting the entire allocation picture.
 
-## Key Files
+### Approach 2: CmpI Fusion in handleArithSelect
 
-| File | Role |
-|------|------|
-| `waveasm/include/waveasm/Dialect/WaveASMInterfaces.h` | SCCDef/SCCUse C++ trait classes |
-| `waveasm/include/waveasm/Dialect/WaveASMOps.td` | Op class definitions with SCC traits |
-| `waveasm/lib/Transforms/SCCVerifier.cpp` | SCC verification pass |
-| `waveasm/lib/Transforms/handlers/Handlers.h` | emitScalarCmp, emitOr/Xor/Min/Max helpers |
-| `waveasm/lib/Transforms/handlers/ArithHandlers.cpp` | handleArithCmpI, handleArithSelect |
-| `waveasm/lib/Transforms/handlers/AMDGPUHandlers.cpp` | emitSrdNumRecords, handleFatRawBufferCast |
-| `waveasm/lib/Transforms/handlers/AffineHandlers.cpp` | emitCeilFromFloorQuotient, handleAffineApply |
-| `wave_ref/f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256.s` | aiter reference kernel |
+**Idea:** Add a fusion path that detects `arith.select(arith.cmpi(scalar, scalar), scalar, scalar)` and emits `s_cmp + s_cselect` directly.
+
+**Result:** Memory fault when the select result feeds non-SRD consumers (cascading SGPR changes). With user-safety guards (only fire for specific downstream patterns), the fusion never triggers for the loop-body pattern.
+
+### Approach 3: Targeted SRD Scalar Select in emitSrdNumRecords
+
+**Idea:** Only in `emitSrdNumRecords`, detect the `arith.select(arith.cmpi)` pattern feeding `fat_raw_buffer_cast`'s `validBytes` and emit `s_cmp + s_cselect` directly into the precolored SRD word 2 (`PSRegType`).
+
+**Result:** Memory fault ("Write access to a read-only page"). Tried four emission variants:
+- Direct `S_CSELECT_B32` into `PSRegType(srdBase+2)` with `DCEProtectOp`
+- `S_CSELECT_B32` into virtual SGPR → `S_MOV_B32` copy to PSReg
+- `S_CSELECT_B32` into virtual SGPR → `S_ADD_U32` copy to PSReg (clobbers SCC — eliminated as cause)
+- Fresh `S_MOV_B32` copy of trueOp inside loop body before `S_CSELECT_B32`
+
+All produce correct-looking assembly. The SCC verifier reports no hazards. Register allocation appears correct (validBytes SGPR kept alive from prologue through loop body, not clobbered by intermediates).
+
+### Why All Approaches Fail
+
+The assembly emitted by all three approaches looks correct when inspected manually:
+- SCC chain: `s_cmp → s_cselect` with nothing between them
+- SRD formation: word 0 (base lo), word 1 (base hi + flags), word 2 (num_records from s_cselect), word 3 (stride/swizzle)
+- Comparison semantics: `s_cmp_lt_i32` matches the original `v_cmp_lt_i32` predicate
+- Value selection: `s_cselect src0=validBytes, src1=0` matches the original `v_cndmask 0, validBytes, vcc`
+
+The fault address patterns suggest a corrupted buffer descriptor, but the assembly-level SRD setup appears identical to the working version (with different SGPR numbers from changed register allocation).
+
+## Debugging Next Steps
+
+The bug is invisible at the assembly level. The investigation needs:
+
+1. **WaveASM IR dumps after register allocation** — compare the IR between passing (v_readfirstlane) and failing (s_cselect) versions to find which SSA value got a different physical register assignment
+2. **The waveasm-translate tool supports `--mlir-print-ir-after-all`** (or the tool-specific `--print-ir` flag) — pipe stderr to a file
+3. **Diff the IR** — look for PSRegType assignments that differ, especially for SRD word 0/1 (base address) registers
+
+The key hypothesis: adding new SALU ops (s_cmp, s_cselect) in the loop body changes the SGPR pressure, which shifts the linear scan allocator's register assignments. One of those shifted assignments happens to clobber a precolored SRD register that's being set up elsewhere.
+
+## V_CNDMASK_B32 Constant Bus Issue
+
+Attempted to allow one SGPR in `V_CNDMASK_B32` (VOP3 constant bus allows one SGPR + VCC). This caused test failures — `v_cndmask_b32` VOP3 encoding with VCC counts as one constant bus slot, and adding an SGPR as src0/src1 requires a SECOND slot, exceeding the limit on some instructions.
+
+## Files Modified
+
+| File | Changes |
+|------|---------|
+| `WaveASMInterfaces.h/.td` | SCCDef, SCCUse trait definitions |
+| `WaveASMOps.td` | SCC-aware op classes, trait assignments |
+| `SCCVerifier.cpp` | SCC verification pass |
+| `ScopedCSE.cpp` | SCCUse exclusion from CSE |
+| `Handlers.h` | emitOr, emitXor, emitMinI32/U32, emitMaxI32/U32, emitScalarCmp |
+| `ArithHandlers.cpp` | SALU paths for OR/XOR/Min/Max/DivUI/RemUI, V_CMP constant bus |
+| `AffineHandlers.cpp` | emitOr for non-overlapping Add |
+| `AMDGPUHandlers.cpp` | SRD scalar select TODO documentation |
+| `Passes.td` | SCC verifier pass registration |
+| `CMakeLists.txt` | SCCVerifier.cpp |
+| `compile.py` | `--waveasm-scc-verifier` in pipeline |
+| `waveasm_e2e.py` | Same |
+
+## Commits
+
+1. `d54817dc` — SCC verifier pass and trait infrastructure
+2. `bc9726f8` — Migrate all SALU ops to SCC-aware trait classes
+3. `d3e69752` — SALU paths for OR, XOR, DivUI, RemUI handlers
+4. `3bcf0b85` — Eliminate unnecessary SGPR-to-VGPR coercions before V_CMP
+5. `c22ce840` — emitScalarCmp helper and emitMin/emitMax SALU promotion
+6. `8c65e6e0` — Move emitScalarCmp to Handlers.h
+7. `963444f3` — SRD scalar select TODO with failure analysis
