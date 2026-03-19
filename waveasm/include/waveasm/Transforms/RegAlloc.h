@@ -69,7 +69,7 @@ public:
 
 /// Pool of available physical registers.
 /// Uses a BitVector for O(1) per-register operations and cache-friendly
-/// scanning. Typical GPU register files (256 VGPRs, 108 SGPRs, 256 AGPRs)
+/// scanning. Typical GPU register files (256 VGPRs, 102 SGPRs, 256 AGPRs)
 /// fit in a few 64-bit words.
 class RegPool {
 public:
