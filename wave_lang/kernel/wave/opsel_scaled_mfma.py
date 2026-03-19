@@ -507,14 +507,40 @@ def _get_affine_constant_offset(op) -> Optional[int]:
     return None
 
 
+def _affine_base_key(op) -> Optional[tuple]:
+    """Return a key that identifies the non-constant base of an affine.apply.
+
+    Two affine.apply ops with the same base key compute addresses that
+    differ only by a compile-time constant offset, so a single wide load
+    at the offset-0 address covers all of them.
+
+    Returns ``None`` when *op* is not an affine.apply.
+    """
+    if not _is_op_named(op, "affine.apply"):
+        return None
+    operand_ids = tuple(id(v) for v in op.operands)
+    import re
+
+    map_str = str(op.attributes["map"])
+    m = re.search(r"\+\s*\d+\)\s*>\s*$", map_str)
+    if m:
+        base_map = map_str[: m.start()] + ")>"
+    else:
+        base_map = map_str
+    return (base_map, operand_ids)
+
+
 def _merge_scale_byte_loads(module: Module) -> None:
-    """Merge adjacent vector<1/2xi8> LDS loads into vector<4xi8> + extract.
+    """Merge adjacent vector<1xi8> LDS loads into vector<4xi8> + extract.
 
     Handles the unrolled-iteration pattern where sub-word scale loads
     aren't loop-carried and thus not covered by _coalesce_vector_iter_args.
+    Only merges vector<1xi8> loads to guarantee every extract from the
+    wide load has size 1, which _trace_scale_chain requires for opsel.
     """
     i8 = IntegerType.get_signless(8)
     i64 = IntegerType.get_signless(64)
+    v1xi8 = VectorType.get([1], i8)
 
     byte_loads: list[Operation] = []
     for op in _walk_operations(module.operation):
@@ -523,7 +549,7 @@ def _merge_scale_byte_loads(module: Module) -> None:
         rtype = op.results[0].type
         if not isinstance(rtype, VectorType) or rtype.element_type != i8:
             continue
-        if rtype.shape[0] > 2:
+        if rtype.shape[0] != 1:
             continue
         view = op.opview
         addr = view.indices[-1]
@@ -541,11 +567,20 @@ def _merge_scale_byte_loads(module: Module) -> None:
             return (id(owner), base_value.arg_number)
         return id(owner)
 
-    by_memref: dict = defaultdict(list)
-    for op in byte_loads:
-        by_memref[_memref_key(op.opview.base)].append(op)
+    def _full_group_key(op: Operation):
+        """Group by memref, all non-last indices, AND the affine base expr."""
+        view = op.opview
+        memref_k = _memref_key(view.base)
+        prefix_indices = tuple(id(v) for v in list(view.indices)[:-1])
+        addr = view.indices[-1]
+        base_k = _affine_base_key(addr.owner)
+        return (memref_k, prefix_indices, base_k)
 
-    for loads in by_memref.values():
+    by_group: dict = defaultdict(list)
+    for op in byte_loads:
+        by_group[_full_group_key(op)].append(op)
+
+    for loads in by_group.values():
         if len(loads) < 2:
             continue
 
@@ -555,6 +590,8 @@ def _merge_scale_byte_loads(module: Module) -> None:
             addr_val = load_op.opview.indices[-1]
             off = _get_affine_constant_offset(addr_val.owner)
             if off is None:
+                continue
+            if off >= SCALE_VECTOR_WIDTH:
                 continue
             addr_to_offset[id(load_op)] = off
             if off == 0:
@@ -580,15 +617,15 @@ def _merge_scale_byte_loads(module: Module) -> None:
             if id(load_op) not in addr_to_offset:
                 continue
             off = addr_to_offset[id(load_op)]
-            rtype = load_op.results[0].type
-            n = rtype.shape[0]
-            if off + n > SCALE_VECTOR_WIDTH:
+            if off + 1 > SCALE_VECTOR_WIDTH:
                 continue
             with InsertionPoint(load_op):
                 offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
-                sizes = ArrayAttr.get([IntegerAttr.get(i64, n)])
+                sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
                 strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                ext = vector_d.ExtractStridedSliceOp(rtype, wide, offsets, sizes, strides)
+                ext = vector_d.ExtractStridedSliceOp(
+                    v1xi8, wide, offsets, sizes, strides
+                )
             load_op.results[0].replace_all_uses_with(ext.result)
             load_op.erase()
             replaced += 1
