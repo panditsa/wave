@@ -28,6 +28,38 @@ using namespace mlir;
 
 namespace waveasm {
 
+// Emits S_CMP_* for the given predicate with SGPR operands (sets SCC).
+// Both lhs and rhs must be SGPRs (not immediates) before calling.
+// Returns the S_CMP result value (phantom SCC).
+static Value emitScalarCmp(OpBuilder &builder, Location loc,
+                           arith::CmpIPredicate pred, Value lhs, Value rhs,
+                           TranslationContext &ctx) {
+  auto sregType = ctx.createSRegType();
+  switch (pred) {
+  case arith::CmpIPredicate::eq:
+    return S_CMP_EQ_U32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::ne:
+    return S_CMP_NE_U32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::slt:
+    return S_CMP_LT_I32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::sle:
+    return S_CMP_LE_I32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::sgt:
+    return S_CMP_GT_I32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::sge:
+    return S_CMP_GE_I32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::ult:
+    return S_CMP_LT_U32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::ule:
+    return S_CMP_LE_U32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::ugt:
+    return S_CMP_GT_U32::create(builder, loc, sregType, lhs, rhs);
+  case arith::CmpIPredicate::uge:
+    return S_CMP_GE_U32::create(builder, loc, sregType, lhs, rhs);
+  }
+  llvm_unreachable("unhandled CmpIPredicate");
+}
+
 // Materializes VCC (set by a preceding V_CMP) into a VGPR holding 0 or 1.
 // V_CNDMASK_B32 implicitly reads VCC; the op definition lacks Pure/ArithmeticOp
 // traits so CSE will never merge distinct instances.
@@ -150,19 +182,51 @@ LogicalResult handleArithMulI(Operation *op, TranslationContext &ctx) {
 }
 
 LogicalResult handleArithMinSI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::MinSIOp, V_MIN_I32>(op, ctx);
+  auto typedOp = cast<arith::MinSIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+  auto result = emitMinI32(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithMaxSI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::MaxSIOp, V_MAX_I32>(op, ctx);
+  auto typedOp = cast<arith::MaxSIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+  auto result = emitMaxI32(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithMinUI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::MinUIOp, V_MIN_U32>(op, ctx);
+  auto typedOp = cast<arith::MinUIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+  auto result = emitMinU32(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithMaxUI(Operation *op, TranslationContext &ctx) {
-  return handleBinaryVALU<arith::MaxUIOp, V_MAX_U32>(op, ctx);
+  auto typedOp = cast<arith::MaxUIOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+  std::optional<Value> lhs, rhs;
+  if (failed(validateBinaryOperands(typedOp, ctx, lhs, rhs)))
+    return failure();
+  auto result = emitMaxU32(*lhs, *rhs, builder, loc, ctx);
+  ctx.getMapper().mapValue(typedOp.getResult(), result);
+  return success();
 }
 
 LogicalResult handleArithAndI(Operation *op, TranslationContext &ctx) {
@@ -420,10 +484,10 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
   }
 
   // When both operands are scalar AND the result feeds a ConditionOp (loop
-  // back-edge), use S_CMP which writes SCC directly. The assembly emitter
-  // emits s_cbranch_scc1 that reads SCC.  Do NOT use S_CMP when the result
-  // feeds handleArithSelect, because the S_CMP "result" is a phantom SGPR
-  // (SCC has no physical register) and V_CMP_NE_U32 would read garbage.
+  // back-edge), use S_CMP which writes SCC directly.  The assembly emitter
+  // emits s_cbranch_scc1 that reads SCC.  S_CSELECT(1,0) materializes
+  // the boolean in SGPR so downstream ops that use the cmpi result (e.g.
+  // via arith.extui) get a scalar value.
   bool lhsScalar = isSGPRType(lhs->getType()) || isImmType(lhs->getType());
   bool rhsScalar = isSGPRType(rhs->getType()) || isImmType(rhs->getType());
   bool usedByCondition = cmpOp.getResult().hasOneUse() &&
@@ -431,46 +495,14 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
 
   if (lhsScalar && rhsScalar && usedByCondition) {
     auto sregType = ctx.createSRegType();
-    // S_CMP requires SGPR operands; move immediates to SGPRs first.
     Value lhsOp = *lhs;
     Value rhsOp = *rhs;
     if (isImmType(lhsOp.getType()))
       lhsOp = S_MOV_B32::create(builder, loc, sregType, lhsOp);
     if (isImmType(rhsOp.getType()))
       rhsOp = S_MOV_B32::create(builder, loc, sregType, rhsOp);
-    Value result;
-    switch (cmpOp.getPredicate()) {
-    case arith::CmpIPredicate::eq:
-      result = S_CMP_EQ_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::ne:
-      result = S_CMP_NE_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::slt:
-      result = S_CMP_LT_I32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::sle:
-      result = S_CMP_LE_I32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::sgt:
-      result = S_CMP_GT_I32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::sge:
-      result = S_CMP_GE_I32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::ult:
-      result = S_CMP_LT_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::ule:
-      result = S_CMP_LE_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::ugt:
-      result = S_CMP_GT_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    case arith::CmpIPredicate::uge:
-      result = S_CMP_GE_U32::create(builder, loc, sregType, lhsOp, rhsOp);
-      break;
-    }
+    Value result =
+        emitScalarCmp(builder, loc, cmpOp.getPredicate(), lhsOp, rhsOp, ctx);
     ctx.getMapper().mapValue(cmpOp.getResult(), result);
     return success();
   }
