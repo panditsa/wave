@@ -1343,7 +1343,17 @@ def _generate_asm_code(mb, options):
                 + extra_passes
                 + tail_passes
             )
-            return subprocess.run(full_cmd, capture_output=True, text=True, timeout=60)
+            # If WAVEASM_DUMP_IR is set, add --mlir-print-ir-after-all and
+            # save stderr to the specified file for debugging.
+            ir_dump_path = os.environ.get("WAVEASM_DUMP_IR")
+            if ir_dump_path:
+                full_cmd.append("--mlir-print-ir-after-all")
+            result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=120)
+            if ir_dump_path and result.stderr:
+                os.makedirs(os.path.dirname(ir_dump_path) or ".", exist_ok=True)
+                with open(ir_dump_path, "w") as f:
+                    f.write(result.stderr)
+            return result
 
         import re
 
