@@ -26,6 +26,7 @@
 
 #include "waveasm/Transforms/TranslateFromMLIR.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
@@ -496,6 +497,43 @@ inline mlir::Value emitMinU32(mlir::Value a, mlir::Value b,
   }
   auto vregType = ctx.createVRegType();
   return V_MIN_U32::create(builder, loc, vregType, a, b);
+}
+
+//===----------------------------------------------------------------------===//
+// Scalar Comparison Helper
+//===----------------------------------------------------------------------===//
+
+/// Emit S_CMP_* for the given predicate with SGPR operands (sets SCC).
+/// Both lhs and rhs must be SGPRs (not immediates) before calling.
+/// Returns the S_CMP result value (phantom SCC).
+inline mlir::Value emitScalarCmp(mlir::OpBuilder &builder, mlir::Location loc,
+                                 mlir::arith::CmpIPredicate pred,
+                                 mlir::Value lhs, mlir::Value rhs,
+                                 TranslationContext &ctx) {
+  auto sregType = ctx.createSRegType();
+  switch (pred) {
+  case mlir::arith::CmpIPredicate::eq:
+    return S_CMP_EQ_U32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::ne:
+    return S_CMP_NE_U32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::slt:
+    return S_CMP_LT_I32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::sle:
+    return S_CMP_LE_I32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::sgt:
+    return S_CMP_GT_I32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::sge:
+    return S_CMP_GE_I32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::ult:
+    return S_CMP_LT_U32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::ule:
+    return S_CMP_LE_U32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::ugt:
+    return S_CMP_GT_U32::create(builder, loc, sregType, lhs, rhs);
+  case mlir::arith::CmpIPredicate::uge:
+    return S_CMP_GE_U32::create(builder, loc, sregType, lhs, rhs);
+  }
+  llvm_unreachable("unhandled CmpIPredicate");
 }
 
 //===----------------------------------------------------------------------===//

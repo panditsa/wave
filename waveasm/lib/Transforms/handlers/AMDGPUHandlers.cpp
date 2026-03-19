@@ -353,6 +353,13 @@ LogicalResult handleAMDGPUScaledMfma(Operation *op, TranslationContext &ctx) {
 /// Static constants emit s_mov_b32; dynamic values (e.g. from arith.select
 /// for the branchless g2s guard) go through v_readfirstlane_b32 + s_add_u32
 /// (non-Pure to avoid DCE). Falls back to hardware maximum if absent.
+///
+/// TODO: Detect arith.select(arith.cmpi(scalar, scalar), scalar, scalar)
+/// and emit s_cmp + s_cselect directly to avoid the VGPR round-trip.
+/// This saves ~7 VALU ops per SRD in the loop body.  Previous attempts
+/// caused memory faults — the pattern matching is correct but something
+/// in the interaction between the new s_cselect ops and register allocation
+/// corrupts a buffer descriptor.  Needs investigation with IR dumps.
 static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
                               Operation *op, TranslationContext &ctx) {
   auto castOp = cast<amdgpu::FatRawBufferCastOp>(op);
