@@ -350,6 +350,13 @@ void TranslationContext::emitSRDPrologue() {
                                  ", 0x" + llvm::utohexstr(kSRDStrideSwizzle);
       RawOp::create(builder, loc, movStrideStr);
 
+      // Prevent DCE from removing this PrecoloredSRegOp. The SRD registers
+      // are later referenced by RawOps (e.g., s_mov_b64 for epilogue SRD
+      // copies) that don't create SSA uses. Without DCEProtect, canonicalize
+      // removes the PrecoloredSRegOp, and the register allocator doesn't
+      // reserve s[srdBase:srdBase+3], allowing it to allocate temps there.
+      DCEProtectOp::create(builder, loc, srdReg);
+
       mapper.mapValue(pending.memref, srdReg);
     }
 

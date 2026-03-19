@@ -2,7 +2,7 @@
 
 ## Summary
 
-This document captures the findings from investigating SCC (Scalar Condition Code) tracking and VGPR→SGPR promotion in the WaveASM backend. The work spans SCC infrastructure, handler-level SALU promotions, and the unresolved SRD scalar select issue.
+This document captures the findings from investigating SCC (Scalar Condition Code) tracking and VGPR→SGPR promotion in the WaveASM backend. The work spans SCC infrastructure, handler-level SALU promotions, and the SRD scalar select issue (now resolved — root cause was a register allocator bug where initial SRD precolored registers were DCE'd).
 
 ## What Was Built
 
@@ -96,25 +96,56 @@ Our code emits 7 VALU ops + v_readfirstlane because:
 
 All produce correct-looking assembly. The SCC verifier reports no hazards. Register allocation appears correct (validBytes SGPR kept alive from prologue through loop body, not clobbered by intermediates).
 
-### Why All Approaches Fail
+### Root Cause (RESOLVED)
 
-The assembly emitted by all three approaches looks correct when inspected manually:
-- SCC chain: `s_cmp → s_cselect` with nothing between them
-- SRD formation: word 0 (base lo), word 1 (base hi + flags), word 2 (num_records from s_cselect), word 3 (stride/swizzle)
-- Comparison semantics: `s_cmp_lt_i32` matches the original `v_cmp_lt_i32` predicate
-- Value selection: `s_cselect src0=validBytes, src1=0` matches the original `v_cndmask 0, validBytes, vcc`
+The assembly emitted by all three approaches was semantically correct.
+The real bug was in the register allocator's interaction with `RawOp`-based
+SRD setup:
 
-The fault address patterns suggest a corrupted buffer descriptor, but the assembly-level SRD setup appears identical to the working version (with different SGPR numbers from changed register allocation).
+**Bug chain:**
 
-## Debugging Next Steps
+1. `emitSRDPrologue` creates a `PrecoloredSRegOp` for each initial SRD
+   (e.g., arg4 output buffer at s[36:39]) and fills it via `RawOp`s
+   (`s_mov_b64`, `s_mov_b32`).
 
-The bug is invisible at the assembly level. The investigation needs:
+2. The SSA result of the `PrecoloredSRegOp` is mapped to the memref via
+   `mapper.mapValue()`. For some SRDs (data/scale buffers used inside the
+   loop), downstream SSA uses keep the value alive. For others (e.g., the
+   output buffer SRD), the only downstream references are `RawOp`s that
+   copy the physical registers directly (e.g., `s_mov_b64 s[80:81], s[36:37]`
+   in the epilogue). These `RawOp`s create no SSA uses.
 
-1. **WaveASM IR dumps after register allocation** — compare the IR between passing (v_readfirstlane) and failing (s_cselect) versions to find which SSA value got a different physical register assignment
-2. **The waveasm-translate tool supports `--mlir-print-ir-after-all`** (or the tool-specific `--print-ir` flag) — pipe stderr to a file
-3. **Diff the IR** — look for PSRegType assignments that differ, especially for SRD word 0/1 (base address) registers
+3. `CanonicalizerPass` (DCE) removes the unused `PrecoloredSRegOp`.
 
-The key hypothesis: adding new SALU ops (s_cmp, s_cselect) in the loop body changes the SGPR pressure, which shifts the linear scan allocator's register assignments. One of those shifted assignments happens to clobber a precolored SRD register that's being set up elsewhere.
+4. `LinearScanPass` walks `PrecoloredSRegOp` ops to build `reservedSGPRs`.
+   Since the op was DCE'd, s[36:39] is NOT reserved.
+
+5. The linear scan allocator freely assigns s36/s37 to loop body temp
+   values (soffset, next-K computation), **clobbering the SRD base address**.
+
+6. After the loop, the epilogue `RawOp` copies garbage from s[36:37] to
+   s[80:81], forming a corrupted buffer descriptor → GPU fault.
+
+**Why it only manifested with s_cselect:** The s_cselect change referenced
+the SGPR validBytes value inside the loop, extending its liveness from the
+prologue through the loop body. This increased SGPR pressure forced the
+linear scan allocator to reclaim s[36:39] (which it thought was free).
+In the baseline, the allocator had enough free SGPRs and happened to never
+assign anything to s[36:39].
+
+**Fix:** Add `DCEProtectOp` after each initial SRD's `PrecoloredSRegOp`
+in `emitSRDPrologue`. This prevents DCE from removing the op, so
+`LinearScanPass` always reserves the physical SRD registers.
+
+```cpp
+auto srdReg = PrecoloredSRegOp::create(builder, loc, srdType, srdBase, 4);
+// ... RawOps for s_mov_b64, s_mov_b32 ...
+DCEProtectOp::create(builder, loc, srdReg);  // prevent DCE
+```
+
+**Impact:** The fix is correct for all kernels, not just the s_cselect case.
+Any kernel where SGPR pressure pushes the allocator into the SRD register
+range would have hit this bug. The SCC/s_cselect work merely exposed it.
 
 ## V_CNDMASK_B32 Constant Bus Issue
 
@@ -131,7 +162,8 @@ Attempted to allow one SGPR in `V_CNDMASK_B32` (VOP3 constant bus allows one SGP
 | `Handlers.h` | emitOr, emitXor, emitMinI32/U32, emitMaxI32/U32, emitScalarCmp |
 | `ArithHandlers.cpp` | SALU paths for OR/XOR/Min/Max/DivUI/RemUI, V_CMP constant bus |
 | `AffineHandlers.cpp` | emitOr for non-overlapping Add |
-| `AMDGPUHandlers.cpp` | SRD scalar select TODO documentation |
+| `AMDGPUHandlers.cpp` | s_cmp + s_cselect path in emitSrdNumRecords |
+| `TranslateFromMLIR.cpp` | DCEProtect for initial SRD PrecoloredSRegOps |
 | `Passes.td` | SCC verifier pass registration |
 | `CMakeLists.txt` | SCCVerifier.cpp |
 | `compile.py` | `--waveasm-scc-verifier` in pipeline |
