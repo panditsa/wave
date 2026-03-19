@@ -137,6 +137,50 @@ public:
     return -1;
   }
 
+  /// Allocate the highest-numbered free register below ceiling.
+  int64_t allocSingleFromTop(int64_t ceiling = -1) {
+    int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
+    // Scan from cap-1 downward for the first free register.
+    for (int64_t i = cap - 1; i >= 0; --i) {
+      if (free.test(i)) {
+        free.reset(i);
+        ++currentUsage;
+        updatePeak();
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /// Allocate a contiguous range from the top of a capped region.
+  /// Scans from `ceiling` downward to pack long-lived values at the top
+  /// of the USED range, not the top of the entire register file.
+  int64_t allocRangeFromTop(int64_t size, int64_t alignment,
+                            int64_t ceiling = -1) {
+    if (size <= 0)
+      return -1;
+
+    int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
+    int64_t highestBase = ((cap - size) / alignment) * alignment;
+    for (int64_t c = highestBase; c >= 0; c -= alignment) {
+      bool allFree = true;
+      for (int64_t o = 0; o < size; ++o) {
+        if (!free.test(c + o)) {
+          allFree = false;
+          break;
+        }
+      }
+      if (allFree) {
+        for (int64_t o = 0; o < size; ++o)
+          free.reset(c + o);
+        currentUsage += size;
+        updatePeak();
+        return c;
+      }
+    }
+    return -1;
+  }
+
   /// Free a single register back to the pool.
   void freeSingle(int64_t reg) {
     if (reg < 0 || reg >= maxRegs || free.test(reg))

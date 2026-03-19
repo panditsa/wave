@@ -32,6 +32,7 @@ add_mlir_dialect_library(MLIRWaveASMTransforms
   SCCVerifier.cpp
   ScopedCSE.cpp
   Ticketing.cpp
+  VGPRCompaction.cpp
   TranslateFromMLIR.cpp
   ${HANDLERS_FULL_PATHS}
 
