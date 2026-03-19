@@ -624,7 +624,7 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   auto *mlirCtx = builder.getContext();
 
   int64_t N = ctx.getNextSwizzleSRDIndex();
-  assert(N + 4 < 108 && "SRD allocation exceeds SGPR limit");
+  assert(N + 4 <= 102 && "SRD allocation exceeds SGPR limit (s0-s101)");
 
   // Copy source SRD base to new SRD.
   // Must use RawOp: S_MOV_B64 is Pure (SALUUnaryOp) and writes to a
@@ -646,13 +646,15 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   }
 
   // 64-bit byte offset = element_offset * elementBytes.
-  // byteOffHi -> s[N+2], byteOffLo -> s[N+4] (dedicated temp).
-  // Using s[N+4] for byteOffLo avoids aliasing with offsetVal at s[N+3],
-  // which would corrupt the high-half multiply if reordered.
+  // byteOffHi -> s[N+2], byteOffLo -> s[N+3] (reuses offsetVal's register).
+  // mulhi must be emitted first so it reads offsetVal before mullo
+  // overwrites s[N+3].  AMDGCN scalar ALU reads the source before writing
+  // the destination within a single instruction, so the mullo is safe even
+  // when src and dst are the same register.
   auto elemSizeImm = ConstantOp::create(
       builder, loc, ctx.createImmType(adj.elementBytes), adj.elementBytes);
   auto hiType = PSRegType::get(mlirCtx, N + 2, 1);
-  auto loType = PSRegType::get(mlirCtx, N + 4, 1);
+  auto loType = PSRegType::get(mlirCtx, N + 3, 1);
   auto byteOffHi =
       S_MUL_HI_I32::create(builder, loc, hiType, offsetVal, elemSizeImm);
   auto byteOffLo =
