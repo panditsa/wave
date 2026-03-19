@@ -452,10 +452,10 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
   }
 
   // When both operands are scalar AND the result feeds a ConditionOp (loop
-  // back-edge), use S_CMP which writes SCC directly.  The assembly emitter
-  // emits s_cbranch_scc1 that reads SCC.  S_CSELECT(1,0) materializes
-  // the boolean in SGPR so downstream ops that use the cmpi result (e.g.
-  // via arith.extui) get a scalar value.
+  // back-edge), use S_CMP which writes SCC directly. ConditionOp reads SCC
+  // via s_cbranch_scc1.
+  // For other scalar consumers (arith.select), the fusion happens in
+  // handleArithSelect which emits s_cmp + s_cselect as a pair.
   bool lhsScalar = isSGPRType(lhs->getType()) || isImmType(lhs->getType());
   bool rhsScalar = isSGPRType(rhs->getType()) || isImmType(rhs->getType());
   bool usedByCondition = cmpOp.getResult().hasOneUse() &&
@@ -532,6 +532,36 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
 
   if (!cond || !trueVal || !falseVal) {
     return op->emitError("operands not mapped");
+  }
+
+  // CmpI fusion: when condition is arith.cmpi with scalar operands and
+  // both select values are scalar, emit s_cmp + s_cselect directly.
+  // This bypasses the VGPR boolean from handleArithCmpI entirely.
+  if (isScalarOrImm(*trueVal) && isScalarOrImm(*falseVal)) {
+    Value condMLIR = selectOp.getCondition();
+    if (auto cmpOp = condMLIR.getDefiningOp<arith::CmpIOp>()) {
+      auto cmpLhs = ctx.getMapper().getMapped(cmpOp.getLhs());
+      auto cmpRhs = ctx.getMapper().getMapped(cmpOp.getRhs());
+      if (cmpLhs && cmpRhs &&
+          isScalarOrImm(*cmpLhs) && isScalarOrImm(*cmpRhs)) {
+        auto sregType = ctx.createSRegType();
+        Value lhsOp = *cmpLhs;
+        Value rhsOp = *cmpRhs;
+        if (isImmType(lhsOp.getType()))
+          lhsOp = S_MOV_B32::create(builder, loc, sregType, lhsOp);
+        if (isImmType(rhsOp.getType()))
+          rhsOp = S_MOV_B32::create(builder, loc, sregType, rhsOp);
+        emitScalarCmp(builder, loc, cmpOp.getPredicate(), lhsOp, rhsOp, ctx);
+        Value trueV = *trueVal;
+        Value falseV = *falseVal;
+        if (isImmType(trueV.getType()))
+          trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
+        auto result =
+            S_CSELECT_B32::create(builder, loc, sregType, trueV, falseV);
+        ctx.getMapper().mapValue(selectOp.getResult(), result);
+        return success();
+      }
+    }
   }
 
   // Scalar path: when condition and both values are scalar, use
