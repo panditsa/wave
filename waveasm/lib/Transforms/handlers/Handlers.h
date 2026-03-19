@@ -436,6 +436,68 @@ inline mlir::Value emitMulHi(mlir::Value a, mlir::Value b,
   return V_MUL_HI_U32::create(builder, loc, vregType, a, b);
 }
 
+/// Emit signed max: S_MAX_I32 when both scalar, V_MAX_I32 otherwise.
+/// Not commutative for SCC semantics (SCC = src0 was selected) but
+/// the result value is commutative.
+inline mlir::Value emitMaxI32(mlir::Value a, mlir::Value b,
+                              mlir::OpBuilder &builder, mlir::Location loc,
+                              TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_MAX_I32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_MAX_I32::create(builder, loc, vregType, a, b);
+}
+
+/// Emit signed min: S_MIN_I32 when both scalar, V_MIN_I32 otherwise.
+inline mlir::Value emitMinI32(mlir::Value a, mlir::Value b,
+                              mlir::OpBuilder &builder, mlir::Location loc,
+                              TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_MIN_I32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_MIN_I32::create(builder, loc, vregType, a, b);
+}
+
+/// Emit unsigned max: S_MAX_U32 when both scalar, V_MAX_U32 otherwise.
+inline mlir::Value emitMaxU32(mlir::Value a, mlir::Value b,
+                              mlir::OpBuilder &builder, mlir::Location loc,
+                              TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_MAX_U32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_MAX_U32::create(builder, loc, vregType, a, b);
+}
+
+/// Emit unsigned min: S_MIN_U32 when both scalar, V_MIN_U32 otherwise.
+inline mlir::Value emitMinU32(mlir::Value a, mlir::Value b,
+                              mlir::OpBuilder &builder, mlir::Location loc,
+                              TranslationContext &ctx) {
+  if (isScalarOrImm(a) && isScalarOrImm(b) &&
+      !(isImmType(a.getType()) && isImmType(b.getType()))) {
+    if (isImmType(a.getType()))
+      std::swap(a, b);
+    auto sregType = ctx.createSRegType();
+    return S_MIN_U32::create(builder, loc, sregType, a, b);
+  }
+  auto vregType = ctx.createVRegType();
+  return V_MIN_U32::create(builder, loc, vregType, a, b);
+}
+
 //===----------------------------------------------------------------------===//
 // Error Handling Helpers
 //===----------------------------------------------------------------------===//
