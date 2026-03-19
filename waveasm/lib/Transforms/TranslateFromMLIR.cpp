@@ -624,7 +624,7 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   auto *mlirCtx = builder.getContext();
 
   int64_t N = ctx.getNextSwizzleSRDIndex();
-  assert(N + 4 < 108 && "SRD allocation exceeds SGPR limit");
+  assert(N + 4 <= 102 && "SRD allocation exceeds SGPR limit (s0-s101)");
 
   // Copy source SRD base to new SRD.
   // Must use RawOp: S_MOV_B64 is Pure (SALUUnaryOp) and writes to a

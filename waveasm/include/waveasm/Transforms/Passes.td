@@ -38,8 +38,8 @@ def WAVEASMLinearScan : Pass<"waveasm-linear-scan"> {
   let options = [
     Option<"maxVGPRs", "max-vgprs", "int64_t", "256",
            "Maximum VGPRs available">,
-    Option<"maxSGPRs", "max-sgprs", "int64_t", "104",
-           "Maximum SGPRs available">,
+    Option<"maxSGPRs", "max-sgprs", "int64_t", "102",
+           "Maximum user-addressable SGPRs (s0-s101 on GFX9+)">,
     Option<"maxAGPRs", "max-agprs", "int64_t", "256",
            "Maximum AGPRs available">
   ];
