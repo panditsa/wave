@@ -213,6 +213,7 @@ class WaveASMCompiler:
             "--waveasm-loop-address-promotion",
             "--waveasm-scc-verifier",  # Verify no SCC hazards before regalloc.
             "--waveasm-linear-scan=max-vgprs=512 max-agprs=512",  # Register allocation.
+            "--waveasm-vgpr-compaction",  # Compact VGPR assignments.
             f"--waveasm-insert-waitcnt=ticketed-waitcnt={ticketed}",  # Insert waits.
             f"--waveasm-hazard-mitigation=target={self.target}",  # Handle hazards.
             "--emit-assembly",
