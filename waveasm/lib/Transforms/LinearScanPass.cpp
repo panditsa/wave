@@ -78,20 +78,52 @@ static Type makePhysicalType(MLIRContext *ctx, Type virtualType,
 // Rematerialization
 //===----------------------------------------------------------------------===//
 
+/// Return true when \p op sits inside a LoopOp body at any nesting depth.
+static bool isInsideLoopBody(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
+    if (isa<LoopOp>(p))
+      return true;
+  }
+  return false;
+}
+
 /// Check if an operation can be cheaply rematerialized (cloned near each
-/// use to shorten its live range). Targets V_MOV_B32 with immediate-only
-/// operands — 1-cycle scalar moves common in accumulator zero-initialization.
+/// use to shorten its live range).
+///
+/// Accepted patterns:
+///   - V_MOV_B32 with immediate operands  (accumulator zero-init)
+///   - V_MOV_B32 with SGPR source         (scalar-to-vector address copy)
+///   - S_MOV_B32 with immediate operands  (scalar constant materialisation)
 static bool isRematerializableOp(Operation *op) {
-  if (!isa<V_MOV_B32>(op))
-    return false;
   if (op->getNumResults() != 1)
     return false;
-  for (Value operand : op->getOperands()) {
-    auto *defOp = operand.getDefiningOp();
-    if (!defOp || !isa<ConstantOp>(defOp))
+
+  if (isa<V_MOV_B32>(op)) {
+    for (Value operand : op->getOperands()) {
+      auto *defOp = operand.getDefiningOp();
+      if (!defOp)
+        return false;
+      if (isa<ConstantOp>(defOp))
+        continue;
+      // SGPR source: the scalar value dominates the original def, so it
+      // also dominates every use site where we might place a clone.
+      if (isSGPRType(operand.getType()))
+        continue;
       return false;
+    }
+    return true;
   }
-  return true;
+
+  if (isa<S_MOV_B32>(op)) {
+    for (Value operand : op->getOperands()) {
+      auto *defOp = operand.getDefiningOp();
+      if (!defOp || !isa<ConstantOp>(defOp))
+        return false;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 /// Rematerialize cheap-to-compute VGPR values by cloning their defining ops
@@ -113,7 +145,8 @@ static void rematerializeCheapOps(ProgramOp program) {
     if (!isRematerializableOp(op))
       return;
     Value result = op->getResult(0);
-    if (!isVGPRType(result.getType()))
+    // Accept both VGPR and SGPR results (V_MOV_B32 -> VGPR, S_MOV_B32 -> SGPR).
+    if (!isVGPRType(result.getType()) && !isSGPRType(result.getType()))
       return;
     const LiveRange *range = liveness.getRange(result);
     if (!range || range->length() <= kMinRematRangeLength)
@@ -123,6 +156,8 @@ static void rematerializeCheapOps(ProgramOp program) {
 
   for (Operation *op : candidates) {
     Value result = op->getResult(0);
+    bool defOutsideLoop = !isInsideLoopBody(op);
+    bool isVGPR = isVGPRType(result.getType());
 
     llvm::SmallVector<OpOperand *> uses;
     for (OpOperand &use : result.getUses())
@@ -137,6 +172,16 @@ static void rematerializeCheapOps(ProgramOp program) {
 
     for (OpOperand *use : uses) {
       Operation *user = use->getOwner();
+
+      // Preserve VALU-free loop bodies: when a VGPR-producing op is defined
+      // outside a loop but a use is inside, skip that use.  The value's live
+      // range already spans the entire loop body (Pass 2b extends it), so
+      // cloning inside wouldn't reduce in-loop pressure — it would only add
+      // a VALU instruction to the critical loop path.
+      // SALU ops (S_MOV_B32) don't use the VALU pipeline, so they're fine.
+      if (defOutsideLoop && isVGPR && isInsideLoopBody(user))
+        continue;
+
       auto it = cloneCache.find(user);
       if (it != cloneCache.end()) {
         use->set(it->second);
