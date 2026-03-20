@@ -226,7 +226,7 @@ def _find_mergeable_groups(
     by_init_src = defaultdict(list)
     for entry in eligible:
         _, _, init_src, _ = entry
-        by_init_src[id(init_src.owner)].append(entry)
+        by_init_src[hash(init_src.owner)].append(entry)
 
     result = []
     for entries in by_init_src.values():
@@ -251,7 +251,7 @@ def _find_mergeable_groups(
                 init_source = isrc
                 if ysrc is not None:
                     yield_source = ysrc
-                    yield_owners.add(id(ysrc.owner))
+                    yield_owners.add(hash(ysrc.owner))
                 else:
                     has_untraceable_yield = True
             if has_untraceable_yield:
