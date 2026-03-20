@@ -213,7 +213,19 @@ def _find_mergeable_groups(
         if yield_info is not None:
             yield_src, yield_off = yield_info
             if init_off != yield_off:
-                continue
+                # Init and yield extract different bytes from their respective
+                # dword loads.  This happens when the pipeliner shifts the LDS
+                # address by one scale element between init and yield (e.g.
+                # init loads at addr X and extracts byte 1, yield loads at
+                # addr X+1 and extracts byte 0 — same physical byte).
+                # Mark yield as untraceable so the coalescer constructs the
+                # yield vector from the yield source's parent vector<4xi8>.
+                yield_src = None
+                logger.debug(
+                    f"iter_arg {i}: init offset {init_off} != yield offset "
+                    f"{yield_off} — treating yield as untraceable for "
+                    f"dword coalescing"
+                )
         else:
             yield_src = None
             logger.debug(
@@ -410,6 +422,25 @@ def _coalesce_vector_iter_args(module: Module) -> None:
         for g_idx, (init_source, yield_source, members) in enumerate(groups):
             if yield_source is not None:
                 continue
+
+            # Try to find a yield value whose source vector<4xi8> already
+            # exists (from an extract_strided_slice of a wider load).
+            # This handles the address-shifted pattern where init and yield
+            # extract different offsets from their respective dword loads.
+            any_member_idx = next(iter(members.values()))
+            any_yield = old_yield_operands[any_member_idx]
+            any_yield_info = _trace_extract_strided_slice(any_yield)
+            if any_yield_info is not None:
+                # The yield value is an extract from a vector<4xi8> — use
+                # the source vector directly as the merged yield value.
+                yield_vec_src, _ = any_yield_info
+                groups[g_idx] = (init_source, yield_vec_src, members)
+                logger.debug(
+                    f"Group {g_idx}: reusing existing vector<4xi8> yield "
+                    f"source (offset-shifted pattern)"
+                )
+                continue
+
             if 0 not in members:
                 logger.debug(
                     f"Group {g_idx}: no byte-0 member, cannot determine base "
