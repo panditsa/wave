@@ -650,6 +650,11 @@ LivenessInfo computeLiveness(ProgramOp program) {
   info.maxSRegPressure = computeMaxPressure(info.sregRanges, info.tiedClasses);
   info.maxARegPressure = computeMaxPressure(info.aregRanges, info.tiedClasses);
 
+  // Dump detailed pressure breakdown for debugging.
+  dumpPeakPressureInfo(info, ops, RegClass::VGPR);
+  dumpPeakPressureInfo(info, ops, RegClass::SGPR);
+  dumpPeakPressureInfo(info, ops, RegClass::AGPR);
+
   return info;
 }
 
