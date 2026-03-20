@@ -518,25 +518,26 @@ def _affine_base_key(op) -> Optional[tuple]:
     """
     if not _is_op_named(op, "affine.apply"):
         return None
-    operand_ids = tuple(id(v) for v in op.operands)
+    operand_hashes = tuple(hash(v) for v in op.operands)
     import re
 
     map_str = str(op.attributes["map"])
     m = re.search(r"\+\s*\d+\)\s*>\s*$", map_str)
     if m:
-        base_map = map_str[: m.start()] + ")>"
+        base_map = map_str[: m.start()].rstrip() + ")>"
     else:
         base_map = map_str
-    return (base_map, operand_ids)
+    return (base_map, operand_hashes)
 
 
 def _merge_scale_byte_loads(module: Module) -> None:
-    """Merge adjacent vector<1xi8> LDS loads into vector<4xi8> + extract.
+    """Merge adjacent vector<1/2xi8> LDS loads into vector<4xi8> + extract.
 
     Handles the unrolled-iteration pattern where sub-word scale loads
     aren't loop-carried and thus not covered by _coalesce_vector_iter_args.
-    Only merges vector<1xi8> loads to guarantee every extract from the
-    wide load has size 1, which _trace_scale_chain requires for opsel.
+    For vector<2xi8> loads, replaces downstream extract_strided_slice(size=1)
+    users with direct byte extracts from the wide vector<4xi8>, so that
+    _trace_scale_chain sees the correct source type for opsel.
     """
     i8 = IntegerType.get_signless(8)
     i64 = IntegerType.get_signless(64)
@@ -549,7 +550,7 @@ def _merge_scale_byte_loads(module: Module) -> None:
         rtype = op.results[0].type
         if not isinstance(rtype, VectorType) or rtype.element_type != i8:
             continue
-        if rtype.shape[0] != 1:
+        if rtype.shape[0] > 2:
             continue
         view = op.opview
         addr = view.indices[-1]
@@ -560,21 +561,14 @@ def _merge_scale_byte_loads(module: Module) -> None:
     if not byte_loads:
         return
 
-    def _memref_key(base_value: Value):
-        """Stable grouping key for a memref Value across opview accesses."""
-        owner = base_value.owner
-        if isinstance(owner, Block):
-            return (id(owner), base_value.arg_number)
-        return id(owner)
-
     def _full_group_key(op: Operation):
         """Group by memref, all non-last indices, AND the affine base expr."""
         view = op.opview
-        memref_k = _memref_key(view.base)
-        prefix_indices = tuple(id(v) for v in list(view.indices)[:-1])
+        memref_h = hash(view.base)
+        prefix_hashes = tuple(hash(v) for v in list(view.indices)[:-1])
         addr = view.indices[-1]
         base_k = _affine_base_key(addr.owner)
-        return (memref_k, prefix_indices, base_k)
+        return (memref_h, prefix_hashes, base_k)
 
     by_group: dict = defaultdict(list)
     for op in byte_loads:
@@ -617,18 +611,59 @@ def _merge_scale_byte_loads(module: Module) -> None:
             if id(load_op) not in addr_to_offset:
                 continue
             off = addr_to_offset[id(load_op)]
-            if off + 1 > SCALE_VECTOR_WIDTH:
+            rtype = load_op.results[0].type
+            n = rtype.shape[0]
+            if off + n > SCALE_VECTOR_WIDTH:
                 continue
-            with InsertionPoint(load_op):
-                offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
-                sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                ext = vector_d.ExtractStridedSliceOp(
-                    v1xi8, wide, offsets, sizes, strides
-                )
-            load_op.results[0].replace_all_uses_with(ext.result)
-            load_op.erase()
-            replaced += 1
+
+            if n == 1:
+                with InsertionPoint(load_op):
+                    offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
+                    sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                    strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                    ext = vector_d.ExtractStridedSliceOp(
+                        v1xi8, wide, offsets, sizes, strides
+                    )
+                load_op.results[0].replace_all_uses_with(ext.result)
+                load_op.erase()
+                replaced += 1
+            else:
+                ess_users = []
+                for use in list(load_op.results[0].uses):
+                    user_op = use.owner
+                    if (
+                        _is_op_named(user_op, "vector.extract_strided_slice")
+                        and IntegerAttr(user_op.opview.sizes[0]).value == 1
+                    ):
+                        inner_off = IntegerAttr(user_op.opview.offsets[0]).value
+                        byte_off = off + inner_off
+                        if byte_off < SCALE_VECTOR_WIDTH:
+                            ess_users.append((user_op, byte_off))
+
+                for user_op, byte_off in ess_users:
+                    with InsertionPoint(user_op):
+                        offsets = ArrayAttr.get([IntegerAttr.get(i64, byte_off)])
+                        sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                        strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                        ext = vector_d.ExtractStridedSliceOp(
+                            v1xi8, wide, offsets, sizes, strides
+                        )
+                    user_op.results[0].replace_all_uses_with(ext.result)
+                    user_op.erase()
+
+                has_remaining = any(True for _ in load_op.results[0].uses)
+                if has_remaining:
+                    with InsertionPoint(load_op):
+                        offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
+                        sizes = ArrayAttr.get([IntegerAttr.get(i64, n)])
+                        strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                        fallback = vector_d.ExtractStridedSliceOp(
+                            rtype, wide, offsets, sizes, strides
+                        )
+                    load_op.results[0].replace_all_uses_with(fallback.result)
+
+                load_op.erase()
+                replaced += 1
 
         if replaced:
             logger.debug(
@@ -650,6 +685,7 @@ def apply_opsel_scaled_mfma(module: Module):
 
     with mlir_ctx, Location.unknown():
         _coalesce_vector_iter_args(module)
+        _merge_scale_byte_loads(module)
 
         f8e8m0 = Float8E8M0FNUType.get()
 
