@@ -1320,10 +1320,6 @@ def _generate_asm_code(mb, options):
         mlir_file.write(kernel_mlir)
         mlir_path = mlir_file.name
 
-    # Debug: save a copy of the MLIR input to waveasm-translate
-    import shutil
-    shutil.copy(mlir_path, "/tmp/waveasm_input.mlir")
-
     try:
         base_passes = [
             "--mlir-cse",
@@ -1347,10 +1343,7 @@ def _generate_asm_code(mb, options):
         threads_per_wave = 64
         waves_in_m = wg[0] // threads_per_wave
         waves_in_n = wg[1]
-        # TODO: improve Ticketing logic (better latency-covering heuristics,
-        # smarter coalescing) so ticketed waitcnt can be always-on without
-        # a performance hit, removing this wave-shape conditional.
-        use_ticketed_waitcnt = False 
+        use_ticketed_waitcnt = waves_in_m >= 2 and waves_in_n >= 2
         waitcnt_flag = (
             "--waveasm-insert-waitcnt"
             if use_ticketed_waitcnt

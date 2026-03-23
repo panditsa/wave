@@ -261,7 +261,7 @@ def WAVEASMSCCVerifier : Pass<"waveasm-scc-verifier"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Memory Offset Optimization Pass
+// VGPR Compaction Pass
 //===----------------------------------------------------------------------===//
 
 def WAVEASMVGPRCompaction : Pass<"waveasm-vgpr-compaction"> {
