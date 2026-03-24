@@ -862,6 +862,123 @@ def _emit_cycle_offset(
     return arith_d.addi(macro_term, cum_offset, overflow_flags=overflow_flags)
 
 
+_THREAD_SYMS = frozenset({THREAD_0, THREAD_1, THREAD_2})
+
+
+def _linearize_mapping_first(
+    index: dict,
+    sym_strides: list,
+    iv_sym,
+    div_fwd: dict | None,
+    div_bwd: dict | None,
+) -> sympy.Expr | None:
+    """Linearize the address by cancelling floor/Mod at the mapping level.
+
+    Instead of linearizing the post-substitution dimension expressions
+    (where ``floor(within_nblk / K_PACKED)`` survives because K_PACKED
+    is dynamic), we reconstruct the linearized form from the raw
+    ``IndexSequence`` starts and strides.  Applying ``linearize_dims``
+    to the dimension expressions before per-read constants are baked in
+    lets the ``floor(X/D)*D + Mod(X,D) → X`` identity fire.
+
+    Returns the simplified linearized sympy expression with iv=0, or
+    ``None`` if the approach can't be applied.
+    """
+    start_exprs = _get_start_indices(index)
+
+    # Zero out the IV for the base computation.
+    base_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
+
+    # Apply divisibility subs so K/2 == floor(K/2).
+    if div_fwd:
+        base_exprs = [safe_subs(e, div_fwd) for e in base_exprs]
+        lin_strides = [safe_subs(s, div_fwd) for s in sym_strides]
+    else:
+        lin_strides = list(sym_strides)
+
+    lin_sym = linearize_dims(base_exprs, lin_strides)
+
+    # Keep in div_fwd form — caller applies div_bwd to the delta only.
+    return lin_sym
+
+
+def _try_reuse_hoisted_base(
+    emitter: "WaveEmitter",
+    scf_for_op,
+    lin_sym: sympy.Expr,
+    subs_map: dict,
+    hoist_ip,
+    overflow_flags,
+    base_start_exprs: list,
+    sym_strides: list,
+    div_bwd: dict | None = None,
+) -> Value:
+    """Try to reuse a previously hoisted voffset base for *lin_sym*.
+
+    Returns the MLIR ``Value`` for the linearised base offset — either
+    reused from cache (``cached_base + thread-independent delta``) or
+    freshly emitted and cached for subsequent reads.
+    """
+    cache = getattr(emitter, "_hoisted_voffset_cache", None)
+    if cache is None:
+        cache = {}
+        emitter._hoisted_voffset_cache = cache
+
+    # Key by (loop identity, strides) so only reads from the same
+    # buffer shape are compared.  Different buffers (A-data vs B-data)
+    # have different strides and completely different thread structures.
+    cache_key = (hash(scf_for_op), tuple(sym_strides))
+    cached_entries = cache.get(cache_key, [])
+
+    # Try each cached reference to find one whose delta is
+    # thread-independent (i.e. all lanes compute the same offset
+    # difference, so the delta can live in SGPR / instOffset).
+    for ref_sym, ref_mlir in cached_entries:
+        # Both lin_sym and ref_sym are in div_fwd form (e.g.
+        # K → 256*_K_div_256), so floor(K/2) = 128*_K_div_256 matches
+        # the stride K/2 = 128*_K_div_256.  The delta between reads
+        # with different expansion indices should be thread-independent.
+        delta_simplified = simplify(mem_simplify(lin_sym - ref_sym))
+
+        # After simplification, check if any per-lane thread symbols
+        # remain.  If the delta is free of T0/T1/T2, it is uniform
+        # across all lanes and can live in SGPR or as a constant.
+        if delta_simplified.free_symbols & _THREAD_SYMS:
+            continue
+
+        # Reverse divisibility subs before emission so that
+        # gen_sympy_index sees the original dimension symbols.
+        if div_bwd:
+            delta_simplified = safe_subs(delta_simplified, div_bwd)
+
+        if delta_simplified == 0:
+            return ref_mlir
+
+        with hoist_ip:
+            delta_val = gen_sympy_index(subs_map, delta_simplified)
+            return arith_d.addi(
+                ref_mlir, delta_val, overflow_flags=overflow_flags
+            )
+
+    # No reusable reference found — emit the full chain and cache it.
+    with hoist_ip:
+        lin_offset = None
+        for base_expr, stride in zip(base_start_exprs, sym_strides):
+            val = gen_sympy_index(subs_map, base_expr)
+            stride_val = gen_sympy_index(subs_map, stride)
+            term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
+            lin_offset = (
+                term
+                if lin_offset is None
+                else arith_d.addi(
+                    lin_offset, term, overflow_flags=overflow_flags
+                )
+            )
+
+    cache.setdefault(cache_key, []).append((lin_sym, lin_offset))
+    return lin_offset
+
+
 def _try_iv_split_offset(
     emitter: WaveEmitter,
     index: dict[IndexExpr, IndexSequence | IndexExpr],
@@ -932,19 +1049,25 @@ def _try_iv_split_offset(
         subs_map = add_emitter_subs(emitter, dynamic_vals)
         overflow_flags = arith_d.IntegerOverflowFlags.nsw
 
-        with hoist_ip:
-            lin_offset = None
-            for base_expr, stride in zip(base_start_exprs, sym_strides):
-                val = gen_sympy_index(subs_map, base_expr)
-                stride_val = gen_sympy_index(subs_map, stride)
-                term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
-                lin_offset = (
-                    term
-                    if lin_offset is None
-                    else arith_d.addi(
-                        lin_offset, term, overflow_flags=overflow_flags
-                    )
-                )
+        # ---- Voffset sharing: linearize-first, substitute-second ----
+        # Linearize the mapping's dimension expressions with the memory
+        # strides BEFORE substituting per-read iterator values.  This
+        # lets floor(X/D)*D + Mod(X,D) → X cancel at the mapping level
+        # (where X = within_nblk, D = K_PACKED), producing a clean
+        # linearized form.  Then per-read iterator substitution only
+        # introduces simple additive offsets, not nested floor/Mod.
+        #
+        # Apply divisibility subs so K/2 matches floor(K/2).
+        div_fwd, div_bwd = get_divisibility_subs(emitter.constraints)
+
+        lin_sym = _linearize_mapping_first(
+            index, sym_strides, iv_sym, div_fwd, div_bwd,
+        )
+
+        lin_offset = _try_reuse_hoisted_base(
+            emitter, owner, lin_sym, subs_map, hoist_ip, overflow_flags,
+            base_start_exprs, sym_strides, div_bwd,
+        )
 
         iv_mlir = subs_map.get(iv_sym)
         if iv_mlir is None:

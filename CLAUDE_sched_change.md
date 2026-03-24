@@ -106,13 +106,45 @@ The shared Piecewise subexpression generates ~30 VALU ops (v_cndmask, v_and, v_l
 
 **Approach B: Batch CSE in emitter pre-pass** — Collect all global read nodes in `_emit_graph`, apply `sympy.cse()` on all their start indices at once, store replacements + reduced expressions as node metadata, emit replacements once in `handle_read`. Issue: the CSE replacement values are emitted in the deep prologue, extending their live ranges into the loop body, actually INCREASING pressure.
 
-**Approach C (recommended): CSE within BufferLoadStrengthReduction** — After `cloneChainBeforeLoop` creates precomputed voffsets, run MLIR-level CSE on the cloned chains. Since the clones are right before the loop (not deep in the prologue), their live ranges are short. Structurally identical chains (same ops, same operands) get merged to shared values. This is a C++ change in the WaveASM backend.
+**Approach C: CSE within BufferLoadStrengthReduction (committed, partially effective)** — Added `localCSERange()` after `cloneChainBeforeLoop` to merge structurally identical cloned chains, plus `decomposeVoffset()` to strip both constants (→ instOffset) and SGPR addends (→ per-load `s_add_u32(group_soff, sgpr_delta)`). **Works correctly for synthetic tests** where chains are truly identical, but the real GEMM kernel has chains that are **genuinely structurally different** at the WaveASM level. Each read's preshuffle mapping formula bakes per-read constants (n_idx, k_idx) into intermediate `v_mul_lo_u32` / `v_sub_u32` ops deep in the tree, so the resulting VALU chains are not CSE-able — different operands at every level, not just at the final `V_ADD_U32`. Confirmed via debug output: 50 candidates → 50 unique voffsets after CSE, 24-member groups with 23 mismatches.
 
-**Approach D (alternative): Restructure gen_sympy_index to emit shared subexpressions lazily** — Instead of caching at the full-expression level, modify `gen_sympy_index` to accept a shared expression context. Before emitting a read's offset, decompose the sympy expression into `shared_base + per_read_delta` at the Python level, emit `shared_base` once (hoisted), and emit `per_read_delta` as a simple constant addition. The key is to do the decomposition at the sympy level where the shared structure is visible, then pass the decomposed parts to the MLIR emitter. The shared base should be hoisted to a point that dominates all reads but is close to them (not deep in the prologue) to minimize live range extension.
+**Approach D (root fix, required): Factor expressions at sympy/Python level before MLIR emission** — The per-read constants must be separated from thread-dependent terms BEFORE `gen_sympy_index` emits MLIR. Use probing: substitute concrete values for thread symbols (THREAD_0/1/2), evaluate the linearized address for each read, and observe that all reads sharing the same `(k_idx)` produce `shared_thread_function + per_read_constant_offset`. Emit `shared_thread_function` once via `gen_sympy_index`, then each read's voffset is `shared_base + constant_delta` (simple `arith.addi`). This makes the WaveASM chains structurally identical (shared base), and the existing BufferLoadSR CSE + constant-stripping + SGPR-splitting then works.
 
-### Key constraint
+**How probing works**: For a linearized address expression `f(T0, WG0, WG1, n_idx, k_idx)`:
+1. Pick reference read (n_idx=0, k_idx=0), get its base_expr (with iv=0).
+2. For each other read, compute `delta = other_base_expr - reference_base_expr`.
+3. `delta` should be free of THREAD_0/1/2 (thread-independent constant offset). Verify by checking `delta.free_symbols ∩ {THREAD_0, THREAD_1, THREAD_2} == ∅`.
+4. Emit `gen_sympy_index(reference_base_expr)` once as the shared VGPR base.
+5. Emit each delta as `gen_sympy_index(delta)` — which will be SGPR or constant since it has no thread symbols.
+6. Each read's voffset = `arith.addi(shared_base, delta_val)`.
 
-The CSE must NOT extend live ranges of shared values across the entire kernel. The shared subexpressions should be emitted at the latest dominating point — right before the first read that uses them, not at the top of the function. This requires careful insertion point management.
+This reduces N unique VALU chains to 1 shared chain + N-1 simple additions.
+
+### Current state of Approach D (committed, 256 → 252 VGPRs)
+
+**Python-level** (`read_write.py`):
+- `_linearize_mapping_first()`: Applies divisibility subs (`K → 256*_K_div_256`) so `K/2 = floor(K/2) = 128*_K_div_256`, then linearizes with `linearize_dims` which cancels `floor(within_nblk/K_PACKED)*K_PACKED + Mod(within_nblk,K_PACKED) → within_nblk`. The linearized base becomes `(n_it//16)*16*K_PACKED + within_nblk` — no K_PACKED floor/Mod.
+- `_try_reuse_hoisted_base()`: Caches the first read's linearized base (per loop × stride group). For subsequent reads, computes `delta = simplify(mem_simplify(lin_sym - ref_sym))`. If delta is free of THREAD symbols, emits `arith.addi(cached_base, gen_sympy_index(delta))` instead of the full chain.
+- **27 out of 28 B-data reads reuse the cached base**. Deltas are clean: `2048*_K_div_256` (N-tile offset × K_PACKED), `1024` (K-half constant). One read is the reference (cached).
+
+**C++ level** (`BufferLoadStrengthReduction.cpp`):
+- `localCSERange()`: CSEs cloned pre-loop chains.
+- `decomposeVoffset()`: Strips constants (→ instOffset) and single-level SGPR addends (→ per-load soffset).
+- `_combineSGPRParts()`: Pre-combines multiple SGPR parts before the loop, skipping provably-zero values (s_mov_b32(0), s_mul_i32(0, x)).
+
+**C++ level** (`Utils.h`):
+- `getConstantValue()`: Now handles `S_MOV_B32(ConstantOp)` in addition to `V_MOV_B32(ConstantOp)`.
+
+**Result**: 256 → 252 VGPRs. All B-data reads share a single VGPR base at the MLIR level. The remaining gap: after `cloneChainBeforeLoop`, each precomputed voffset is `V_ADD_U32(V_ADD_U32(shared_base, sgpr_delta_N), s_mul_i32(ivInit, stride))`. Single-level `decomposeVoffset` strips the outer SGPR (iv-init term, same for all reads), leaving `V_ADD_U32(shared_base, sgpr_delta_N)` as vgprBase — still different per read.
+
+### Remaining blocker: multi-level SGPR splitting → SGPR allocation failure
+
+Multi-level `decomposeVoffset` (stripping both iv-init and delta SGPRs to reach shared_base) is **mathematically correct** but causes "Failed to allocate SGPR" in the linear scan allocator. The pattern: 12 unique per-load `s_add_u32(group_soff, combined_delta)` in the loop body creates too many simultaneously-live SGPR values. Peak SGPR pressure rises to 87 (under the 102 limit), but the allocator fails — likely due to live range fragmentation from the interleaved `s_add_u32` ops across the loop body.
+
+**Fix paths**:
+1. **Schedule per-load `s_add_u32` right before their consuming buffer_load** to minimize SGPR live range overlap (currently done but loads are spread across the loop)
+2. **Improve SGPR allocator** to handle the pattern of many short-lived SGPRs
+3. **Reduce unique deltas** — some deltas are identical across reads (e.g., k_idx=0 reads at same n_idx share delta=0); cache dedup of `s_add_u32` results is implemented but insufficient
 
 ## Reproducing
 
