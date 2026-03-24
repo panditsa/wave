@@ -128,23 +128,37 @@ This reduces N unique VALU chains to 1 shared chain + N-1 simple additions.
 - **27 out of 28 B-data reads reuse the cached base**. Deltas are clean: `2048*_K_div_256` (N-tile offset × K_PACKED), `1024` (K-half constant). One read is the reference (cached).
 
 **C++ level** (`BufferLoadStrengthReduction.cpp`):
-- `localCSERange()`: CSEs cloned pre-loop chains.
+- `localCSERange()`: CSEs cloned pre-loop chains after `cloneChainBeforeLoop`.
 - `decomposeVoffset()`: Strips constants (→ instOffset) and single-level SGPR addends (→ per-load soffset).
 - `_combineSGPRParts()`: Pre-combines multiple SGPR parts before the loop, skipping provably-zero values (s_mov_b32(0), s_mul_i32(0, x)).
+
+**C++ level** (`Liveness.cpp`):
+- `isSCCResult()`: Skips SCC (result #1 of `SALUBinaryWithCarryOp`) from liveness def-point computation. On hardware SCC is an implicit 1-bit flag, not a real SGPR. This avoids allocating a phantom SGPR for every S_ADD_U32/S_SUB_U32 op.
 
 **C++ level** (`Utils.h`):
 - `getConstantValue()`: Now handles `S_MOV_B32(ConstantOp)` in addition to `V_MOV_B32(ConstantOp)`.
 
 **Result**: 256 → 252 VGPRs. All B-data reads share a single VGPR base at the MLIR level. The remaining gap: after `cloneChainBeforeLoop`, each precomputed voffset is `V_ADD_U32(V_ADD_U32(shared_base, sgpr_delta_N), s_mul_i32(ivInit, stride))`. Single-level `decomposeVoffset` strips the outer SGPR (iv-init term, same for all reads), leaving `V_ADD_U32(shared_base, sgpr_delta_N)` as vgprBase — still different per read.
 
-### Remaining blocker: multi-level SGPR splitting → SGPR allocation failure
+### Multi-level SGPR splitting — what was tried and why it fails
 
-Multi-level `decomposeVoffset` (stripping both iv-init and delta SGPRs to reach shared_base) is **mathematically correct** but causes "Failed to allocate SGPR" in the linear scan allocator. The pattern: 12 unique per-load `s_add_u32(group_soff, combined_delta)` in the loop body creates too many simultaneously-live SGPR values. Peak SGPR pressure rises to 87 (under the 102 limit), but the allocator fails — likely due to live range fragmentation from the interleaved `s_add_u32` ops across the loop body.
+Multi-level `decomposeVoffset` (stripping both iv-init and per-read delta SGPRs to reach `shared_base`) is **mathematically correct** — verified by manual computation. The effective address formula checks out. But every approach to absorb the per-read SGPR delta exceeds GFX942's 102-SGPR hardware limit:
 
-**Fix paths**:
-1. ~~Per-iteration `s_add_u32(group_soff, delta)` in loop body~~ — causes SGPR allocation failure (87 peak + 12 per-load results exceeds usable budget after ABI reservations, even with SCC fix)
-2. **SCC liveness fix (committed)**: Skip SCC (result #1 of `SALUBinaryWithCarryOp`) from liveness range building. On hardware SCC is implicit, not a real SGPR. Saves ~1 SGPR per S_ADD_U32 op.
-3. **Per-load soffset iter_args (next)**: Instead of one soffset per SRD group, create one per unique `(group, sgprDelta)` pair. Each starts at `sgprDelta` (not 0) and shares the same stride increment. This moves the per-load SGPR delta into the loop init value, avoiding any per-iteration SGPR pressure increase. Cost: more iter_args (loop-carried SGPRs), but these are tied to block args and don't inflate peak pressure.
+**Approach E1: Per-iteration `s_add_u32(group_soff, delta)` in loop body** — Each of 12 unique per-load deltas produces an `s_add_u32` result inside the loop body. With 12 results live from their def point to the consuming buffer_load, the SGPR allocator fails. Peak pressure = 87 (below 102 limit), but 62 SGPRs are reserved for ABI (s0-s61: SRDs, kernarg, workgroup IDs, preloaded args), leaving only 40 usable. The 87 peak includes those 62, so 25 virtual SGPRs at peak + 12 new per-load results = 37 virtual SGPRs needed. This should fit in 40, but the linear scan allocator fails due to live-range fragmentation and alignment constraints (SRD pairs/quads need contiguous aligned slots). Caching identical `s_add_u32` results across loads didn't help enough.
+
+**Approach E2: Per-load soffset iter_args (init at `sgprDelta`)** — Instead of per-iteration `s_add_u32`, create one soffset iter_arg per unique `(group, sgprDelta)` pair. Each starts at `sgprDelta` instead of 0, sharing the same stride bump. This avoids per-iteration SGPR pressure but adds 12+ loop-carried iter_args. These are live across the entire loop body (block arg → terminator), and the allocator again fails — the 12 extra loop-wide SGPR live ranges push peak pressure from 87 to ~99, and with fragmentation the allocator cannot find contiguous aligned slots.
+
+**Approach E3: SCC liveness fix (committed, independently valuable)** — Skip SCC (result #1 of `SALUBinaryWithCarryOp`) from liveness range building since SCC is an implicit hardware flag, not a real SGPR. This saves ~1 SGPR per `S_ADD_U32`/`S_SUB_U32` op. However, the SCC results in the current kernel are mostly dead (zero-length ranges, `range.start == range.end`), so the fix has minimal impact on peak pressure for this specific kernel. Still valuable for kernels where SCC results have longer live ranges (e.g., `s_addc_u32` chains).
+
+### Recommendations for further VGPR reduction (252 → ~240)
+
+**Option 1: SRD base pointer bump (like AITER)** — Instead of one SRD + per-load soffset deltas, use multiple SRDs with different base addresses (one per N-tile group). Each SRD covers a row of the B matrix. K-iteration is done by bumping ALL SRDs' base pointers by the stride. This is how AITER handles it: 4 SRDs with different N offsets, each bumped by `s_add_u32(srd_base, stride)`. Cost: 4×4 = 16 extra SGPRs for SRD storage, but no per-load soffset computation. Pro: zero VGPR overhead for N-tile addressing. Con: requires SRD management and per-iteration SRD bumps.
+
+**Option 2: Reduce unique deltas via instOffset** — The k_idx=0 vs k_idx=1 difference is a constant (1024 or 2048) that fits in instOffset (max 4095). Absorbing it into instOffset before SGPR grouping would halve the number of unique SGPR deltas from 12 to 6. With 6 instead of 12 per-load results, the SGPR budget might fit. This requires the constant-stripping phase to run BEFORE the SGPR-stripping phase, operating on the combined `sgpr_delta + constant` value rather than the already-split components.
+
+**Option 3: Python-level: emit per-n_idx shared base, not per-read** — Currently `_try_reuse_hoisted_base` caches ONE reference and computes deltas from it. Instead, compute a shared base PER k_idx (2 bases), and within each k_idx, make all n_idx reads share that base with pure SGPR offsets. The k_idx difference (a constant) goes to instOffset. This produces exactly 2 unique VGPR voffsets (one per k_idx). The n_idx SGPR offsets (`n_idx * 16 * K_PACKED`) are emitted as `arith.addi(k_base, sgpr_n_offset)`. After WaveASM translation, BufferLoadSR sees `V_ADD_U32(k_base, sgpr_n_offset)` and the single-level decomposeVoffset correctly strips the SGPR. All 6 loads per k_idx share the same vgprBase. With 2 vgprBases and 6 sgprAddends per group, the per-iteration `s_add_u32` count is just 6 (not 12), which might fit in the SGPR budget.
+
+**Option 4: SGPR allocator improvement** — The linear scan allocator uses a simple BitVector pool with first-fit allocation. Aligned multi-register ranges (2-wide, 4-wide SGPRs) fragment the pool. Adding best-fit or buddy allocation for the SGPR pool, or spilling short-lived values to VGPRs, would allow the multi-level approach to work within the existing 102-SGPR budget.
 
 ## Reproducing
 
