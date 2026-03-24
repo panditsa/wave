@@ -1720,11 +1720,25 @@ def get_mxfp4_asymmetric_schedule(
             len(prologue_g2v_b_scale) // b_scale_shuffling_factor
         )
 
+        # Interleave g2s_a and g2s_a_scale in 4+1 groups matching AITER:
+        # 4 A-data loads, then 1 A-scale load, repeated.  With 2 prefetch
+        # iterations (double-buffer), each iteration contributes 8 g2s_a
+        # + 2 g2s_a_scale = two 4+1 groups.
+        n_g2s = len(prologue_g2s_a)       # 16 total (8 per prefetch iter)
+        n_g2s_s = len(prologue_g2s_a_scale)  # 4 total (2 per prefetch iter)
+        half_g2s = n_g2s // 2              # 8
+        half_g2s_s = n_g2s_s // 2          # 2
+        prologue_g2s_interleaved = (
+            prologue_g2s_a[0:4] + [prologue_g2s_a_scale[0]]
+            + prologue_g2s_a[4:8] + [prologue_g2s_a_scale[1]]
+            + prologue_g2s_a[8:12] + [prologue_g2s_a_scale[2]]
+            + prologue_g2s_a[12:16] + [prologue_g2s_a_scale[3]]
+        )
+
         prologue_clusters = [
             tkw.cluster(
                 [
-                    prologue_g2s_a,
-                    prologue_g2s_a_scale,
+                    prologue_g2s_interleaved,
                     prologue_g2v_b,
                     tkw.SchedulingBarrier([]),
                     prologue_g2v_b_scale,
@@ -1783,12 +1797,11 @@ def get_mxfp4_asymmetric_schedule(
         # Interleave MFMAs with memory ops (matching aiter f4gemm pattern).
         # Clamp start_offsets so they fit within each partition when the M
         # tile count is odd (e.g. 7 tiles split into 4+3).
-        base_offsets = [0, 3, 2, 0]
-        base_intervals = [4, 4, 2, 4]
-
         def _clamp_offsets(n, offsets):
             return [min(o, max(0, n - 1)) for o in offsets]
 
+        # Partition 0: B-data (g2v_b) at interval 2, A-data prefetch at 4,
+        # A-scale at 3, B-scale at 6 staggered from B-data.
         interleaved_mma_0 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_0,
             interleaved_ops=[
@@ -1797,21 +1810,24 @@ def get_mxfp4_asymmetric_schedule(
                 loop_shared_load_a_scale_1,
                 loop_g2v_b_scale,
             ],
-            intervals=base_intervals,
-            start_offsets=_clamp_offsets(len(loop_scaled_mma_0), base_offsets),
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[2, 4, 3, 6],
+            start_offsets=_clamp_offsets(len(loop_scaled_mma_0), [0, 1, 1, 3]),
+            start_after_groups=[[], [], [1], []],
         )
 
+        # Partition 1: g2s_a + g2s_a_scale merged into one group for
+        # even distribution across the full MMA sequence.  Interval 4
+        # spreads ~10 ops across 48 MFMAs without bunching.
         interleaved_mma_1 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_1,
             interleaved_ops=[
-                loop_g2s_a,
+                loop_g2s_a[0:4] + [loop_g2s_a_scale[0]] + loop_g2s_a[4:8] + [loop_g2s_a_scale[1]],
                 loop_shared_load_a_0,
                 loop_shared_load_a_scale_0,
-                loop_g2s_a_scale,
+                [],
             ],
-            intervals=base_intervals,
-            start_offsets=_clamp_offsets(len(loop_scaled_mma_1), base_offsets),
+            intervals=[4, 4, 3, 4],
+            start_offsets=_clamp_offsets(len(loop_scaled_mma_1), [0, 1, 1, 0]),
             start_after_groups=[[], [], [1], [0]],
         )
 
@@ -1847,7 +1863,7 @@ def get_mxfp4_asymmetric_schedule(
         ]
 
         if eliminate_epilogue:
-            clusters += prologue_clusters
+            tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
             tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
         else:
             epilogue_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.EPILOGUE)
@@ -1990,7 +2006,6 @@ def get_mxfp4_asymmetric_schedule(
                 ),
             ]
 
-            tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
             tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
         unroll_factor = 2
         tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
