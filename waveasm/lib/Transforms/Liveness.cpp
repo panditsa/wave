@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "waveasm/Transforms/Liveness.h"
+#include "waveasm/Dialect/WaveASMInterfaces.h"
 #include "waveasm/Dialect/WaveASMOps.h"
 #include "waveasm/Dialect/WaveASMTypes.h"
 
@@ -17,6 +18,25 @@
 using namespace mlir;
 
 namespace waveasm {
+
+/// Return true if *def* is the SCC (carry) result of an SALU op.
+/// On hardware SCC is an implicit 1-bit flag, not a real SGPR.
+/// Allocating a full SGPR for every SCC def wastes register slots
+/// and causes unnecessary SGPR pressure inflation.  Callers should
+/// skip these values when building live ranges so they never enter
+/// the register allocator.
+static bool isSCCResult(Value def) {
+  auto result = dyn_cast<OpResult>(def);
+  if (!result)
+    return false;
+  Operation *op = result.getOwner();
+  // SALUBinaryWithCarryOp (S_ADD_U32, S_SUB_U32) has two results:
+  // result #0 = dst, result #1 = scc.  Skip the scc result to avoid
+  // wasting a physical SGPR on a hardware-implicit flag.
+  if (op->hasTrait<OpTrait::SCCDef>() && result.getResultNumber() == 1)
+    return true;
+  return false;
+}
 
 //===----------------------------------------------------------------------===//
 // Iter-arg classification helpers
@@ -294,7 +314,7 @@ LivenessInfo computeLiveness(ProgramOp program) {
         }
       }
       for (Value def : op->getResults()) {
-        if (isVirtualRegType(def.getType())) {
+        if (isVirtualRegType(def.getType()) && !isSCCResult(def)) {
           if (!info.defPoints.contains(def)) {
             info.defPoints[def] = loopResultDefPoint;
           }
@@ -302,7 +322,7 @@ LivenessInfo computeLiveness(ProgramOp program) {
       }
     } else {
       for (Value def : op->getResults()) {
-        if (isVirtualRegType(def.getType())) {
+        if (isVirtualRegType(def.getType()) && !isSCCResult(def)) {
           if (!info.defPoints.contains(def)) {
             info.defPoints[def] = idx;
           }
