@@ -72,7 +72,10 @@ namespace {
 static bool isAddressVALU(Operation *op) {
   return isa<V_LSHLREV_B32, V_LSHL_OR_B32, V_LSHL_ADD_U32, V_ADD_U32, V_SUB_U32,
              V_AND_B32, V_OR_B32, V_LSHRREV_B32, V_MUL_LO_U32, V_MOV_B32,
-             V_XOR_B32, V_BFE_U32>(op);
+             V_XOR_B32, V_BFE_U32,
+             // Scalar address ops in buffer_load address chains (e.g.
+             // s_mul_i32 computing iv * element_bytes).
+             S_MUL_I32, S_ADD_U32, S_SUB_U32, S_MOV_B32>(op);
 }
 
 static bool isBufferLoad(Operation *op) {
@@ -336,6 +339,48 @@ computeStaticStride(const llvm::SetVector<Operation *> &deps, Value voffset,
       continue;
     }
 
+    // Scalar multiply: same as V_MUL_LO_U32 but on SGPRs.
+    if (auto smulOp = dyn_cast<S_MUL_I32>(op)) {
+      int64_t d0 = getDelta(smulOp.getSrc0());
+      int64_t d1 = getDelta(smulOp.getSrc1());
+      if (d0 != 0 && d1 != 0)
+        return std::nullopt;
+      if (d0 == 0 && d1 == 0) {
+        for (Value r : op->getResults())
+          delta[r] = 0;
+        continue;
+      }
+      Value constOperand = d0 == 0 ? smulOp.getSrc0() : smulOp.getSrc1();
+      int64_t dVar = d0 != 0 ? d0 : d1;
+      auto constVal = getConstantValue(constOperand);
+      if (!constVal)
+        return std::nullopt;
+      for (Value r : op->getResults())
+        delta[r] = dVar * *constVal;
+      continue;
+    }
+
+    // Scalar add/sub: same as VALU variants.
+    if (auto saddOp = dyn_cast<S_ADD_U32>(op)) {
+      int64_t d = getDelta(saddOp.getSrc0()) + getDelta(saddOp.getSrc1());
+      for (Value r : op->getResults())
+        delta[r] = d;
+      continue;
+    }
+    if (auto ssubOp = dyn_cast<S_SUB_U32>(op)) {
+      int64_t d = getDelta(ssubOp.getSrc0()) - getDelta(ssubOp.getSrc1());
+      for (Value r : op->getResults())
+        delta[r] = d;
+      continue;
+    }
+
+    // Scalar move: pass through delta.
+    if (isa<S_MOV_B32>(op)) {
+      for (Value r : op->getResults())
+        delta[r] = getDelta(op->getOperand(0));
+      continue;
+    }
+
     // Bitwise ops (AND, OR, XOR, BFE): nonlinear if IV-dependent.
     bool hasIVDep = false;
     for (Value operand : op->getOperands())
@@ -491,6 +536,86 @@ static void applyStrengthReduction(LoopOp loopOp) {
     initialVoffsets.push_back(voff);
   }
 
+  // Deduplicate voffsets within each SRD group.  Loads whose precomputed
+  // voffsets differ only by a compile-time constant can share one base
+  // voffset with the constant folded into instOffset.  This matches
+  // AITER's pattern: 8 shared voffsets for 40 loads.
+  //
+  // For each voffset, try to extract a constant addend from its defining
+  // op (V_ADD_U32(base, const) or V_LSHL_OR_B32(src, shift, const)).
+  // Group by (SRD_group, base) and fold the constant into instOffset.
+  constexpr int64_t kMaxInstOffset = 4095; // 12-bit unsigned.
+  SmallVector<int64_t> instOffsetDeltas(candidates.size(), 0);
+
+  for (unsigned g = 0; g < groups.size(); ++g) {
+    // Collect indices of candidates in this group.
+    SmallVector<unsigned> groupMembers;
+    for (unsigned i = 0; i < candidates.size(); ++i)
+      if (candidateGroupIdx[i] == g)
+        groupMembers.push_back(i);
+
+    if (groupMembers.size() <= 1)
+      continue;
+
+    // For each candidate, recursively extract the total constant addend
+    // from the voffset expression tree, leaving a "base" that is the
+    // voffset with all constants removed (folded into instOffset).
+    // Walk V_ADD_U32 chains, accumulating constants at any depth.
+    struct VoffsetSplit {
+      Value base;       // voffset with constants stripped.
+      int64_t constSum; // total constant addend to fold into instOffset.
+      bool valid;
+    };
+    SmallVector<VoffsetSplit> splits(candidates.size(), {nullptr, 0, false});
+
+    // For each candidate, extract the total constant addend from its
+    // precomputed voffset by walking V_ADD_U32 chains.  Rather than
+    // rebuilding the tree (which creates new SSA values that don't CSE),
+    // just strip the outermost constant and set it as instOffset.
+    // The downstream --waveasm-memory-offset-opt and --waveasm-scoped-cse
+    // passes will then extract deeper constants and merge identical bases.
+    for (unsigned idx : groupMembers) {
+      Value voff = initialVoffsets[idx];
+      auto *defOp = voff.getDefiningOp();
+      if (!defOp)
+        continue;
+
+      // Walk nested V_ADD_U32 chains to find the deepest constant addend.
+      int64_t totalConst = 0;
+      Value current = voff;
+      while (auto addOp = current.getDefiningOp<V_ADD_U32>()) {
+        auto c1 = getConstantValue(addOp.getSrc1());
+        if (c1) {
+          totalConst += *c1;
+          current = addOp.getSrc0();
+          continue;
+        }
+        auto c0 = getConstantValue(addOp.getSrc0());
+        if (c0) {
+          totalConst += *c0;
+          current = addOp.getSrc1();
+          continue;
+        }
+        break; // Neither operand is constant.
+      }
+
+      if (totalConst == 0)
+        continue;
+
+      // Check the constant fits in instOffset budget.
+      int64_t existingOffset = 0;
+      if (auto attr =
+              candidates[idx].loadOp->getAttrOfType<IntegerAttr>("instOffset"))
+        existingOffset = attr.getInt();
+      if (totalConst + existingOffset > kMaxInstOffset || totalConst < 0)
+        continue;
+
+      // Use the stripped base as the voffset; fold constant into instOffset.
+      initialVoffsets[idx] = current;
+      instOffsetDeltas[idx] = totalConst;
+    }
+  }
+
   // Build expanded init args: old args + soffset per SRD group (starts at 0).
   SmallVector<Value> expandedInit(initArgs.begin(), initArgs.end());
   unsigned soffsetArgBase = expandedInit.size();
@@ -518,18 +643,31 @@ static void applyStrengthReduction(LoopOp loopOp) {
     opMapping[&op] = cloned;
   }
 
-  // Patch buffer_loads: set voffset to precomputed value, soffset to iter_arg.
+  // Patch buffer_loads: set voffset to precomputed value, soffset to
+  // iter_arg, and apply instOffset deltas from voffset deduplication.
   for (auto [i, info] : llvm::enumerate(candidates)) {
     Operation *clonedLoad = opMapping.lookup(info.loadOp);
     assert(clonedLoad && "cloned load not found in op mapping");
 
-    // Replace voffset with precomputed initial value.
+    // Replace voffset with precomputed (possibly deduplicated) value.
     clonedLoad->setOperand(getVoffsetIdx(clonedLoad), initialVoffsets[i]);
 
     // Replace soffset (always operand 2) with the group's soffset iter_arg.
     unsigned groupIdx = candidateGroupIdx[i];
     Value soffsetArg = newBody.getArgument(soffsetArgBase + groupIdx);
     clonedLoad->setOperand(2, soffsetArg);
+
+    // Apply instOffset delta from voffset deduplication.
+    if (instOffsetDeltas[i] != 0) {
+      int64_t existingOffset = 0;
+      if (auto attr = clonedLoad->getAttrOfType<IntegerAttr>("instOffset"))
+        existingOffset = attr.getInt();
+      clonedLoad->setAttr(
+          "instOffset",
+          IntegerAttr::get(
+              IntegerType::get(clonedLoad->getContext(), 64),
+              existingOffset + instOffsetDeltas[i]));
+    }
   }
 
   // Compute next soffsets BEFORE the condition (s_add_u32 clobbers SCC,
