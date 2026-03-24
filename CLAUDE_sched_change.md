@@ -142,9 +142,9 @@ This reduces N unique VALU chains to 1 shared chain + N-1 simple additions.
 Multi-level `decomposeVoffset` (stripping both iv-init and delta SGPRs to reach shared_base) is **mathematically correct** but causes "Failed to allocate SGPR" in the linear scan allocator. The pattern: 12 unique per-load `s_add_u32(group_soff, combined_delta)` in the loop body creates too many simultaneously-live SGPR values. Peak SGPR pressure rises to 87 (under the 102 limit), but the allocator fails — likely due to live range fragmentation from the interleaved `s_add_u32` ops across the loop body.
 
 **Fix paths**:
-1. **Schedule per-load `s_add_u32` right before their consuming buffer_load** to minimize SGPR live range overlap (currently done but loads are spread across the loop)
-2. **Improve SGPR allocator** to handle the pattern of many short-lived SGPRs
-3. **Reduce unique deltas** — some deltas are identical across reads (e.g., k_idx=0 reads at same n_idx share delta=0); cache dedup of `s_add_u32` results is implemented but insufficient
+1. ~~Per-iteration `s_add_u32(group_soff, delta)` in loop body~~ — causes SGPR allocation failure (87 peak + 12 per-load results exceeds usable budget after ABI reservations, even with SCC fix)
+2. **SCC liveness fix (committed)**: Skip SCC (result #1 of `SALUBinaryWithCarryOp`) from liveness range building. On hardware SCC is implicit, not a real SGPR. Saves ~1 SGPR per S_ADD_U32 op.
+3. **Per-load soffset iter_args (next)**: Instead of one soffset per SRD group, create one per unique `(group, sgprDelta)` pair. Each starts at `sgprDelta` (not 0) and shares the same stride increment. This moves the per-load SGPR delta into the loop init value, avoiding any per-iteration SGPR pressure increase. Cost: more iter_args (loop-carried SGPRs), but these are tied to block args and don't inflate peak pressure.
 
 ## Reproducing
 

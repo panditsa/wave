@@ -715,10 +715,9 @@ waveasm.program @sgpr_addend_extraction
   // Load A: voffset = shared base, soffset = group_soff (no SGPR addend).
   // CHECK: waveasm.buffer_load_dword {{.*}}, [[VOFF:%[a-z0-9]+]], [[SOFF:%[a-z0-9]+]] :
   //
-  // Load B: same voffset, soffset = s_add_u32(group_soff, n_offset),
-  //         and const 256 folded into instOffset.
-  // CHECK: [[PER_LOAD_SOFF:%[a-z0-9_]+]], %{{.*}} = waveasm.s_add_u32 [[SOFF]], %{{.*}} ->
-  // CHECK: waveasm.buffer_load_dword {{.*}}, [[VOFF]], [[PER_LOAD_SOFF]]
+  // Load B: same voffset, soffset = group_soff (single-level strips the
+  //         iv-init SGPR, leaving the delta in voffset), const 256 in instOffset.
+  // CHECK: waveasm.buffer_load_dword {{.*}}, {{%[a-z0-9]+}}, [[SOFF]]
   // CHECK-SAME: offset : 256
   %final_iv, %final_acc = waveasm.loop(%iv = %init_iv, %acc = %init_acc)
       : (!waveasm.sreg, !waveasm.vreg) -> (!waveasm.sreg, !waveasm.vreg) {
