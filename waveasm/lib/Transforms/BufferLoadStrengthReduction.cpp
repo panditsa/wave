@@ -824,10 +824,6 @@ static void applyStrengthReduction(LoopOp loopOp) {
     opMapping[&op] = cloned;
   }
 
-  // Cache per-load soffset computations so loads sharing the same
-  // SGPR addend reuse one S_ADD_U32 result in the loop body.
-  DenseMap<std::pair<unsigned, Value>, Value> perLoadSoffCache;
-
   // Patch buffer_loads: set voffset to precomputed value, soffset to
   // iter_arg (possibly adjusted by per-load SGPR addend), and apply
   // instOffset deltas from voffset deduplication.
@@ -838,33 +834,10 @@ static void applyStrengthReduction(LoopOp loopOp) {
     // Replace voffset with precomputed (possibly deduplicated) value.
     clonedLoad->setOperand(getVoffsetIdx(clonedLoad), initialVoffsets[i]);
 
-    // Compute per-load soffset.  If an SGPR addend was extracted from the
-    // voffset decomposition, emit s_add_u32(group_soff, sgpr_addend) to
-    // absorb the per-load SGPR offset into the scalar path.  This avoids
-    // materializing a separate VGPR for each load's unique N-tile offset.
+    // Replace soffset with the group's soffset iter_arg.
     unsigned groupIdx = candidateGroupIdx[i];
     Value soffsetArg = newBody.getArgument(soffsetArgBase + groupIdx);
-
-    if (sgprAddends[i]) {
-      // Per-load soffset = s_add_u32(group_soff, pre-combined sgpr).
-      // Reuse the same s_add_u32 for loads that share the same addend
-      // to avoid redundant SGPR live ranges in the loop body.
-      auto key = std::make_pair(groupIdx, sgprAddends[i]);
-      auto it = perLoadSoffCache.find(key);
-      if (it != perLoadSoffCache.end()) {
-        clonedLoad->setOperand(2, it->second);
-      } else {
-        OpBuilder loadBuilder(clonedLoad);
-        Value perLoadSoff =
-            S_ADD_U32::create(loadBuilder, loc, sregType, sregType, soffsetArg,
-                              sgprAddends[i])
-                .getDst();
-        clonedLoad->setOperand(2, perLoadSoff);
-        perLoadSoffCache[key] = perLoadSoff;
-      }
-    } else {
-      clonedLoad->setOperand(2, soffsetArg);
-    }
+    clonedLoad->setOperand(2, soffsetArg);
 
     // Apply instOffset delta from voffset deduplication.
     if (instOffsetDeltas[i] != 0) {
@@ -912,7 +885,6 @@ static void applyStrengthReduction(LoopOp loopOp) {
 
     ConditionOp::create(bodyBuilder, loc, newCond, newCondIterArgs);
   } else {
-    // Fallback: no condition producer found, just append.
     SmallVector<Value> newCondIterArgs;
     for (Value v : condIterArgs)
       newCondIterArgs.push_back(mapping.lookup(v));
