@@ -599,11 +599,13 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     return success();
   }
 
-  int64_t newSrdBase = ctx.getNextSwizzleSRDIndex();
-
-  std::string mov0 = "s_mov_b32 s" + std::to_string(newSrdBase) + ", s" +
-                     std::to_string(srcSrdBase);
-  RawOp::create(builder, loc, mov0);
+  // Modify the source SRD in-place to avoid allocating a new 4-SGPR
+  // swizzle SRD.  The original SRD's word 0 (base lo) and word 2
+  // (num_records) are already correct; only word 1 (base hi + swizzle
+  // bits) and word 3 (format + swizzle enable) need updating.
+  // This saves 4 SGPRs per swizzle SRD, critical for higher unroll
+  // factors that push SGPR pressure near the hardware limit.
+  int64_t newSrdBase = srcSrdBase;
 
   if (hasCacheSwizzle && !suppressWord3Swizzle) {
     int64_t srdWord1Bits = static_cast<int64_t>(swizzleStride | 0x4000) << 16;
@@ -615,25 +617,12 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
                       std::to_string(newSrdBase + 1) + ", 0x" +
                       llvm::utohexstr(srdWord1Bits);
     RawOp::create(builder, loc, or1);
-  } else {
-    std::string mov1 = "s_mov_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
-                       std::to_string(srcSrdBase + 1);
-    RawOp::create(builder, loc, mov1);
   }
 
   if (hasNonMaxValidBytes) {
-    // EE path: the MLIR provides a dynamic or non-max validBytes
-    // (e.g. from arith.select for the branchless g2s guard).
     emitSrdNumRecords(builder, loc, newSrdBase, op, ctx);
-  } else {
-    // Copy num_records from the source SRD so that sentinel byte offsets
-    // (0x7FFFFFFF) remain OOB.  On GFX9, OOB buffer loads silently return
-    // zero -- they do NOT fault.  Using 0xFFFFFFFF would make sentinel
-    // offsets in-bounds, causing the hardware to access unmapped memory.
-    std::string mov2 = "s_mov_b32 s" + std::to_string(newSrdBase + 2) + ", s" +
-                       std::to_string(srcSrdBase + 2);
-    RawOp::create(builder, loc, mov2);
   }
+  // Word 2 (num_records) is already correct in the source SRD.
 
   uint64_t word3 =
       (hasCacheSwizzle && !suppressWord3Swizzle) ? 0x27000 : 0x20000;
@@ -647,10 +636,8 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   if (!suppressWord3Swizzle)
     ctx.setCacheSwizzleStride(op->getResult(0), swizzleStride);
 
-  // Record the SRD index for the SOURCE memref so that subsequent
-  // fat_raw_buffer_cast ops on the same source (e.g. inside the loop
-  // body) copy from this stable SRD rather than from the kernel-arg
-  // SRD whose register may be repurposed as a loop counter.
+  // Record the (unchanged) SRD index so subsequent fat_raw_buffer_cast
+  // ops on the same source reuse this SRD.
   ctx.setSRDIndex(op->getOperand(0), newSrdBase);
 
   return success();
