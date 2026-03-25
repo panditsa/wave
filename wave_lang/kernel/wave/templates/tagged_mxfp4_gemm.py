@@ -573,6 +573,192 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     return gemm, options
 
 
+def get_tagged_mxfp4_gemm_preshuffle_a(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    block_shape: tuple[int, int, int] = (256, 256, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    b_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    b_scale_preshuffle: bool = True,
+    reorder_workgroups=True,
+    group_size_n=32,
+    output_dtype=tkl.f32,
+):
+    """Return a tagged MXFP4 scaled GEMM kernel with preshuffled A and A_scale.
+
+    Mirrored from get_tagged_mxfp4_gemm_preshuffle_b:
+    A data is read directly from global memory using a preshuffle mapping
+    (aiter shuffle_weight permutation over M).  A scales are also read from
+    global memory using an e8m0 scale preshuffle mapping.  B and B_scale go
+    through shared memory (LDS).
+
+    All ops are tagged for use with MXFP4 schedule functions.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
+        mfma_variant: Scaled MMA instruction type.
+        b_address_space: Address space for B and B_scale (typically SHARED).
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    M = tkl.sym.M
+    N = tkl.sym.N
+    K = tkl.sym.K
+    BLOCK_M = tkl.sym.BLOCK_M
+    BLOCK_N = tkl.sym.BLOCK_N
+    BLOCK_K = tkl.sym.BLOCK_K
+    GROUP_SIZE_N = tkl.sym.GROUP_SIZE_N
+    B_ADDRESS_SPACE = tkl.sym.B_ADDRESS_SPACE
+    C_ADDRESS_SPACE = tkl.sym.C_ADDRESS_SPACE
+    K_PACKED = tkl.sym.K_PACKED
+    K_SCALE_SHUFFLED = tkl.sym.K_SCALE_SHUFFLED
+
+    constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
+    constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
+    constraints += [tkw.TilingConstraint(K, BLOCK_K)]
+
+    constraints += [tkw.WaveConstraint(M, BLOCK_M / wave_shape[0])]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N / wave_shape[1])]
+
+    constraints += [tkw.HardwareConstraint(threads_per_wave=64, mma_type=mfma_variant)]
+
+    constraints += [tkw.Assumption(Eq(M % 32, 0))]
+    constraints += [tkw.Assumption(Eq(N % 32, 0))]
+    constraints += [tkw.Assumption(Eq(K % 256, 0))]
+
+    constraints += [tkw.Assumption(K > BLOCK_K * 6)]
+
+    if reorder_workgroups:
+        new_wg0, new_wg1 = _reorder_mxfp4_workgroups(
+            M, N, BLOCK_M, BLOCK_N, GROUP_SIZE_N
+        )
+        constraints += [tkw.ReorderingConstraint(new_wg0, 0)]
+        constraints += [tkw.ReorderingConstraint(new_wg1, 1)]
+
+    # --- A data preshuffle mapping (aiter shuffle_weight over M) ---
+    m_it = tkw.IndexMapping.iterator(0)
+    k_it = tkw.IndexMapping.iterator(1)
+
+    within_mblk = (
+        (k_it // 32) * 512 + ((k_it // 16) % 2) * 256 + (m_it % 16) * 16 + k_it % 16
+    )
+
+    a_preshuffle_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={
+            M: (m_it // 16) * 16 + within_mblk // K_PACKED,
+            K: within_mblk % K_PACKED,
+        },
+        outputs={M: m_it, K: k_it},
+    )
+
+    # --- A scale preshuffle mapping (e8m0_shuffle over M) ---
+    i_a = tkw.IndexMapping.iterator(0)
+    j_a = tkw.IndexMapping.iterator(1)
+
+    a_scale_flat = (
+        (j_a // 32) * ((K_SCALE_SHUFFLED // 8) * 256)
+        + (i_a // 8) * 256
+        + ((i_a % 8) % 4) * 64
+        + ((j_a % 32) % 16) * 4
+        + (((i_a % 8) // 4) * 2)
+        + ((j_a % 32) // 16)
+    )
+
+    a_scale_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={
+            M: a_scale_flat // K_SCALE_SHUFFLED,
+            K: a_scale_flat % K_SCALE_SHUFFLED,
+        },
+        outputs={K: i_a, M: j_a},
+    )
+
+    # --- B scale preshuffle mapping (e8m0_shuffle over N) ---
+    k_s = tkw.IndexMapping.iterator(0)
+    n_s = tkw.IndexMapping.iterator(1)
+
+    b_scale_flat = (
+        (n_s // 32) * ((K_SCALE_SHUFFLED // 8) * 256)
+        + (k_s // 8) * 256
+        + ((k_s % 8) % 4) * 64
+        + ((n_s % 32) % 16) * 4
+        + (((k_s % 8) // 4) * 2)
+        + ((n_s % 32) // 16)
+    )
+
+    if b_scale_preshuffle:
+        b_scale_mapping = tkw.IndexMapping(
+            num_iterators=2,
+            inputs={
+                N: b_scale_flat // K_SCALE_SHUFFLED,
+                K: b_scale_flat % K_SCALE_SHUFFLED,
+            },
+            outputs={K: k_s, N: n_s},
+        )
+    else:
+        b_scale_mapping = None
+
+    @tkw.wave(constraints)
+    def gemm(
+        a: tkl.Memory[M, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
+        b: tkl.Memory[N, K / 2, B_ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, B_ADDRESS_SPACE, tkl.i8],
+        c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
+    ):
+        c_reg = tkl.Register[M, N, tkl.f32](0.0)
+
+        @tkw.iterate(K, init_args=[c_reg], tag="k_loop")
+        def repeat(
+            acc: tkl.Register[M, N, tkl.f32],
+        ) -> tkl.Register[M, N, tkl.f32]:
+            a_reg = tkw.read(a, mapping=a_preshuffle_mapping, tag="read_a")
+            a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
+            a_scale_reg = tkw.read(a_scale, mapping=a_scale_mapping, tag="read_a_scale")
+            a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
+            b_reg = tkw.read(b, tag="read_b")
+            b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
+            b_scale_reg = tkw.read(b_scale, mapping=b_scale_mapping, tag="read_b_scale")
+            b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
+            acc = tkw.scaled_mma(
+                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+            )
+            return acc
+
+        if output_dtype == tkl.bf16:
+            repeat = tkw.cast(repeat, tkl.bf16)
+        tkw.write(repeat, c)
+
+    hyperparams = {
+        B_ADDRESS_SPACE: b_address_space,
+        C_ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
+        BLOCK_M: block_shape[0],
+        BLOCK_N: block_shape[1],
+        BLOCK_K: block_shape[2],
+        GROUP_SIZE_N: group_size_n,
+        M: shape[0],
+        N: shape[1],
+        K: shape[2],
+        K_PACKED: K // 2,
+        K_SCALE_SHUFFLED: (((K // 32) + 7) // 8) * 8,
+    }
+    hyperparams.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        canonicalize=True,
+        schedule=SchedulingType.MANUAL,
+        use_global_to_shared=True,
+        minimize_shared_allocs=False,
+    )
+
+    return gemm, options
+
+
 def _reorder_mxfp4_workgroups(m, n, block_m, block_n, group_size_n):
     """Remap workgroup indices to a new order based on group_size_n along N dimension.
 

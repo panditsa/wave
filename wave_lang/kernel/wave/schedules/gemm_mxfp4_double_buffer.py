@@ -21,6 +21,7 @@ Requires use_global_to_shared=True and threads_per_wave=64.
 import wave_lang.kernel.lang as tkl
 import wave_lang.kernel.wave as tkw
 import wave_lang.kernel.wave.wave_schedule as wave_schedule
+from wave_lang.kernel.wave.scheduling.resources import Operation
 
 
 def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
@@ -1658,7 +1659,6 @@ def get_mxfp4_asymmetric_schedule(
                     (),
                 ],
             )
-            # Stage 0: Global-to-shared prefetch via GatherToLDS (no fusion)
             pl.set_stage(
                 [
                     (
@@ -1672,7 +1672,6 @@ def get_mxfp4_asymmetric_schedule(
                     (),
                 ],
             )
-            # Stage 1: Shared memory loads + bitcasts + compute
             pl.set_stage(
                 [
                     (
@@ -1686,7 +1685,7 @@ def get_mxfp4_asymmetric_schedule(
 
         # Constants derived from schedule structure
         num_m_partitions = (
-            2  # we are dividing the M dimension into 2 paritions per loop iteration
+            2  # we are dividing the M dimension into 2 partitions per loop iteration
         )
         num_pf_iters = (
             2  # prefetch depth of A and A_scale is 2 iterations (triple buffer)
@@ -1815,20 +1814,20 @@ def get_mxfp4_asymmetric_schedule(
             start_after_groups=[[], [], [1], []],
         )
 
-        # Partition 1: g2s_a + g2s_a_scale merged into one group for
-        # even distribution across the full MMA sequence.  Interval 4
-        # spreads ~10 ops across 48 MFMAs without bunching.
+        # Partition 1: G2S and ds_reads at interval 3.
+        # G2S (10 ops) at interval 3 → covers MFMAs 0,3,...,27 = 10 slots.
+        # s2v_a_0+scale (10 ops) at interval 3 offset 1 → MFMAs 1,4,...,28.
+        # Total: 20 ops at interval 3 interleaved → covers ~30 MFMAs,
+        # leaving ~18 MFMA drain tail (down from ~24 at interval 4).
         interleaved_mma_1 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_1,
             interleaved_ops=[
                 loop_g2s_a[0:4] + [loop_g2s_a_scale[0]] + loop_g2s_a[4:8] + [loop_g2s_a_scale[1]],
-                loop_shared_load_a_0,
-                loop_shared_load_a_scale_0,
-                [],
+                loop_shared_load_a_0 + loop_shared_load_a_scale_0,
             ],
-            intervals=[4, 4, 3, 4],
-            start_offsets=_clamp_offsets(len(loop_scaled_mma_1), [0, 1, 1, 0]),
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[3, 3],
+            start_offsets=_clamp_offsets(len(loop_scaled_mma_1), [0, 1]),
+            start_after_groups=[[], []],
         )
 
         loop_B_g2v_bs = len(loop_g2v_b) + (
@@ -2014,8 +2013,18 @@ def get_mxfp4_asymmetric_schedule(
             pipeline_loop.KERNEL,
             tkw.MemoryCounterWaitBarrier(load=A_g2s_per_iter, ds=0),
         )
+        # Final drain after loop: wait for everything.
         tkw.insert_after(
             pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
         )
 
     return mxfp4_dbuf_schedule
+
+
+def get_mxfp4_asymmetric_schedule_mirrored(
+    eliminate_epilogue: bool = False, is_ascale_shuffled: bool = False
+):
+    """Placeholder for mirrored asymmetric schedule (A direct, B via LDS)."""
+    raise NotImplementedError(
+        "get_mxfp4_asymmetric_schedule_mirrored is not yet implemented"
+    )
