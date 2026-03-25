@@ -378,6 +378,8 @@ def _transform_scale_memory(
             if tag:
                 new_write.tag = tag
 
+        new_write.expanded_dims = {global_m_dim: op_i}
+
         all_new_writes.append(new_write)
 
     for write_node, write, input_read in write_group:
