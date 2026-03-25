@@ -1343,7 +1343,7 @@ def _generate_asm_code(mb, options):
         threads_per_wave = 64
         waves_in_m = wg[0] // threads_per_wave
         waves_in_n = wg[1]
-        use_ticketed_waitcnt = waves_in_m >= 2 and waves_in_n >= 2
+        use_ticketed_waitcnt = False 
         waitcnt_flag = (
             "--waveasm-insert-waitcnt"
             if use_ticketed_waitcnt
