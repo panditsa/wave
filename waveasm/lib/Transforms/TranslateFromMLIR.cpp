@@ -186,7 +186,11 @@ void TranslationContext::emitSRDPrologue() {
   // Overflow scalars are placed in SGPRs after all SRDs.
   int64_t afterLastSrd = srdStartIndex + pendingSRDs.size() * 4;
   int64_t overflowSgprBase = (afterLastSrd + 3) & ~3;
-  nextSwizzleSRDIndex = (overflowSgprBase + numOverflowScalars * 2 + 3) & ~3;
+  // Dedicated SGPR slots for scalar kernel args (placed after overflow slots).
+  int64_t scalarArgSgprBase =
+      (overflowSgprBase + numOverflowScalars * 2 + 3) & ~3;
+  nextSwizzleSRDIndex =
+      (scalarArgSgprBase + (int64_t)pendingScalarArgs.size() + 3) & ~3;
 
   // Emit comment for prologue.
   CommentOp::create(builder, loc, "SRD setup prologue");
@@ -342,11 +346,10 @@ void TranslationContext::emitSRDPrologue() {
       mapper.mapValue(pending.memref, srdReg);
     }
 
-    // Step 6: Move scalar args from SGPRs to VGPRs.
-    // Preloaded scalars come from s[2+argIndex*2], overflow from
-    // overflowSgprBase slots.
+    // Copy scalar args from preload/overflow SGPRs to dedicated SGPRs.
     int64_t ovfIdx = 0;
-    for (const auto &pending : pendingScalarArgs) {
+    for (size_t i = 0; i < pendingScalarArgs.size(); ++i) {
+      const auto &pending = pendingScalarArgs[i];
       int64_t preloadBase = 2 + pending.argIndex * 2;
       int64_t sgprSrc;
       if (preloadBase >= 16) {
@@ -355,14 +358,16 @@ void TranslationContext::emitSRDPrologue() {
       } else {
         sgprSrc = preloadBase;
       }
+      int64_t sgprDst = scalarArgSgprBase + i;
 
-      auto vregType = createVRegType();
-      auto vreg =
-          PrecoloredVRegOp::create(builder, loc, vregType, pending.argIndex, 1);
+      auto dstType = createSRegType(1, 1);
+      auto dstSreg =
+          PrecoloredSRegOp::create(builder, loc, dstType, sgprDst, 1);
       RawOp::create(builder, loc,
-                    "v_mov_b32 v" + std::to_string(pending.argIndex) + ", s" +
+                    "s_mov_b32 s" + std::to_string(sgprDst) + ", s" +
                         std::to_string(sgprSrc));
-      mapper.mapValue(pending.blockArg, vreg);
+      DCEProtectOp::create(builder, loc, dstSreg);
+      mapper.mapValue(pending.blockArg, dstSreg);
     }
   } else {
     // Direct-load path (non-GFX950 targets):
@@ -418,34 +423,20 @@ void TranslationContext::emitSRDPrologue() {
       mapper.mapValue(pending.memref, srdReg);
     }
 
-    // Move scalar args from SGPRs to VGPRs (lower SGPR of each pair).
+    // Map scalar args to their dedicated SGPRs (already loaded above).
     for (size_t i = 0; i < pendingScalarArgs.size(); ++i) {
       const auto &pending = pendingScalarArgs[i];
-      int64_t srcSgpr = overflowSgprBase + (int64_t)i * 2;
+      int64_t sgprIdx = scalarArgSgprBase + (int64_t)i;
 
-      auto vregType = createVRegType();
-      auto vreg =
-          PrecoloredVRegOp::create(builder, loc, vregType, pending.argIndex, 1);
+      auto dstType = createSRegType(1, 1);
+      auto dstSreg =
+          PrecoloredSRegOp::create(builder, loc, dstType, sgprIdx, 1);
       RawOp::create(builder, loc,
-                    "v_mov_b32 v" + std::to_string(pending.argIndex) + ", s" +
-                        std::to_string(srcSgpr));
-      mapper.mapValue(pending.blockArg, vreg);
+                    "s_mov_b32 s" + std::to_string(sgprIdx) + ", s" +
+                        std::to_string(overflowSgprBase + (int64_t)i * 2));
+      DCEProtectOp::create(builder, loc, dstSreg);
+      mapper.mapValue(pending.blockArg, dstSreg);
     }
-  }
-
-  // For the direct-load path, record the pinned SGPR reservations as
-  // attributes. Their PrecoloredSRegOps may be DCE'd by canonicalize
-  // (they're Pure with no SSA users since the RawOp references registers
-  // by string). The preloading path uses typed S_LOAD_DWORDX2 ops which
-  // the allocator sees directly, so no extra attributes are needed.
-  if (!usePreloading && !pendingScalarArgs.empty()) {
-    int64_t scalarCount = (int64_t)pendingScalarArgs.size() * 2;
-    int64_t scalarEnd = overflowSgprBase + scalarCount;
-    program->setAttr("min_sgprs", builder.getI64IntegerAttr(scalarEnd));
-    program->setAttr("scalar_sgpr_base",
-                     builder.getI64IntegerAttr(overflowSgprBase));
-    program->setAttr("scalar_sgpr_count",
-                     builder.getI64IntegerAttr(scalarCount));
   }
 
   CommentOp::create(builder, loc, "End SRD setup");
@@ -578,6 +569,10 @@ VOffsetResult computeVOffsetFromIndices(MemRefType memrefType,
   if (!voffset) {
     auto immType = ctx.createImmType(0);
     voffset = ConstantOp::create(builder, loc, immType, 0);
+  }
+  // buffer_load/store with offen mode requires a VGPR for voffset.
+  if (!llvm::isa<VRegType>(voffset.getType())) {
+    voffset = V_MOV_B32::create(builder, loc, ctx.createVRegType(), voffset);
   }
   return {voffset, instOffset};
 }
@@ -1022,8 +1017,7 @@ LogicalResult handleVectorTransferWrite(Operation *op,
     if (isAGPRType(storeData.getType())) {
       auto vregType =
           ctx.createVRegType(numDwords, numDwords > 1 ? numDwords : 1);
-      storeData =
-          V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
+      storeData = V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
     }
 
     if (numDwords == 1) {
