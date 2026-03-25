@@ -18,6 +18,7 @@ from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 from wave_lang.kernel.wave.templates import (
     get_tagged_mxfp4_gemm,
+    get_tagged_mxfp4_gemm_preshuffle_a,
     get_tagged_mxfp4_gemm_preshuffle_b,
     get_tagged_mxfp4_gemm_preshuffle_scales,
     get_tagged_mxfp4_gemm_preshuffle_scales_and_B,
@@ -27,6 +28,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_pingpong_schedule,
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
+    get_mxfp4_asymmetric_schedule_mirrored,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled_lds,
@@ -426,7 +428,7 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
 def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     is_debug=False,
     shape=(1024, 1024, 8192),
-    block=(128, 256, 256),
+    block=(256, 192, 256),
     eliminate_epilogue=True,
 ):
     """Preshuffle-B MXFP4 GEMM with dynamic M, N, K."""
@@ -453,6 +455,37 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
 
     _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
     print("MXFP GEMM preshuffle-B 4-wave dynamic M, N, K (WaveASM backend) test passed!")
+
+
+def test_mirrored(
+    is_debug=False,
+    shape=(1024, 1024, 8192),
+    block=(256, 192, 256),
+    eliminate_epilogue=True,
+):
+    """Mirrored asymmetric MXFP4 GEMM: preshuffle-A (direct), B through LDS."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_a(shape, block, wave_shape=(4, 1), reorder_workgroups=True)
+    dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
+    for sym in dynamic_symbols:
+        del options.subs[sym]
+    options.dynamic_symbols = dynamic_symbols
+    options.use_buffer_ops = True
+    options.backend = "llvm"
+    # options.use_wave_asm_backend = True
+    options.wave_runtime = True
+    options.eliminate_epilogue = eliminate_epilogue
+    options.dump_intermediates = "build/intermediatesmirrored/"
+    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_asymmetric_mirrored.mlir"
+    options.print_mlir = True
+    schedule = get_mxfp4_asymmetric_schedule_mirrored(
+        eliminate_epilogue=eliminate_epilogue, is_ascale_shuffled=True
+    )
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    print("Mirrored asymmetric MXFP4 GEMM (preshuffle-A, B via LDS) test passed!")
 
 
 if __name__ == "__main__":
