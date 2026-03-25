@@ -1602,7 +1602,7 @@ def get_mxfp4_asymmetric_schedule(
     removes all epilogue code, reducing total code size.
     """
     M = tkl.sym.M
-
+    K = tkl.sym.K
     @wave_schedule.wave_schedule()
     def mxfp4_dbuf_schedule():
         # =====================================================================
@@ -1621,6 +1621,9 @@ def get_mxfp4_asymmetric_schedule(
         s2v_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
 
         # partition s2v_a by M
+        g2s_a_0, g2s_a_1 = tkw.partition_by_dim(g2s_a, dim=M, num_partitions=2)
+        g2s_a_scale_0, g2s_a_scale_1 = tkw.partition_by_dim(g2s_a_scale, dim=M, num_partitions=2)
+    
         s2v_a_0, s2v_a_1 = tkw.partition_by_dim(s2v_a, dim=M, num_partitions=2)
         s2v_a_scale_0, s2v_a_scale_1 = tkw.partition_by_dim(
             s2v_a_scale, dim=M, num_partitions=2
@@ -1652,8 +1655,10 @@ def get_mxfp4_asymmetric_schedule(
             pl.set_stage(
                 [
                     (
-                        g2s_a,
-                        g2s_a_scale,
+                        g2s_a_0,
+                        g2s_a_scale_0,
+                        g2s_a_1,
+                        g2s_a_scale_1,
                     ),
                     (),
                     (),
@@ -1699,9 +1704,13 @@ def get_mxfp4_asymmetric_schedule(
         # =====================================================================
         # Prologue: G2S_A + G2S_A_scale + G2V_B + G2V_B_scale + vmcnt(25) + s2v_a_0 + s2v_a_scale_0
         # =====================================================================
-        prologue_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.PROLOGUE)
-        prologue_g2s_a_scale = tkw.filter_nodes(
-            g2s_a_scale, subgraph=pipeline_loop.PROLOGUE
+        prologue_g2s_a_0 = tkw.filter_nodes(g2s_a_0, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2s_a_1 = tkw.filter_nodes(g2s_a_1, subgraph=pipeline_loop.PROLOGUE)
+        prologue_g2s_a_scale_0 = tkw.filter_nodes(
+            g2s_a_scale_0, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_g2s_a_scale_1 = tkw.filter_nodes(
+            g2s_a_scale_1, subgraph=pipeline_loop.PROLOGUE
         )
         prologue_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.PROLOGUE)
         prologue_g2v_b_scale = tkw.filter_nodes(
@@ -1713,36 +1722,58 @@ def get_mxfp4_asymmetric_schedule(
         )
 
         # A is prefetched twice in the prologue, we want to wait for just the first prefetch
-        A_g2s_total = len(prologue_g2s_a) + len(prologue_g2s_a_scale)
+        A_g2s_total = len(prologue_g2s_a_0) + len(prologue_g2s_a_scale_0) + len(prologue_g2s_a_1) + len(prologue_g2s_a_scale_1)
         A_g2s_per_iter = A_g2s_total // num_pf_iters
         B_g2v_prologue = len(prologue_g2v_b) + (
             len(prologue_g2v_b_scale) // b_scale_shuffling_factor
         )
 
-        # Interleave g2s_a and g2s_a_scale in 4+1 groups matching AITER:
-        # 4 A-data loads, then 1 A-scale load, repeated.  With 2 prefetch
-        # iterations (double-buffer), each iteration contributes 8 g2s_a
-        # + 2 g2s_a_scale = two 4+1 groups.
-        n_g2s = len(prologue_g2s_a)       # 16 total (8 per prefetch iter)
-        n_g2s_s = len(prologue_g2s_a_scale)  # 4 total (2 per prefetch iter)
-        half_g2s = n_g2s // 2              # 8
-        half_g2s_s = n_g2s_s // 2          # 2
-        prologue_g2s_interleaved = (
-            prologue_g2s_a[0:4] + [prologue_g2s_a_scale[0]]
-            + prologue_g2s_a[4:8] + [prologue_g2s_a_scale[1]]
-            + prologue_g2s_a[8:12] + [prologue_g2s_a_scale[2]]
-            + prologue_g2s_a[12:16] + [prologue_g2s_a_scale[3]]
+        # Sort prologue G2S by multi_buffer target so the buffer that
+        # s2v_a_0 reads from (multi_buffer_0) is issued first.  This
+        # allows vmcnt(N) to skip waiting for the other buffer's ops.
+        from wave_lang.kernel.ops.wave_ops import get_custom
+
+        def _get_dst_name(n):
+            """Get the destination buffer name from a G2S node."""
+            c = get_custom(n)
+            dst = c.dst
+            if hasattr(dst, "name"):
+                return dst.name
+            if hasattr(dst, "__name__"):
+                return dst.__name__
+            return str(dst)
+
+        def _sort_by_dst_buffer(nodes, target_first="multi_buffer_0"):
+            """Sort G2S nodes: target buffer first, then the rest."""
+            first = [n for n in nodes if target_first in _get_dst_name(n)]
+            rest = [n for n in nodes if target_first not in _get_dst_name(n)]
+            return first + rest
+
+        sorted_g2s_a_0 = _sort_by_dst_buffer(prologue_g2s_a_0)
+        sorted_g2s_a_1 = _sort_by_dst_buffer(prologue_g2s_a_1)
+        sorted_g2s_a_scale_0 = _sort_by_dst_buffer(prologue_g2s_a_scale_0)
+        sorted_g2s_a_scale_1 = _sort_by_dst_buffer(prologue_g2s_a_scale_1)
+
+        # First group: all multi_buffer_0 ops (4 data + 1 scale per
+        # M-partition = 10 ops for buf0), then buf1 ops.
+        # s2v_a_0 reads from multi_buffer_0, so these must complete first.
+        prologue_g2s_interleaved_0 = (
+            sorted_g2s_a_0[:4] + [sorted_g2s_a_scale_0[0]]
+            + sorted_g2s_a_1[:4] + [sorted_g2s_a_scale_1[0]]
+        )
+        prologue_g2s_interleaved_1 = (
+            sorted_g2s_a_0[4:8] + [sorted_g2s_a_scale_0[1]]
+            + sorted_g2s_a_1[4:8] + [sorted_g2s_a_scale_1[1]]
         )
 
         prologue_clusters = [
             tkw.cluster(
                 [
-                    prologue_g2s_interleaved,
+                    prologue_g2s_interleaved_0,
                     prologue_g2v_b,
-                    tkw.SchedulingBarrier([]),
                     prologue_g2v_b_scale,
-                    tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=0),
+                    prologue_g2s_interleaved_1,
+                    tkw.MemoryCounterWaitBarrier(load=30),
                     tkw.SchedulingBarrier([]),
                     prologue_s2v_a_0,
                     prologue_s2v_a_scale_0,
@@ -1755,8 +1786,10 @@ def get_mxfp4_asymmetric_schedule(
         # =====================================================================
 
         # Filter nodes for KERNEL stage
-        loop_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.KERNEL)
-        loop_g2s_a_scale = tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.KERNEL)
+        loop_g2s_a_0 = tkw.filter_nodes(g2s_a_0, subgraph=pipeline_loop.KERNEL)
+        loop_g2s_a_1 = tkw.filter_nodes(g2s_a_1, subgraph=pipeline_loop.KERNEL)
+        loop_g2s_a_scale_0 = tkw.filter_nodes(g2s_a_scale_0, subgraph=pipeline_loop.KERNEL)
+        loop_g2s_a_scale_1 = tkw.filter_nodes(g2s_a_scale_1, subgraph=pipeline_loop.KERNEL)
 
         loop_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.KERNEL)
         loop_g2v_b_scale = tkw.filter_nodes(g2v_b_scale, subgraph=pipeline_loop.KERNEL)
@@ -1822,7 +1855,7 @@ def get_mxfp4_asymmetric_schedule(
         interleaved_mma_1 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_1,
             interleaved_ops=[
-                loop_g2s_a[0:4] + [loop_g2s_a_scale[0]] + loop_g2s_a[4:8] + [loop_g2s_a_scale[1]],
+                loop_g2s_a_0 + [loop_g2s_a_scale_0[0]] + loop_g2s_a_1 + [loop_g2s_a_scale_1[0]],
                 loop_shared_load_a_0 + loop_shared_load_a_scale_0,
             ],
             intervals=[3, 3],
@@ -1833,7 +1866,7 @@ def get_mxfp4_asymmetric_schedule(
         loop_B_g2v_bs = len(loop_g2v_b) + (
             len(loop_g2v_b_scale) // b_scale_shuffling_factor
         )
-        loop_A_s2v_bs = len(loop_g2s_a) + len(loop_g2s_a_scale)
+        loop_A_s2v_bs = len(loop_g2s_a_0) + len(loop_g2s_a_scale_0) + len(loop_g2s_a_1) + len(loop_g2s_a_scale_1)
         clusters = [
             tkw.cluster(
                 [
@@ -1844,7 +1877,7 @@ def get_mxfp4_asymmetric_schedule(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=loop_B_g2v_bs, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=loop_B_g2v_bs + 5, ds=0),
                     tkw.SchedulingBarrier([]),
                 ],
             ),
@@ -2012,10 +2045,6 @@ def get_mxfp4_asymmetric_schedule(
         tkw.insert_at_start(
             pipeline_loop.KERNEL,
             tkw.MemoryCounterWaitBarrier(load=A_g2s_per_iter, ds=0),
-        )
-        # Final drain after loop: wait for everything.
-        tkw.insert_after(
-            pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
         )
 
     return mxfp4_dbuf_schedule
