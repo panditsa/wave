@@ -20,6 +20,10 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/DebugLog.h"
+
+#define DEBUG_TYPE "wave-interfaces"
 
 using namespace mlir;
 
@@ -571,13 +575,13 @@ bool wave::detail::isReductionTypeInferenceComplete(Value input, Value init,
 }
 
 FailureOr<ChangeResult> wave::detail::propagateReductionIndexExprsForward(
-    TypeRange operandTypes, Type resultType,
+    TypeRange operandTypes, Value result,
     llvm::ArrayRef<IndexExprsLatticeStorage> operandExprs,
     llvm::MutableArrayRef<IndexExprsLatticeStorage> resultExprs,
     EmitErrorFn emitError) {
-  auto targetTensorType = dyn_cast<WaveTensorType>(resultType);
+  auto targetTensorType = dyn_cast<WaveTensorType>(result.getType());
   if (!targetTensorType) {
-    emitError() << "expected result tensor type, got " << resultType;
+    emitError() << "expected result tensor type, got " << result.getType();
     return failure();
   }
 
@@ -592,19 +596,19 @@ FailureOr<ChangeResult> wave::detail::propagateReductionIndexExprsForward(
   // Forward propagation is identity only for symbols that are present.
   return identityIndexExprsPropagate(
              operandExprs[0].keepOnlySymbols(targetTensorType.getShape()),
-             resultExprs, resultType, "reduced value", "result", emitError) |
-         identityIndexExprsPropagate(operandExprs[1], resultExprs, resultType,
+             resultExprs, result, "reduced value", "result", emitError) |
+         identityIndexExprsPropagate(operandExprs[1], resultExprs, result,
                                      "init", "result", emitError);
 }
 
 FailureOr<ChangeResult> wave::detail::propagateReductionIndexExprsBackward(
-    TypeRange operandTypes,
+    ValueRange operands,
     llvm::MutableArrayRef<IndexExprsLatticeStorage> operandExprs,
     llvm::ArrayRef<IndexExprsLatticeStorage> resultExprs,
     EmitErrorFn emitError) {
-  auto initTensorType = dyn_cast<WaveTensorType>(operandTypes[1]);
+  auto initTensorType = dyn_cast<WaveTensorType>(operands[1].getType());
   if (!initTensorType) {
-    emitError() << "expected init tensor type, got " << operandTypes[1];
+    emitError() << "expected init tensor type, got " << operands[1].getType();
     return failure();
   }
   if (operandExprs.size() != 2) {
@@ -617,14 +621,13 @@ FailureOr<ChangeResult> wave::detail::propagateReductionIndexExprsBackward(
   // expressions for symbols present in both target and source, but additional
   // propagation from the op defining the operand is needed to cover reduction
   // dimensions. Backward propagation to the init is full identity.
-  return identityIndexExprsPropagate(resultExprs[0], operandExprs, operandTypes,
+  return identityIndexExprsPropagate(resultExprs[0], operandExprs, operands,
                                      "result", "operands", emitError) |
          identityIndexExprsPropagate(
              operandExprs[0].keepOnlySymbols(initTensorType.getShape()),
-             operandExprs[1], operandTypes[1], "operand", "init", emitError) |
+             operandExprs[1], operands[1], "operand", "init", emitError) |
          identityIndexExprsPropagate(operandExprs[1], operandExprs[0],
-                                     operandTypes[0], "init", "operand",
-                                     emitError);
+                                     operands[0], "init", "operand", emitError);
 }
 
 //-----------------------------------------------------------------------------
@@ -1751,70 +1754,68 @@ llvm::operator<<(llvm::raw_ostream &os,
 
 llvm::FailureOr<ChangeResult> wave::detail::identityIndexExprsPropagate(
     llvm::ArrayRef<IndexExprsLatticeStorage> from,
-    llvm::MutableArrayRef<IndexExprsLatticeStorage> to, TypeRange toTypes,
+    llvm::MutableArrayRef<IndexExprsLatticeStorage> to, ValueRange toValues,
     llvm::StringRef fromName, llvm::StringRef toName,
     wave::EmitErrorFn emitError) {
-  // Join all "from" lattices.
-  IndexExprsLatticeStorage joined = IndexExprsLatticeStorage::bottom();
-  bool fromTop = false;
-  for (const IndexExprsLatticeStorage &fromLattice : from) {
-    // If one of the from lattices reached the top, no need to keep joining, the
-    // result is known to be top.
-    if (fromLattice.isTop()) {
-      fromTop = true;
-      joined = IndexExprsLatticeStorage::top();
-      break;
-    }
-    joined = IndexExprsLatticeStorage::join(joined, fromLattice);
-  }
-
-  // Report if joining non-top "from" lattices reached the top as this is
-  // indicative of a "sideways" conflict.
-  if (joined.isTop() && !fromTop) {
-    InFlightDiagnostic diag = emitError()
-                              << "incompatible " << fromName << " lattices"
-                              << " when propagating from those to " << toName;
-    for (auto &&[i, fromLattice] : llvm::enumerate(from)) {
-      diag.attachNote() << fromName << " #" << i << " lattice: " << fromLattice;
-    }
-    return diag;
-  }
-
-  // Propagate to all "to" lattices.
   ChangeResult changeResult = ChangeResult::NoChange;
-  for (auto &&[i, toLattice] : llvm::enumerate(to)) {
-    auto tensorType = llvm::dyn_cast<wave::WaveTensorType>(toTypes[i]);
-    if (!tensorType) {
-      toLattice = IndexExprsLatticeStorage::top();
+  for (auto &&[toNum, toLattice, toValue] : llvm::enumerate(to, toValues)) {
+    if (toLattice.isTop())
       continue;
-    }
-    IndexExprsLatticeStorage filtered =
-        joined.keepOnlySymbols(tensorType.getShape());
-    IndexExprsLatticeStorage newLattice =
-        IndexExprsLatticeStorage::join(toLattice, filtered);
 
-    // Report an error only when the lattice moved to the top state, which is
-    // indicative of a conflict, not when it was in the top state to start with.
-    // Also avoid reporting errors when joined lattice is in the top state: it
-    // is either reported above or it means the conflict was found elsewhere and
-    // we are just propagating it.
-    if (newLattice.isTop() && !toLattice.isTop() && !filtered.isTop()) {
-      InFlightDiagnostic diag =
-          emitError() << "conflict when propagating index expressions from "
-                      << fromName << " to " << toName << " #" << i;
-      diag.attachNote() << "original " << toName << " lattice: " << toLattice;
-      for (auto &&[j, fromLattice] : llvm::enumerate(from)) {
-        diag.attachNote() << fromName << " #" << j
-                          << " lattice: " << fromLattice;
+    auto toTensorType = dyn_cast<WaveTensorType>(toValue.getType());
+    if (!toTensorType || !toTensorType.getFullySpecified())
+      continue;
+
+    for (auto &&[fromNum, fromLattice] : llvm::enumerate(from)) {
+      bool fromTop = false;
+
+      // If one of the from lattices reached the top, no need to keep joining,
+      // the result is known to be top. The error will have been reported
+      // already, no need to repeat it.
+      if (fromLattice.isTop()) {
+        fromTop = true;
+        toLattice = IndexExprsLatticeStorage::top();
+        changeResult = ChangeResult::Change;
+        break;
       }
-      return diag;
-    }
 
-    if (newLattice != toLattice) {
-      changeResult = ChangeResult::Change;
-      toLattice = newLattice;
+      // XXX: a more efficient way would have been to join all "from" lattices
+      // first, and then join that into each "to" lattice. But this heuristic
+      // would not work in that case.
+      if (!wave::detail::shouldPropagateIndexExprs(fromLattice, toLattice,
+                                                   toValue)) {
+        LLVM_DEBUG(LDBG() << "not propagating index expressions from "
+                          << fromName << " #" << fromNum << " to " << toName
+                          << " #" << toNum << "\n";);
+        continue;
+      }
+
+      IndexExprsLatticeStorage joined =
+          IndexExprsLatticeStorage::join(toLattice, fromLattice);
+      if (joined.isTop() && !fromTop) {
+        bool isVectorShapeConflict =
+            failed(IndexExprsLatticeStorage::getJoinedVectorShape(
+                toLattice, fromLattice)) &&
+            toLattice.getVectorShape() && fromLattice.getVectorShape();
+        InFlightDiagnostic diag =
+            emitError() << "conflict when propagating "
+                        << (isVectorShapeConflict ? "vector shapes"
+                                                  : "index expressions")
+                        << " from " << fromName << " #" << fromNum << " to "
+                        << toName << " #" << toNum;
+        diag.attachNote() << "original " << toName << " lattice: " << toLattice;
+        diag.attachNote() << fromName << " #" << fromNum
+                          << " lattice: " << fromLattice;
+        return diag;
+      }
+      joined = joined.keepOnlySymbols(toTensorType.getShape());
+      if (joined != toLattice) {
+        changeResult = ChangeResult::Change;
+        toLattice = joined;
+      }
     }
   }
+
   return changeResult;
 }
 
