@@ -79,3 +79,20 @@ waveasm.program @no_precolored_cse target = #waveasm.target<#waveasm.gfx942, 5> 
 
   waveasm.s_endpgm
 }
+
+// Test 6: s_cmp_ne_u32 should NOT be CSE'd.
+// On hardware, s_cmp writes the implicit SCC flag with no destination
+// register. CSE would extend the SCC live range across SCC-clobbering ops.
+// CHECK-LABEL: waveasm.program @no_cse_s_cmp
+waveasm.program @no_cse_s_cmp target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
+  %s0 = waveasm.precolored.sreg 0 : !waveasm.psreg<0>
+  %c0 = waveasm.constant 0 : !waveasm.imm<0>
+
+  // Two identical s_cmp_ne_u32 - both should remain (SCC is hardware-only).
+  // CHECK: waveasm.s_cmp_ne_u32
+  // CHECK: waveasm.s_cmp_ne_u32
+  %cmp1 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.sreg
+  %cmp2 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.sreg
+
+  waveasm.s_endpgm
+}

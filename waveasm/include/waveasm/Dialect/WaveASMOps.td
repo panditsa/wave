@@ -159,6 +159,11 @@ class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
 // result as a regular sreg; this wastes one SGPR slot but is harmless
 // since the live range is very short (s_cmp -> condition terminator).
 // TODO: Consider a dedicated SCCType to avoid the wasted register slot.
+// WARNING: SALUCmpOp must NOT be CSE-eligible. On hardware, s_cmp sets the
+// implicit SCC flag with no destination register — the "result" SGPR is a
+// modeling fiction. CSE would merge two s_cmp ops, extending the SCC live
+// range across other SCC-clobbering ops, causing the second consumer to
+// read a stale SCC value.
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
