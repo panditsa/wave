@@ -212,6 +212,7 @@ class WaveASMCompiler:
             "--waveasm-scoped-cse",  # Re-deduplicate after offset folding.
             "--loop-invariant-code-motion",  # Re-hoist invariants created by offset opt / strength reduction.
             "--waveasm-loop-address-promotion",
+            "--waveasm-scc-spill-reload",  # Spill/reload SCC across clobbering ops.
             "--waveasm-scc-verifier",  # Verify no SCC hazards before regalloc.
             "--waveasm-linear-scan=max-vgprs=512 max-agprs=512",  # Register allocation.
             "--waveasm-vgpr-compaction",  # Compact VGPR assignments.

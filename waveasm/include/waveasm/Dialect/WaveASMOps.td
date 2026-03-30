@@ -158,16 +158,13 @@ class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
 // source operands (no destination). The register allocator treats the
 // result as a regular sreg; this wastes one SGPR slot per s_cmp.
 //
-// WARNING: SALUCmpOp must NOT be CSE-eligible. The "result" SGPR is a
-// modeling fiction — it is never written on hardware. CSE would merge two
-// s_cmp ops, extending the implicit SCC live range across SCC-clobbering
-// ops (s_and, s_or, s_add, etc.), causing stale SCC reads. The SCC
-// verifier catches this for ConditionOp/IfOp consumers but NOT for
-// s_cselect_b32 consumers (verifier gap).
-//
-// TODO: Introduce a dedicated SCCType for s_cmp results so regalloc does
-// not waste an SGPR, and add SCC spill/reload logic to enable safe CSE
-// (see waveasm_regalloc_analysis.md, issue #1).
+// NOTE: SALUCmpOp is NOT yet CSE-eligible. Enabling CSE requires making
+// s_cselect_b32 and s_addc_u32 take an explicit SCCType operand so the
+// spill/reload pass can track all SCC consumers via SSA use-def chains.
+// Currently s_cselect_b32 reads SCC implicitly (SCCUse trait, no SSA
+// operand), so the spill/reload pass cannot insert reloads before it.
+// The SCCSpillReload pass and infrastructure are in place for Phase 3
+// when explicit SCC operands are added.
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
