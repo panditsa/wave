@@ -315,7 +315,8 @@ inline mlir::Value emitAdd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_ADD_U32::create(builder, loc, sregType, sregType, a, b).getDst();
+    auto sccType = ctx.createSCCType();
+    return S_ADD_U32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_ADD_U32::create(builder, loc, vregType, a, b);
@@ -327,7 +328,8 @@ inline mlir::Value emitSub(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
                            mlir::Location loc, TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) && isSGPRType(a.getType())) {
     auto sregType = ctx.createSRegType();
-    return S_SUB_U32::create(builder, loc, sregType, sregType, a, b).getDst();
+    auto sccType = ctx.createSCCType();
+    return S_SUB_U32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_SUB_U32::create(builder, loc, vregType, a, b);
@@ -512,28 +514,28 @@ inline mlir::Value emitScalarCmp(mlir::OpBuilder &builder, mlir::Location loc,
                                  mlir::arith::CmpIPredicate pred,
                                  mlir::Value lhs, mlir::Value rhs,
                                  TranslationContext &ctx) {
-  auto sregType = ctx.createSRegType();
+  auto sccType = ctx.createSCCType();
   switch (pred) {
   case mlir::arith::CmpIPredicate::eq:
-    return S_CMP_EQ_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_EQ_U32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::ne:
-    return S_CMP_NE_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_NE_U32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::slt:
-    return S_CMP_LT_I32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_LT_I32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::sle:
-    return S_CMP_LE_I32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_LE_I32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::sgt:
-    return S_CMP_GT_I32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_GT_I32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::sge:
-    return S_CMP_GE_I32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_GE_I32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::ult:
-    return S_CMP_LT_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_LT_U32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::ule:
-    return S_CMP_LE_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_LE_U32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::ugt:
-    return S_CMP_GT_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_GT_U32::create(builder, loc, sccType, lhs, rhs);
   case mlir::arith::CmpIPredicate::uge:
-    return S_CMP_GE_U32::create(builder, loc, sregType, lhs, rhs);
+    return S_CMP_GE_U32::create(builder, loc, sccType, lhs, rhs);
   }
   llvm_unreachable("unhandled CmpIPredicate");
 }

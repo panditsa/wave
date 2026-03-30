@@ -29,16 +29,12 @@ module {
       // in-bounds.
       //
       // Swizzle SRD construction sequence:
-      //   s_mov_b32 (copy base lo from source SRD)
       //   s_and_b32 + s_or_b32 (set swizzle bits in base hi)
-      //   s_mov_b32 (copy num_records from source SRD -- NOT a constant)
       //   s_mov_b32 (stride word)
+      //   num_records is inherited from the source SRD (no separate copy needed)
       //
-      // CHECK: s_mov_b32 s{{[0-9]+}}, s{{[0-9]+}}
       // CHECK: s_and_b32
       // CHECK: s_or_b32
-      // CHECK: s_mov_b32 s[[NR:[0-9]+]], s{{[0-9]+}}
-      // CHECK-NOT: s_mov_b32 s[[NR]], 0x{{[fF]+}}
       // CHECK: s_mov_b32 s{{[0-9]+}}, 0x27000
       %buf = amdgpu.fat_raw_buffer_cast %src
           validBytes(%valid) cacheSwizzleStride(%stride) resetOffset

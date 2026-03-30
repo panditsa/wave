@@ -91,8 +91,8 @@ waveasm.program @no_cse_s_cmp target = #waveasm.target<#waveasm.gfx942, 5> abi =
   // Two identical s_cmp_ne_u32 - both should remain (SCC is hardware-only).
   // CHECK: waveasm.s_cmp_ne_u32
   // CHECK: waveasm.s_cmp_ne_u32
-  %cmp1 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.sreg
-  %cmp2 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.sreg
+  %cmp1 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.scc
+  %cmp2 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.scc
 
   waveasm.s_endpgm
 }

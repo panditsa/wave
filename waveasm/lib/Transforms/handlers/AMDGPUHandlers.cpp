@@ -422,7 +422,7 @@ static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
         auto result = V_READFIRSTLANE_B32::create(builder, loc, dstType, src);
         DCEProtectOp::create(builder, loc, result);
       } else {
-        auto sccType = ctx.createSRegType();
+        auto sccType = ctx.createSCCType();
         auto zeroImm = ctx.createImmType(0);
         auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
         S_ADD_U32::create(builder, loc, dstType, sccType, src, zeroConst);
@@ -951,8 +951,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
             bool m0IsSgpr = !isVGPRType(m0Val.getType());
             if (m0IsSgpr) {
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        totalConst)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, totalConst)
                           .getDst();
             } else {
               m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(),
@@ -975,8 +975,9 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
               bool rowIsSgpr = !isVGPRType(rowContrib.getType());
               if (m0IsSgpr && rowIsSgpr) {
                 auto sregType = ctx.createSRegType();
-                m0Val = S_ADD_U32::create(builder, loc, sregType, sregType,
-                                          m0Val, rowContrib)
+                m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                          ctx.createSCCType(), m0Val,
+                                          rowContrib)
                             .getDst();
               } else {
                 m0Val = convertToVgpr(m0Val);
@@ -995,8 +996,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
             bool m0IsSgpr = m0Val && !isVGPRType(m0Val.getType());
             if (m0IsSgpr) {
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        colConst)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, colConst)
                           .getDst();
             } else if (m0Val) {
               m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(),
@@ -1027,8 +1028,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
                 }
               }
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        colVal)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, colVal)
                           .getDst();
             } else {
               // At least one is VGPR: fall back to VALU
@@ -1057,8 +1058,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
           bool m0IsSgpr = !isVGPRType(m0Val.getType());
           if (m0IsSgpr) {
             auto sregType = ctx.createSRegType();
-            m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                      baseConst)
+            m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                      ctx.createSCCType(), m0Val, baseConst)
                         .getDst();
           } else {
             Value baseVgpr = V_MOV_B32::create(builder, loc,

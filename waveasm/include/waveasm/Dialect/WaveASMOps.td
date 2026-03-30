@@ -146,7 +146,7 @@ class SALUBinaryWithSCCOp<string mnemonic, list<Trait> traits = []>
 class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
-  let results = (outs WaveASM_AnySGPR:$dst, WaveASM_AnySGPR:$scc);
+  let results = (outs WaveASM_AnySGPR:$dst, WaveASM_SCC:$scc);
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst) `,` type($scc)";
 }
 
@@ -171,7 +171,7 @@ class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
-  let results = (outs WaveASM_AnySGPR:$result);  // SCC result (see note above)
+  let results = (outs WaveASM_SCC:$result);  // SCC flag (not a real SGPR)
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($result)";
 }
 

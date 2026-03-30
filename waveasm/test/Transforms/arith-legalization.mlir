@@ -352,13 +352,17 @@ waveasm.program @test_cmp_i64_slt_salu
   %b = waveasm.precolored.sreg 2, 2 : !waveasm.sreg<2, 2>
 
   // Ordered i64 slt (SALU): hiLt | (hiEq & loLt).
+  // Each s_cmp sets SCC, then s_cselect_b32 materializes the boolean to SGPR.
   // CHECK-DAG: [[A_LO:%.*]] = waveasm.precolored.sreg 0 : !waveasm.sreg
   // CHECK-DAG: [[A_HI:%.*]] = waveasm.precolored.sreg 1 : !waveasm.sreg
   // CHECK-DAG: [[B_LO:%.*]] = waveasm.precolored.sreg 2 : !waveasm.sreg
   // CHECK-DAG: [[B_HI:%.*]] = waveasm.precolored.sreg 3 : !waveasm.sreg
-  // CHECK: [[HI_LT:%.*]] = waveasm.s_cmp_lt_i32 [[A_HI]], [[B_HI]]
-  // CHECK: [[HI_EQ:%.*]] = waveasm.s_cmp_eq_i32 [[A_HI]], [[B_HI]]
-  // CHECK: [[LO_LT:%.*]] = waveasm.s_cmp_lt_u32 [[A_LO]], [[B_LO]]
+  // CHECK: waveasm.s_cmp_lt_i32 [[A_HI]], [[B_HI]]
+  // CHECK: [[HI_LT:%.*]] = waveasm.s_cselect_b32
+  // CHECK: waveasm.s_cmp_eq_i32 [[A_HI]], [[B_HI]]
+  // CHECK: [[HI_EQ:%.*]] = waveasm.s_cselect_b32
+  // CHECK: waveasm.s_cmp_lt_u32 [[A_LO]], [[B_LO]]
+  // CHECK: [[LO_LT:%.*]] = waveasm.s_cselect_b32
   // CHECK: [[EQ_AND_LO:%.*]] = waveasm.s_and_b32 [[HI_EQ]], [[LO_LT]]
   // CHECK: waveasm.s_or_b32 [[HI_LT]], [[EQ_AND_LO]]
   %cmp = waveasm.arith.cmp slt, %a, %b : (!waveasm.sreg<2, 2>, !waveasm.sreg<2, 2>) -> !waveasm.sreg

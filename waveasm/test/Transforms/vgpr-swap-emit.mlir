@@ -20,10 +20,11 @@ waveasm.program @vgpr_swap_iter_args
   %init_a = waveasm.v_mov_b32 %c0 : !waveasm.imm<0> -> !waveasm.vreg
   %init_b = waveasm.v_mov_b32 %c42 : !waveasm.imm<42> -> !waveasm.vreg
 
-  // Loop that swaps %a and %b each iteration.
-  // CHECK: v_mov_b32 v
-  // CHECK: v_mov_b32 v
-  // CHECK: v_mov_b32 v
+  // Loop that swaps %a and %b each iteration via v_swap_b32.
+  // CHECK: v_add_u32
+  // CHECK: s_add_u32
+  // CHECK: s_cmp_lt_u32
+  // CHECK: v_swap_b32
   // CHECK: s_cbranch_scc1
   %r:3 = waveasm.loop(%iv = %init_iv, %a = %init_a, %b = %init_b)
       : (!waveasm.sreg, !waveasm.vreg, !waveasm.vreg)
@@ -32,10 +33,10 @@ waveasm.program @vgpr_swap_iter_args
     // Use both so they're not dead.
     %sum = waveasm.v_add_u32 %a, %b : !waveasm.vreg, !waveasm.vreg -> !waveasm.vreg
 
-    %next_iv:2 = waveasm.s_add_u32 %iv, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.sreg
-    %cond = waveasm.s_cmp_lt_u32 %next_iv#0, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.sreg
+    %next_iv:2 = waveasm.s_add_u32 %iv, %c1 : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.scc
+    %cond = waveasm.s_cmp_lt_u32 %next_iv#0, %limit : !waveasm.sreg, !waveasm.imm<8> -> !waveasm.scc
     // Swap: pass %b as new %a, %a as new %b.
-    waveasm.condition %cond : !waveasm.sreg iter_args(%next_iv#0, %b, %a) : !waveasm.sreg, !waveasm.vreg, !waveasm.vreg
+    waveasm.condition %cond : !waveasm.scc iter_args(%next_iv#0, %b, %a) : !waveasm.sreg, !waveasm.vreg, !waveasm.vreg
   }
 
   waveasm.s_endpgm

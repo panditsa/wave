@@ -78,6 +78,9 @@ std::string KernelGenerator::resolveValue(Value value) {
     return "0";
   }
 
+  if (isa<SCCType>(ty))
+    return "scc";
+
   return "<unknown>";
 }
 

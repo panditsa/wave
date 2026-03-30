@@ -600,7 +600,7 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     Value condV = *cond;
     if (isImmType(condV.getType()))
       condV = S_MOV_B32::create(builder, loc, ctx.createSRegType(), condV);
-    S_CMP_NE_U32::create(builder, loc, ctx.createSRegType(), condV, zeroConst);
+    S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(), condV, zeroConst);
     auto sregType = ctx.createSRegType();
     Value trueV = *trueVal;
     Value falseV = *falseVal;

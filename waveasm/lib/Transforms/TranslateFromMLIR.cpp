@@ -67,6 +67,10 @@ ARegType TranslationContext::createARegType(int64_t size, int64_t alignment) {
   return ARegType::get(builder.getContext(), size, alignment);
 }
 
+SCCType TranslationContext::createSCCType() {
+  return SCCType::get(builder.getContext());
+}
+
 ImmType TranslationContext::createImmType(int64_t value) {
   return ImmType::get(builder.getContext(), value);
 }
@@ -632,7 +636,7 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
 
   // Adjust SRD base: s_add_u32 (sets SCC) + s_addc_u32 (reads SCC).
   // Non-Pure S_ADD_U32/S_ADDC_U32 anchor the chain and prevent DCE.
-  auto sccType = ctx.createSRegType();
+  auto sccType = ctx.createSCCType();
   auto base0Type = PSRegType::get(mlirCtx, N, 1);
   auto base1Type = PSRegType::get(mlirCtx, N + 1, 1);
   auto base0 = PrecoloredSRegOp::create(builder, loc, base0Type, N, 1);
@@ -651,10 +655,10 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
           V_READFIRSTLANE_B32::create(builder, loc, numRecType, nrVal);
       DCEProtectOp::create(builder, loc, result);
     } else {
-      auto sccType = ctx.createSRegType();
+      auto sccType2 = ctx.createSCCType();
       auto zeroImm = ctx.createImmType(0);
       auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-      S_ADD_U32::create(builder, loc, numRecType, sccType, nrVal, zeroConst);
+      S_ADD_U32::create(builder, loc, numRecType, sccType2, nrVal, zeroConst);
     }
   } else {
     int64_t bufferSize = ctx.getBufferSizeForSRD(adj.srcSrdBase);
