@@ -254,19 +254,17 @@ static AffineExpr normalizeExpr(AffineExpr e, MLIRContext *ctx) {
   }
 }
 
-// 32-bit unsigned Barrett reduction: floordiv(x, d) exact for all uint32.
-// Matches LLVM's __udivsi3 lowering:
-//   1. Float rcp seed  →  Newton-Raphson refinement  →  exact reciprocal
-//   2. q = mulhi(x, recip)
-//   3. Two remainder-based correction steps
-// When both inputs are scalar, extracts the result back to SGPR via
-// v_readfirstlane_b32 so downstream arithmetic stays in SALU.
-Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
-                           TranslationContext &ctx) {
-  bool bothScalar = isScalarOrImm(x) && isScalarOrImm(d);
+// Compute the Barrett reciprocal of divisor d (Steps 1-2 of the Barrett
+// reduction).  The result is cached by divisor SSA value so that multiple
+// divisions by the same d reuse the same reciprocal (~8 VALU saved per hit).
+static Value getOrComputeBarrettReciprocal(Value d, OpBuilder &builder,
+                                           Location loc,
+                                           TranslationContext &ctx) {
+  // Check the expression cache first.
+  if (auto cached = ctx.getCachedExpr("barrett_recip", {d}))
+    return *cached;
+
   auto vregType = ctx.createVRegType();
-  x = ensureVGPR(builder, x.getLoc(), ctx, x);
-  d = ensureVGPR(builder, d.getLoc(), ctx, d);
   Value zeroConst = createImmConst(0, builder, loc, ctx);
 
   // --- Step 1: float reciprocal seed ---
@@ -284,6 +282,29 @@ Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
   Value e = V_MUL_LO_U32::create(builder, loc, vregType, negD, recip);
   Value err = V_MUL_HI_U32::create(builder, loc, vregType, recip, e);
   recip = V_ADD_U32::create(builder, loc, vregType, recip, err);
+
+  ctx.cacheExpr("barrett_recip", {d}, {}, recip);
+  return recip;
+}
+
+// 32-bit unsigned Barrett reduction: floordiv(x, d) exact for all uint32.
+// Matches LLVM's __udivsi3 lowering:
+//   1. Float rcp seed  →  Newton-Raphson refinement  →  exact reciprocal
+//   2. q = mulhi(x, recip)
+//   3. Two remainder-based correction steps
+// When both inputs are scalar, extracts the result back to SGPR via
+// v_readfirstlane_b32 so downstream arithmetic stays in SALU.
+Value emitUnsignedFloordiv(Value x, Value d, OpBuilder &builder, Location loc,
+                           TranslationContext &ctx) {
+  bool bothScalar = isScalarOrImm(x) && isScalarOrImm(d);
+  auto vregType = ctx.createVRegType();
+  x = ensureVGPR(builder, x.getLoc(), ctx, x);
+  d = ensureVGPR(builder, d.getLoc(), ctx, d);
+
+  Value zeroConst = createImmConst(0, builder, loc, ctx);
+
+  // Steps 1-2 (reciprocal + Newton-Raphson) cached by divisor.
+  Value recip = getOrComputeBarrettReciprocal(d, builder, loc, ctx);
 
   // --- Step 3: quotient ---
   Value q = V_MUL_HI_U32::create(builder, loc, vregType, x, recip);

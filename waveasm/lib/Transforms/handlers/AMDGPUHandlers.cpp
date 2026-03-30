@@ -83,6 +83,17 @@ LogicalResult handleROCDLSetPrio(Operation *op, TranslationContext &ctx) {
   return success();
 }
 
+/// Handle rocdl.sched.barrier — compiler scheduling hint, not a HW instruction.
+/// The WaveASM backend does its own scheduling, so we emit a comment for
+/// traceability rather than a real instruction (the LLVM assembler would
+/// reject s_sched_barrier in raw assembly).
+LogicalResult handleROCDLSchedBarrier(Operation *op, TranslationContext &ctx) {
+  auto schedBarrierOp = cast<ROCDL::SchedBarrier>(op);
+  int32_t mask = schedBarrierOp.getMask();
+  ctx.emitComment("sched_barrier mask=" + std::to_string(mask));
+  return success();
+}
+
 LogicalResult handleAMDGPUMfma(Operation *op, TranslationContext &ctx) {
   auto mfmaOp = cast<amdgpu::MFMAOp>(op);
   auto &builder = ctx.getBuilder();

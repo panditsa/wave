@@ -1199,6 +1199,10 @@ def WaveASM_S_SETPRIO : WaveASM_CountedScalarOp<"s_setprio"> {
   let summary = "Set wave priority level (0=default, 1-3=elevated)";
 }
 
+def WaveASM_S_SCHED_BARRIER : WaveASM_CountedScalarOp<"s_sched_barrier"> {
+  let summary = "Scheduling barrier (bitmask controls which instructions cross)";
+}
+
 //===----------------------------------------------------------------------===//
 // Misc/Utility Operations
 //===----------------------------------------------------------------------===//
