@@ -345,7 +345,6 @@ public:
     int64_t argIndex;     // Which kernel argument (0, 1, 2, ...)
     int64_t bufferSize;   // Size in bytes for SRD[2]
     int64_t srdBaseIndex; // SGPR index for SRD (e.g., 8 for s[8:11])
-    bool willBeModifiedInPlace = false; // Skip SRD[2:3] writes in prologue.
   };
 
   /// Information about a pending scalar kernel argument load (index, i32, etc.)
@@ -359,10 +358,6 @@ public:
 
   /// Queue a scalar argument load from the kernarg buffer
   void queueScalarArgLoad(mlir::Value blockArg, int64_t argIndex);
-
-  /// Pre-scan function body to mark SRDs that will be modified in-place by
-  /// handleFatRawBufferCast, so emitSRDPrologue can skip dead SRD[2:3] writes.
-  void markSRDsModifiedInPlace(mlir::Region &body);
 
   /// Emit all pending SRD setup instructions (called at start of kernel body)
   void emitSRDPrologue();
