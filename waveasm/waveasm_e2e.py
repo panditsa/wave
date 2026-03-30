@@ -210,6 +210,7 @@ class WaveASMCompiler:
             "--waveasm-memory-offset-opt",  # Fold constant addresses into offset fields.
             "--canonicalize",  # Clean up dead instructions from offset opt.
             "--waveasm-scoped-cse",  # Re-deduplicate after offset folding.
+            "--loop-invariant-code-motion",  # Re-hoist invariants created by offset opt / strength reduction.
             "--waveasm-loop-address-promotion",
             "--waveasm-scc-verifier",  # Verify no SCC hazards before regalloc.
             "--waveasm-linear-scan=max-vgprs=512 max-agprs=512",  # Register allocation.

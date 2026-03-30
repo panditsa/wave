@@ -1332,6 +1332,7 @@ def _generate_asm_code(mb, options):
             "--waveasm-memory-offset-opt",
             "--canonicalize",
             "--waveasm-scoped-cse",
+            "--loop-invariant-code-motion",
         ]
         # (2,2) wave shapes generate extract_strided_slice -> V_BFE_U32
         # for scale extraction, creating load->VALU data hazards that
@@ -1389,7 +1390,7 @@ def _generate_asm_code(mb, options):
                 result = _run_translate([])
 
         if result.returncode != 0:
-            raise RuntimeError(f"waveasm-translate failed:\n{result.stderr}")
+            raise RuntimeError("waveasm-translate failed (see stderr output above)")
         asm_text = result.stdout
     finally:
         os.unlink(mlir_path)
