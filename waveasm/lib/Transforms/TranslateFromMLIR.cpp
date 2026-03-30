@@ -155,6 +155,30 @@ void TranslationContext::queueScalarArgLoad(Value blockArg, int64_t argIndex) {
   pendingScalarArgs.push_back(pending);
 }
 
+void TranslationContext::markSRDsModifiedInPlace(Region &body) {
+  // Collect memref Values whose SRDs are modified in-place by
+  // FatRawBufferCastOp with cache swizzle (3+ operands).
+  llvm::DenseSet<Value> modifiedMemrefs;
+
+  body.walk([&](amdgpu::FatRawBufferCastOp castOp) {
+    if (castOp->getNumOperands() < 3)
+      return;
+
+    // Trace source memref back through casts.
+    Value src = castOp->getOperand(0);
+    while (auto c = src.getDefiningOp<memref::CastOp>())
+      src = c.getSource();
+    while (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>())
+      src = rc.getSource();
+
+    modifiedMemrefs.insert(src);
+  });
+
+  for (auto &pending : pendingSRDs)
+    if (modifiedMemrefs.count(pending.memref))
+      pending.willBeModifiedInPlace = true;
+}
+
 void TranslationContext::emitSRDPrologue() {
   if (srdPrologueEmitted || (pendingSRDs.empty() && pendingScalarArgs.empty()))
     return;
@@ -331,14 +355,18 @@ void TranslationContext::emitSRDPrologue() {
                               std::to_string(preloadBase + 1) + "]";
       RawOp::create(builder, loc, movB64Str);
 
-      int64_t clampedSize = std::min(pending.bufferSize, kMaxNumRecords32);
-      RawOp::create(builder, loc,
-                    "s_mov_b32 s" + std::to_string(srdBase + 2) + ", 0x" +
-                        llvm::utohexstr(clampedSize));
+      // Skip SRD[2:3] writes when handleFatRawBufferCast will overwrite them.
+      if (!pending.willBeModifiedInPlace) {
+        int64_t clampedSize = std::min(pending.bufferSize, kMaxNumRecords32);
+        RawOp::create(builder, loc,
+                      "s_mov_b32 s" + std::to_string(srdBase + 2) + ", 0x" +
+                          llvm::utohexstr(clampedSize));
 
-      std::string movStrideStr = "s_mov_b32 s" + std::to_string(srdBase + 3) +
-                                 ", 0x" + llvm::utohexstr(kSRDStrideSwizzle);
-      RawOp::create(builder, loc, movStrideStr);
+        std::string movStrideStr =
+            "s_mov_b32 s" + std::to_string(srdBase + 3) + ", 0x" +
+            llvm::utohexstr(kSRDStrideSwizzle);
+        RawOp::create(builder, loc, movStrideStr);
+      }
 
       // Prevent DCE from removing this PrecoloredSRegOp. The SRD registers
       // are later referenced by RawOps (e.g., s_mov_b64 for epilogue SRD
@@ -2135,6 +2163,9 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
       }
     }
 
+    // Pre-scan for fat_raw_buffer_cast to skip dead SRD[2:3] writes.
+    ctx.markSRDsModifiedInPlace(gpuFunc.getBody());
+
     // Emit SRD prologue (s_load, s_waitcnt, s_mov instructions)
     ctx.emitSRDPrologue();
 
@@ -2234,6 +2265,9 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
         (void)translateOperation(&op, ctx);
       }
     }
+
+    // Pre-scan for fat_raw_buffer_cast to skip dead SRD[2:3] writes.
+    ctx.markSRDsModifiedInPlace(funcOp.getBody());
 
     // Emit SRD prologue (s_load, s_waitcnt, s_mov instructions)
     ctx.emitSRDPrologue();
@@ -2418,6 +2452,9 @@ LogicalResult translateModule(ModuleOp module,
         (void)translateOperation(&op, transCtx);
       }
     }
+
+    // Pre-scan for fat_raw_buffer_cast to skip dead SRD[2:3] writes.
+    transCtx.markSRDsModifiedInPlace(funcOp.getBody());
 
     // Emit SRD prologue
     transCtx.emitSRDPrologue();
