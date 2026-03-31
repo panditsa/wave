@@ -157,9 +157,9 @@ waveasm.program @test_add_i64_salu
   // CHECK-DAG: [[A_HI:%.*]] = waveasm.precolored.sreg 1 : !waveasm.sreg
   // CHECK-DAG: [[B_LO:%.*]] = waveasm.precolored.sreg 2 : !waveasm.sreg
   // CHECK-DAG: [[B_HI:%.*]] = waveasm.precolored.sreg 3 : !waveasm.sreg
-  // Carry chain: s_add_u32 (lo) then s_addc_u32 (hi).
-  // CHECK: [[LO:%.*]], %{{.*}} = waveasm.s_add_u32 [[A_LO]], [[B_LO]]
-  // CHECK-NEXT: [[HI:%.*]], %{{.*}} = waveasm.s_addc_u32 [[A_HI]], [[B_HI]]
+  // Carry chain: s_add_u32 (lo) then s_addc_u32 (hi, with explicit SCC-in).
+  // CHECK: [[LO:%.*]], [[SCC:%.*]] = waveasm.s_add_u32 [[A_LO]], [[B_LO]]
+  // CHECK-NEXT: [[HI:%.*]], %{{.*}} = waveasm.s_addc_u32 [[SCC]], [[A_HI]], [[B_HI]]
   // CHECK: waveasm.pack [[LO]], [[HI]]
   %add = waveasm.arith.add %a, %b : (!waveasm.sreg<2, 2>, !waveasm.sreg<2, 2>) -> !waveasm.sreg<2, 2>
 
@@ -357,12 +357,12 @@ waveasm.program @test_cmp_i64_slt_salu
   // CHECK-DAG: [[A_HI:%.*]] = waveasm.precolored.sreg 1 : !waveasm.sreg
   // CHECK-DAG: [[B_LO:%.*]] = waveasm.precolored.sreg 2 : !waveasm.sreg
   // CHECK-DAG: [[B_HI:%.*]] = waveasm.precolored.sreg 3 : !waveasm.sreg
-  // CHECK: waveasm.s_cmp_lt_i32 [[A_HI]], [[B_HI]]
-  // CHECK: [[HI_LT:%.*]] = waveasm.s_cselect_b32
-  // CHECK: waveasm.s_cmp_eq_i32 [[A_HI]], [[B_HI]]
-  // CHECK: [[HI_EQ:%.*]] = waveasm.s_cselect_b32
-  // CHECK: waveasm.s_cmp_lt_u32 [[A_LO]], [[B_LO]]
-  // CHECK: [[LO_LT:%.*]] = waveasm.s_cselect_b32
+  // CHECK: [[SCC1:%.*]] = waveasm.s_cmp_lt_i32 [[A_HI]], [[B_HI]]
+  // CHECK: [[HI_LT:%.*]] = waveasm.s_cselect_b32 [[SCC1]],
+  // CHECK: [[SCC2:%.*]] = waveasm.s_cmp_eq_i32 [[A_HI]], [[B_HI]]
+  // CHECK: [[HI_EQ:%.*]] = waveasm.s_cselect_b32 [[SCC2]],
+  // CHECK: [[SCC3:%.*]] = waveasm.s_cmp_lt_u32 [[A_LO]], [[B_LO]]
+  // CHECK: [[LO_LT:%.*]] = waveasm.s_cselect_b32 [[SCC3]],
   // CHECK: [[EQ_AND_LO:%.*]] = waveasm.s_and_b32 [[HI_EQ]], [[LO_LT]]
   // CHECK: waveasm.s_or_b32 [[HI_LT]], [[EQ_AND_LO]]
   %cmp = waveasm.arith.cmp slt, %a, %b : (!waveasm.sreg<2, 2>, !waveasm.sreg<2, 2>) -> !waveasm.sreg

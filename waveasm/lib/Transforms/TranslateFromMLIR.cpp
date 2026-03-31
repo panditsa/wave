@@ -641,8 +641,8 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
   auto base1Type = PSRegType::get(mlirCtx, N + 1, 1);
   auto base0 = PrecoloredSRegOp::create(builder, loc, base0Type, N, 1);
   auto base1 = PrecoloredSRegOp::create(builder, loc, base1Type, N + 1, 1);
-  S_ADD_U32::create(builder, loc, base0Type, sccType, base0, byteOffLo);
-  S_ADDC_U32::create(builder, loc, base1Type, sccType, base1, byteOffHi);
+  auto addLo = S_ADD_U32::create(builder, loc, base0Type, sccType, base0, byteOffLo);
+  S_ADDC_U32::create(builder, loc, base1Type, sccType, addLo.getScc(), base1, byteOffHi);
 
   // Set num_records: prefer the override from fat_raw_buffer_cast's
   // validBytes (gives tight OOB protection for epilogue elimination),

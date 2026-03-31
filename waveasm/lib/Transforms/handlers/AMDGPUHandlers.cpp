@@ -397,7 +397,7 @@ static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
         if (cmpLhsMapped && cmpRhsMapped && trueMapped && falseMapped &&
             isScalarOrImm(*cmpLhsMapped) && isScalarOrImm(*cmpRhsMapped) &&
             isScalarOrImm(*trueMapped) && isScalarOrImm(*falseMapped)) {
-          emitScalarCmp(builder, loc, cmpOp.getPredicate(),
+          Value sccVal = emitScalarCmp(builder, loc, cmpOp.getPredicate(),
                         *cmpLhsMapped, *cmpRhsMapped, ctx);
 
           auto dstType = PSRegType::get(builder.getContext(), srdBase + 2, 1);
@@ -407,7 +407,7 @@ static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
           if (isImmType(trueV.getType()))
             trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
           auto result =
-              S_CSELECT_B32::create(builder, loc, dstType, trueV, falseV);
+              S_CSELECT_B32::create(builder, loc, dstType, sccVal, trueV, falseV);
           DCEProtectOp::create(builder, loc, result);
           return;
         }

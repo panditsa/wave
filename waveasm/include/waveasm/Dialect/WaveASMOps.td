@@ -135,19 +135,24 @@ class SALUBinaryWithSCCOp<string mnemonic, list<Trait> traits = []>
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst)";
 }
 
-// SALU Binary with carry/SCC: dst, scc = op(src0, src1)
-// s_add_u32 and s_addc_u32 set SCC (carry flag) as a side effect.
-// We model SCC as an explicit sreg result so the verifier can prevent
-// reordering ops that corrupt the carry chain.
-// TODO: The scc result should be fed as an explicit operand to s_addc_u32
-// when used in an add-with-carry chain (s_add_u32 → s_addc_u32), creating
-// a true SSA dependency. Currently the chain is only enforced by emission
-// ordering, not by the SSA graph.
+// SALU Binary with carry-out: dst, scc = op(src0, src1)
+// Sets SCC as a side effect (carry-out). Used for S_ADD_U32, S_SUB_U32, etc.
 class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
   let results = (outs WaveASM_AnySGPR:$dst, WaveASM_SCC:$scc);
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst) `,` type($scc)";
+}
+
+// SALU Binary with carry-in AND carry-out: dst, scc = op(scc_in, src0, src1)
+// Reads SCC (carry-in) and writes SCC (carry-out). Used for S_ADDC_U32.
+// The explicit $scc_in operand creates a true SSA dependency for the
+// carry chain (s_add_u32 → s_addc_u32), enabling correct CSE behavior.
+class SALUBinaryWithCarryInOp<string mnemonic, list<Trait> traits = []>
+    : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef, WaveASM_SCCUse], traits)> {
+  let arguments = (ins WaveASM_SCC:$scc_in, WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
+  let results = (outs WaveASM_AnySGPR:$dst, WaveASM_SCC:$scc);
+  let assemblyFormat = "$scc_in `,` $src0 `,` $src1 attr-dict `:` type($scc_in) `,` type($src0) `,` type($src1) `->` type($dst) `,` type($scc)";
 }
 
 // SALU Compare: returns condition in SCC.
@@ -158,13 +163,14 @@ class SALUBinaryWithCarryOp<string mnemonic, list<Trait> traits = []>
 // source operands (no destination). The register allocator treats the
 // result as a regular sreg; this wastes one SGPR slot per s_cmp.
 //
-// NOTE: SALUCmpOp is NOT yet CSE-eligible. Enabling CSE requires making
-// s_cselect_b32 and s_addc_u32 take an explicit SCCType operand so the
-// spill/reload pass can track all SCC consumers via SSA use-def chains.
-// Currently s_cselect_b32 reads SCC implicitly (SCCUse trait, no SSA
-// operand), so the spill/reload pass cannot insert reloads before it.
-// The SCCSpillReload pass and infrastructure are in place for Phase 3
-// when explicit SCC operands are added.
+// SALUCmpOp is NOT yet CSE-eligible.  S_CSELECT_B32 and S_ADDC_U32
+// now have explicit SCC operands, but SALUBinaryWithSCCOp ops
+// (S_AND_B32, S_OR_B32, etc.) also write SCC as a side-effect and are
+// already CSE-eligible.  When CSE merges those ops, the SCC that a
+// later s_cselect_b32 reads becomes stale.  Enabling CSE on SALUCmpOp
+// removes s_cmp "SCC barriers" that previously protected those paths.
+// Full fix requires the spill/reload pass to handle ALL SCCDef ops,
+// not just SCCType results.
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
     : WAVEASMOp<mnemonic, !listconcat([WaveASM_SCCDef], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
@@ -770,19 +776,19 @@ def WaveASM_S_ABS_I32 : SALUUnaryWithSCCOp<"s_abs_i32">;
 
 // Arithmetic with carry (sets SCC)
 def WaveASM_S_ADD_U32 : SALUBinaryWithCarryOp<"s_add_u32">;
-def WaveASM_S_ADDC_U32 : SALUBinaryWithCarryOp<"s_addc_u32">;
+def WaveASM_S_ADDC_U32 : SALUBinaryWithCarryInOp<"s_addc_u32">;
 def WaveASM_S_ADD_I32 : SALUBinaryWithCarryOp<"s_add_i32">;
 def WaveASM_S_SUB_U32 : SALUBinaryWithCarryOp<"s_sub_u32">;
 def WaveASM_S_SUB_I32 : SALUBinaryWithCarryOp<"s_sub_i32">;
 // Conditional select: dst = SCC ? src0 : src1 (reads SCC, no SCC write).
-// NOT Pure/ArithmeticOp — result depends on implicit SCC state, so NOT
-// CSE-eligible (two s_cselect_b32 with same operands can give different
-// results if SCC differs).  NoMemoryEffect allows DCE of unused results.
+// Conditional select: dst = SCC ? src0 : src1.
+// Takes an explicit SCC operand for SSA tracking of the SCC dependency.
+// NOT CSE-eligible: result depends on SCC state.  NoMemoryEffect allows DCE.
 def WaveASM_S_CSELECT_B32 : WAVEASMOp<"s_cselect_b32",
     [WaveASM_SCCUse, NoMemoryEffect]> {
-  let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
+  let arguments = (ins WaveASM_SCC:$scc_in, WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
   let results = (outs WaveASM_AnySGPR:$dst);
-  let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst)";
+  let assemblyFormat = "$scc_in `,` $src0 `,` $src1 attr-dict `:` type($scc_in) `,` type($src0) `,` type($src1) `->` type($dst)";
 }
 // Multiplication does not set SCC
 def WaveASM_S_MUL_I32 : SALUBinaryOp<"s_mul_i32">;

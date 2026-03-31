@@ -188,7 +188,7 @@ static void legalizeAddI64(Value lhs, Value rhs, ArithAddOp op,
     auto addLo = S_ADD_U32::create(builder, loc, sregTy, sccTy, lhsLo, rhsLo);
     loResult = addLo.getDst();
     // s_addc_u32: hi + hi + carry in from SCC.
-    auto addHi = S_ADDC_U32::create(builder, loc, sregTy, sccTy, lhsHi, rhsHi);
+    auto addHi = S_ADDC_U32::create(builder, loc, sregTy, sccTy, addLo.getScc(), lhsHi, rhsHi);
     hiResult = addHi.getDst();
   }
 
@@ -433,14 +433,14 @@ static LogicalResult legalizeCmpI64(Value lhs, Value rhs, CmpPredicate pred,
       Value one = ConstantOp::create(builder, loc, immTy1, 1);
       Value oneSgpr = S_MOV_B32::create(builder, loc, sregTy, one);
 
-      emitSCmp(hiPred, lhsHi, rhsHi, builder, loc);
-      Value hiCmp = S_CSELECT_B32::create(builder, loc, sregTy, oneSgpr, zero);
+      Value hiSCC = emitSCmp(hiPred, lhsHi, rhsHi, builder, loc);
+      Value hiCmp = S_CSELECT_B32::create(builder, loc, sregTy, hiSCC, oneSgpr, zero);
 
-      emitSCmp(CmpPredicate::eq, lhsHi, rhsHi, builder, loc);
-      Value hiEq = S_CSELECT_B32::create(builder, loc, sregTy, oneSgpr, zero);
+      Value eqSCC = emitSCmp(CmpPredicate::eq, lhsHi, rhsHi, builder, loc);
+      Value hiEq = S_CSELECT_B32::create(builder, loc, sregTy, eqSCC, oneSgpr, zero);
 
-      emitSCmp(loPred, lhsLo, rhsLo, builder, loc);
-      Value loCmp = S_CSELECT_B32::create(builder, loc, sregTy, oneSgpr, zero);
+      Value loSCC = emitSCmp(loPred, lhsLo, rhsLo, builder, loc);
+      Value loCmp = S_CSELECT_B32::create(builder, loc, sregTy, loSCC, oneSgpr, zero);
 
       Value eqAndLo = S_AND_B32::create(builder, loc, sregTy, hiEq, loCmp);
       Value result = S_OR_B32::create(builder, loc, sregTy, hiCmp, eqAndLo);

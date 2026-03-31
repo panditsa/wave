@@ -417,11 +417,12 @@ static Value emitCeilFromFloorQuotient(Value q, Value x, Value d,
     Value rem = emitSub(x, qd, builder, loc, ctx);
     Value zeroConst = createImmConst(0, builder, loc, ctx);
     // s_cmp_lg_u32 sets SCC = (rem != 0)
-    S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(), rem, zeroConst);
+    Value sccVal =
+        S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(), rem, zeroConst);
     // s_addc_u32: dst = q + 0 + SCC (carry-in from SCC)
     auto sregType = ctx.createSRegType();
     auto sccType = ctx.createSCCType();
-    return S_ADDC_U32::create(builder, loc, sregType, sccType, q, zeroConst)
+    return S_ADDC_U32::create(builder, loc, sregType, sccType, sccVal, q, zeroConst)
         .getDst();
   }
   auto vregType = ctx.createVRegType();
@@ -834,12 +835,12 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             Value rem = emitAnd(lhs, maskConst, builder, loc, ctx);
             Value zeroConst = createImmConst(0, builder, loc, ctx);
             if (isScalarOrImm(rem)) {
-              S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(), rem,
-                                   zeroConst);
+              Value sccVal = S_CMP_NE_U32::create(builder, loc,
+                                   ctx.createSCCType(), rem, zeroConst);
               auto sregType = ctx.createSRegType();
               auto sccType = ctx.createSCCType();
               Value result =
-                  S_ADDC_U32::create(builder, loc, sregType, sccType, q,
+                  S_ADDC_U32::create(builder, loc, sregType, sccType, sccVal, q,
                                      zeroConst)
                       .getDst();
               return ExprResult(result, BitRange());

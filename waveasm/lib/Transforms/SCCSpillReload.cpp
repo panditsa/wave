@@ -138,9 +138,9 @@ private:
                                           immTy1, 1);
       Value zeroConst = ConstantOp::create(builder, info.producer->getLoc(),
                                            immTy0, 0);
-      // s_cselect_b32 reads SCC implicitly: dst = SCC ? src0 : src1.
+      // s_cselect_b32 reads SCC explicitly: dst = SCC ? src0 : src1.
       Value spillSgpr = S_CSELECT_B32::create(
-          builder, info.producer->getLoc(), sregTy, oneConst, zeroConst);
+          builder, info.producer->getLoc(), sregTy, info.sccValue, oneConst, zeroConst);
 
       LLVM_DEBUG(llvm::dbgs()
                  << "SCC spill: inserted s_cselect_b32 after "

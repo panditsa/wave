@@ -878,6 +878,7 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           })
 
       // SALU arithmetic ops that set SCC: emit dst and operands, skip scc.
+      // S_ADDC_U32 has an explicit SCC-in operand that must also be skipped.
       .Case<S_ADD_U32, S_ADDC_U32, S_ADD_I32, S_SUB_U32, S_SUB_I32>(
           [&](auto addOp) -> std::optional<std::string> {
             llvm::StringRef opName = addOp->getName().getStringRef();
@@ -889,6 +890,9 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             // Only emit the first result (dst), not the second (scc)
             operands.push_back(resolveValue(addOp.getDst()));
             for (Value operand : addOp->getOperands()) {
+              // Skip SCC-typed operands (carry-in for s_addc_u32).
+              if (isa<SCCType>(operand.getType()))
+                continue;
               operands.push_back(resolveValue(operand));
             }
             return formatter.format(mnemonic, operands);
@@ -997,6 +1001,16 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
               operands.push_back("vcc");
             return prefix + formatter.format(carryOp->getName().stripDialect(),
                                              operands);
+          })
+
+      // S_CSELECT_B32: emit dst, src0, src1 — skip the SCC-in operand.
+      .Case<S_CSELECT_B32>(
+          [&](S_CSELECT_B32 selOp) -> std::optional<std::string> {
+            llvm::SmallVector<std::string> operands;
+            operands.push_back(resolveValue(selOp.getDst()));
+            operands.push_back(resolveScalarValue(selOp.getSrc0()));
+            operands.push_back(resolveScalarValue(selOp.getSrc1()));
+            return formatter.format("s_cselect_b32", operands);
           })
 
       .Default([&](Operation *defaultOp) -> std::optional<std::string> {
