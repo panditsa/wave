@@ -302,7 +302,15 @@ LogicalResult handleMemRefStore(Operation *op, TranslationContext &ctx) {
       srd = lookupSRD(storeOp.getMemref(), ctx, loc);
     }
 
-    BUFFER_STORE_DWORD::create(builder, loc, *data, srd, voffset, instOffset);
+    Value storeData = *data;
+    if (isAGPRType(storeData.getType())) {
+      auto vregType = ctx.createVRegType();
+      storeData =
+          V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
+    }
+
+    BUFFER_STORE_DWORD::create(builder, loc, storeData, srd, voffset,
+                               instOffset);
   }
 
   return success();
