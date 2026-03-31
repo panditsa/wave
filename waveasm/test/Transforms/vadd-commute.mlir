@@ -7,10 +7,10 @@
 waveasm.program @vadd_commute_test target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
   %v0 = waveasm.precolored.vreg 0 : !waveasm.pvreg<0>
 
-  // Non-inline literal in src1 should be commuted to src0
+  // Non-inline literal in src1: materialized into scratch VGPR
   %c256 = waveasm.constant 256 : !waveasm.imm<256>
-  // CHECK-NOT: v_mov_b32
-  // CHECK: v_add_u32 v{{[0-9]+}}, 256, v0
+  // CHECK: v_mov_b32 v15, 256
+  // CHECK: v_add_u32 v{{[0-9]+}}, v0, v15
   %r1 = waveasm.v_add_u32 %v0, %c256 : !waveasm.pvreg<0>, !waveasm.imm<256> -> !waveasm.vreg
 
   // Inline constant should work without commutation
