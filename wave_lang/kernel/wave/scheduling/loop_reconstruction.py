@@ -877,7 +877,6 @@ def guard_g2s_with_bounds_check(
         induction_variable = get_induction_variable(iterate, constraints)
 
         pipeline_depth = num_stages - 1
-
         for g2s in g2s_nodes:
             custom = get_custom(g2s)
             unroll_iter = getattr(custom, "unroll_iteration", 0) or 0
