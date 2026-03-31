@@ -91,7 +91,7 @@ public:
   void reserve(int64_t reg, int64_t size) {
     for (int64_t i = 0; i < size; ++i) {
       int64_t r = reg + i;
-      if (r < maxRegs && free.test(r)) {
+      if (r >= 0 && r < maxRegs && free.test(r)) {
         free.reset(r);
         ++currentUsage;
       }

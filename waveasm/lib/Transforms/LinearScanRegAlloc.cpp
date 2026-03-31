@@ -188,17 +188,15 @@ allocateRegClass(ArrayRef<LiveRange> ranges, RegPool &pool,
         pool.getRegClass() == RegClass::VGPR && range.size > 1;
     if (useBidirectional) {
       int64_t rangeLength = range.end - range.start;
-      // Ranges in the top 10% by length get allocated from the top.
-      // This targets buffer_load prefetch values (which span almost the
-      // entire loop body) while leaving ds_read values (consumed within
-      // one half) at the bottom.
-      int64_t maxEnd = ranges.back().end;
-      int64_t threshold = (maxEnd * 3) / 4;
+      // Ranges whose length exceeds 75% of the program span are allocated
+      // from the top. This targets buffer_load prefetch values (which span
+      // almost the entire loop body) while leaving ds_read values (consumed
+      // within one half) at the bottom.
+      int64_t lastRangeEnd = ranges.back().end;
+      int64_t threshold = (lastRangeEnd * 3) / 4;
       if (rangeLength > threshold)
         physReg = tryAllocateFromTop(pool, range.size, range.alignment,
                                      maxPressure);
-      else
-        physReg = tryAllocate(pool, range.size, range.alignment);
     }
     if (!physReg)
       physReg = tryAllocate(pool, range.size, range.alignment);
