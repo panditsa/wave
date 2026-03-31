@@ -283,10 +283,10 @@ waveasm.program @loop_with_if
   // CHECK:      %{{.*}} = waveasm.loop (%[[IV:.*]] = %{{.*}}) : (!waveasm.sreg) -> !waveasm.sreg {
   %result = waveasm.loop(%i = %init) : (!waveasm.sreg) -> (!waveasm.sreg) {
     // Block arg used by s_and to check parity
-    // CHECK:      %[[REM:.*]] = waveasm.s_and_b32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
-    %rem = waveasm.s_and_b32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    // CHECK:      %[[REM:.*]], %{{.*}} = waveasm.s_and_b32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.scc
+    %rem:2 = waveasm.s_and_b32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.scc
     // CHECK-NEXT: %[[EVEN:.*]] = waveasm.s_cmp_eq_u32 %[[REM]], %{{.*}} : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
-    %is_even = waveasm.s_cmp_eq_u32 %rem, %zero : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
+    %is_even = waveasm.s_cmp_eq_u32 %rem#0, %zero : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
 
     // If branches on the comparison result, producing an sreg step value
     // CHECK-NEXT: %[[STEP:.*]] = waveasm.if %[[EVEN]] : !waveasm.scc -> !waveasm.sreg {

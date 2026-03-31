@@ -297,9 +297,15 @@ std::string KernelGenerator::emitDefaultFormat(Operation *op,
   }
 
   for (Value result : op->getResults()) {
+    // Skip SCC-typed results (hardware-implicit, not emitted).
+    if (isa<SCCType>(result.getType()))
+      continue;
     operands.push_back(resolveValue(result));
   }
   for (Value operand : op->getOperands()) {
+    // Skip SCC-typed operands (hardware-implicit, not emitted).
+    if (isa<SCCType>(operand.getType()))
+      continue;
     if (isScalarOp) {
       operands.push_back(resolveScalarValue(operand));
     } else {

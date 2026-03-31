@@ -23,7 +23,7 @@ waveasm.program @salu_literal_test target = #waveasm.target<#waveasm.gfx942, 5> 
   // CHECK-NOT: v_mov_b32
   // CHECK: s_lshl_b32 s{{[0-9]+}}, s{{[0-9]+}}, 7
   %c7 = waveasm.constant 7 : !waveasm.imm<7>
-  %r2 = waveasm.s_lshl_b32 %r1#0, %c7 : !waveasm.sreg, !waveasm.imm<7> -> !waveasm.sreg
+  %r2:2 = waveasm.s_lshl_b32 %r1#0, %c7 : !waveasm.sreg, !waveasm.imm<7> -> !waveasm.sreg, !waveasm.scc
 
   waveasm.s_endpgm
 }

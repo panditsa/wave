@@ -170,10 +170,10 @@ waveasm.program @test_if_in_loop
 
   // CHECK:      %{{.*}} = waveasm.loop (%[[IV:.*]] = %{{.*}}) : (!waveasm.sreg) -> !waveasm.sreg {
   %final = waveasm.loop(%i = %init) : (!waveasm.sreg) -> (!waveasm.sreg) {
-    // CHECK:      %[[REM:.*]] = waveasm.s_and_b32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
-    %rem = waveasm.s_and_b32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg
+    // CHECK:      %[[REM:.*]], %{{.*}} = waveasm.s_and_b32 %[[IV]], %{{.*}} : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.scc
+    %rem:2 = waveasm.s_and_b32 %i, %one : !waveasm.sreg, !waveasm.imm<1> -> !waveasm.sreg, !waveasm.scc
     // CHECK-NEXT: %[[EVEN:.*]] = waveasm.s_cmp_eq_u32 %[[REM]], %{{.*}} : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
-    %is_even = waveasm.s_cmp_eq_u32 %rem, %zero : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
+    %is_even = waveasm.s_cmp_eq_u32 %rem#0, %zero : !waveasm.sreg, !waveasm.imm<0> -> !waveasm.scc
 
     // CHECK-NEXT: %[[STEP:.*]] = waveasm.if %[[EVEN]] : !waveasm.scc -> !waveasm.sreg {
     %step = waveasm.if %is_even : !waveasm.scc -> !waveasm.sreg {

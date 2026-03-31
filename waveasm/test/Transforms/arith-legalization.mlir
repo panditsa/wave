@@ -17,7 +17,7 @@ waveasm.program @test_add
   %add_vv = waveasm.arith.add %v0, %v0 : (!waveasm.vreg, !waveasm.vreg) -> !waveasm.vreg
 
   // SGPR + SGPR -> s_add_u32.
-  // CHECK: waveasm.s_add_u32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.sreg
+  // CHECK: waveasm.s_add_u32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.sreg -> !waveasm.sreg, !waveasm.scc
   %add_ss = waveasm.arith.add %s0, %s1 : (!waveasm.sreg, !waveasm.sreg) -> !waveasm.sreg
 
   // SGPR + VGPR -> v_add_u32 (SGPR broadcast via v_mov_b32).
@@ -26,7 +26,7 @@ waveasm.program @test_add
   %add_sv = waveasm.arith.add %s0, %v0 : (!waveasm.sreg, !waveasm.vreg) -> !waveasm.vreg
 
   // SGPR + imm -> s_add_u32.
-  // CHECK: waveasm.s_add_u32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.imm<42>
+  // CHECK: waveasm.s_add_u32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.imm<42> -> !waveasm.sreg, !waveasm.scc
   %add_si = waveasm.arith.add %s0, %c42 : (!waveasm.sreg, !waveasm.imm<42>) -> !waveasm.sreg
 
   // CHECK-NOT: waveasm.arith.
@@ -256,7 +256,7 @@ waveasm.program @test_sext
   %v0 = waveasm.precolored.vreg 0 : !waveasm.vreg
 
   // SGPR sext: hi = s_ashr_i32(lo, 31), then merge.
-  // CHECK: waveasm.s_ashr_i32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.imm<31>
+  // CHECK: waveasm.s_ashr_i32 %{{.*}}, %{{.*}} : !waveasm.sreg, !waveasm.imm<31> -> !waveasm.sreg, !waveasm.scc
   // CHECK: waveasm.pack
   %sext_s = waveasm.arith.sext %s0 : (!waveasm.sreg) -> !waveasm.sreg<2, 2>
 
@@ -306,9 +306,9 @@ waveasm.program @test_cmp_i64_eq
   // CHECK-DAG: [[A_HI:%.*]] = waveasm.precolored.sreg 1 : !waveasm.sreg
   // CHECK-DAG: [[B_LO:%.*]] = waveasm.precolored.sreg 2 : !waveasm.sreg
   // CHECK-DAG: [[B_HI:%.*]] = waveasm.precolored.sreg 3 : !waveasm.sreg
-  // CHECK: [[XOR_LO:%.*]] = waveasm.s_xor_b32 [[A_LO]], [[B_LO]]
-  // CHECK: [[XOR_HI:%.*]] = waveasm.s_xor_b32 [[A_HI]], [[B_HI]]
-  // CHECK: [[COMBINED:%.*]] = waveasm.s_or_b32 [[XOR_LO]], [[XOR_HI]]
+  // CHECK: [[XOR_LO:%.*]], %{{.*}} = waveasm.s_xor_b32 [[A_LO]], [[B_LO]]
+  // CHECK: [[XOR_HI:%.*]], %{{.*}} = waveasm.s_xor_b32 [[A_HI]], [[B_HI]]
+  // CHECK: [[COMBINED:%.*]], %{{.*}} = waveasm.s_or_b32 [[XOR_LO]], [[XOR_HI]]
   // CHECK: waveasm.s_cmp_eq_i32 [[COMBINED]], %{{.*}}
   %cmp = waveasm.arith.cmp eq, %a, %b : (!waveasm.sreg<2, 2>, !waveasm.sreg<2, 2>) -> !waveasm.sreg
 
@@ -363,8 +363,8 @@ waveasm.program @test_cmp_i64_slt_salu
   // CHECK: [[HI_EQ:%.*]] = waveasm.s_cselect_b32 [[SCC2]],
   // CHECK: [[SCC3:%.*]] = waveasm.s_cmp_lt_u32 [[A_LO]], [[B_LO]]
   // CHECK: [[LO_LT:%.*]] = waveasm.s_cselect_b32 [[SCC3]],
-  // CHECK: [[EQ_AND_LO:%.*]] = waveasm.s_and_b32 [[HI_EQ]], [[LO_LT]]
-  // CHECK: waveasm.s_or_b32 [[HI_LT]], [[EQ_AND_LO]]
+  // CHECK: [[EQ_AND_LO:%.*]], %{{.*}} = waveasm.s_and_b32 [[HI_EQ]], [[LO_LT]]
+  // CHECK: %{{.*}}, %{{.*}} = waveasm.s_or_b32 [[HI_LT]], [[EQ_AND_LO]]
   %cmp = waveasm.arith.cmp slt, %a, %b : (!waveasm.sreg<2, 2>, !waveasm.sreg<2, 2>) -> !waveasm.sreg
 
   // CHECK-NOT: waveasm.arith.

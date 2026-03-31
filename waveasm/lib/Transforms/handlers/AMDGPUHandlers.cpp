@@ -618,6 +618,15 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // factors that push SGPR pressure near the hardware limit.
   int64_t newSrdBase = srcSrdBase;
 
+  // Emit num_records BEFORE word1 swizzle setup. The num_records path
+  // uses s_cmp + s_cselect_b32 which reads SCC; the word1 s_and/s_or
+  // (emitted as RawOps) clobber SCC on hardware. Reordering avoids
+  // the SCC hazard without converting RawOps to typed ops.
+  if (hasNonMaxValidBytes) {
+    emitSrdNumRecords(builder, loc, newSrdBase, op, ctx);
+  }
+  // Word 2 (num_records) is already correct in the source SRD.
+
   if (hasCacheSwizzle && !suppressWord3Swizzle) {
     int64_t srdWord1Bits = static_cast<int64_t>(swizzleStride | 0x4000) << 16;
     std::string and1 = "s_and_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
@@ -629,11 +638,6 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
                       llvm::utohexstr(srdWord1Bits);
     RawOp::create(builder, loc, or1);
   }
-
-  if (hasNonMaxValidBytes) {
-    emitSrdNumRecords(builder, loc, newSrdBase, op, ctx);
-  }
-  // Word 2 (num_records) is already correct in the source SRD.
 
   uint64_t word3 =
       (hasCacheSwizzle && !suppressWord3Swizzle) ? 0x27000 : 0x20000;
@@ -893,8 +897,10 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
               auto shiftImm = ctx.createImmType(shiftAmt);
               auto shiftConst =
                   ConstantOp::create(builder, loc, shiftImm, shiftAmt);
-              rowContrib = S_LSHL_B32::create(builder, loc, sregType,
-                                              rowContrib, shiftConst);
+              rowContrib =
+                  S_LSHL_B32::create(builder, loc, sregType,
+                                     ctx.createSCCType(), rowContrib, shiftConst)
+                      .getDst();
             } else {
               auto strideImm = ctx.createImmType(ldsRowStride);
               auto strideConst =
@@ -1017,8 +1023,10 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
                   auto shiftImm = ctx.createImmType(shiftAmt);
                   auto shiftConst =
                       ConstantOp::create(builder, loc, shiftImm, shiftAmt);
-                  colVal = S_LSHL_B32::create(builder, loc, sregType, colVal,
-                                              shiftConst);
+                  colVal =
+                      S_LSHL_B32::create(builder, loc, sregType,
+                                         ctx.createSCCType(), colVal, shiftConst)
+                          .getDst();
                 } else {
                   auto scaleImm = ctx.createImmType(ldsElemBytes);
                   auto scaleConst =

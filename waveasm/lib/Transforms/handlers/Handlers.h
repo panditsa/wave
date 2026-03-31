@@ -358,7 +358,9 @@ inline mlir::Value emitLshr(mlir::Value value, mlir::Value shiftAmt,
   if (isScalarOrImm(value) && isScalarOrImm(shiftAmt) &&
       isSGPRType(value.getType())) {
     auto sregType = ctx.createSRegType();
-    return S_LSHR_B32::create(builder, loc, sregType, value, shiftAmt);
+    auto sccType = ctx.createSCCType();
+    return S_LSHR_B32::create(builder, loc, sregType, sccType, value, shiftAmt)
+        .getDst();
   }
   auto vregType = ctx.createVRegType();
   value = ensureVGPR(builder, loc, ctx, value);
@@ -373,7 +375,9 @@ inline mlir::Value emitLshl(mlir::Value value, mlir::Value shiftAmt,
   if (isScalarOrImm(value) && isScalarOrImm(shiftAmt) &&
       isSGPRType(value.getType())) {
     auto sregType = ctx.createSRegType();
-    return S_LSHL_B32::create(builder, loc, sregType, value, shiftAmt);
+    auto sccType = ctx.createSCCType();
+    return S_LSHL_B32::create(builder, loc, sregType, sccType, value, shiftAmt)
+        .getDst();
   }
   auto vregType = ctx.createVRegType();
   value = ensureVGPR(builder, loc, ctx, value);
@@ -389,7 +393,8 @@ inline mlir::Value emitAnd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_AND_B32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_AND_B32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_AND_B32::create(builder, loc, vregType, a, b);
@@ -404,7 +409,8 @@ inline mlir::Value emitOr(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_OR_B32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_OR_B32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_OR_B32::create(builder, loc, vregType, a, b);
@@ -419,7 +425,8 @@ inline mlir::Value emitXor(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_XOR_B32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_XOR_B32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_XOR_B32::create(builder, loc, vregType, a, b);
@@ -452,7 +459,8 @@ inline mlir::Value emitMaxI32(mlir::Value a, mlir::Value b,
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_MAX_I32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_MAX_I32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_MAX_I32::create(builder, loc, vregType, a, b);
@@ -467,7 +475,8 @@ inline mlir::Value emitMinI32(mlir::Value a, mlir::Value b,
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_MIN_I32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_MIN_I32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_MIN_I32::create(builder, loc, vregType, a, b);
@@ -482,7 +491,8 @@ inline mlir::Value emitMaxU32(mlir::Value a, mlir::Value b,
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_MAX_U32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_MAX_U32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_MAX_U32::create(builder, loc, vregType, a, b);
@@ -497,7 +507,8 @@ inline mlir::Value emitMinU32(mlir::Value a, mlir::Value b,
     if (isImmType(a.getType()))
       std::swap(a, b);
     auto sregType = ctx.createSRegType();
-    return S_MIN_U32::create(builder, loc, sregType, a, b);
+    auto sccType = ctx.createSCCType();
+    return S_MIN_U32::create(builder, loc, sregType, sccType, a, b).getDst();
   }
   auto vregType = ctx.createVRegType();
   return V_MIN_U32::create(builder, loc, vregType, a, b);

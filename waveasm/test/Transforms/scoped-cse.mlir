@@ -80,19 +80,17 @@ waveasm.program @no_precolored_cse target = #waveasm.target<#waveasm.gfx942, 5> 
   waveasm.s_endpgm
 }
 
-// Test 6: s_cmp_ne_u32 should NOT be CSE'd yet.
-// Explicit SCC operands are in place on S_CSELECT_B32 and S_ADDC_U32,
-// but SALUBinaryWithSCCOp (S_AND_B32, S_OR_B32, etc.) also write SCC
-// as a side-effect and are already CSE-eligible.  Enabling CSE on
-// SALUCmpOp removes s_cmp "SCC barriers" that protect those paths.
-// CHECK-LABEL: waveasm.program @no_cse_s_cmp
-waveasm.program @no_cse_s_cmp target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
+// Test 6: s_cmp_ne_u32 IS now CSE-eligible (SALUCmpOp has ArithmeticOp trait).
+// SALUBinaryWithSCCOp (S_AND_B32, S_OR_B32, etc.) now produce explicit SCC
+// results, so SCC data flow is fully tracked and CSE on SALUCmpOp is safe.
+// CHECK-LABEL: waveasm.program @cse_s_cmp
+waveasm.program @cse_s_cmp target = #waveasm.target<#waveasm.gfx942, 5> abi = #waveasm.abi<> {
   %s0 = waveasm.precolored.sreg 0 : !waveasm.psreg<0>
   %c0 = waveasm.constant 0 : !waveasm.imm<0>
 
-  // Two identical s_cmp_ne_u32 - both should remain.
+  // Two identical s_cmp_ne_u32 - second should be eliminated by CSE.
   // CHECK: waveasm.s_cmp_ne_u32
-  // CHECK: waveasm.s_cmp_ne_u32
+  // CHECK-NOT: waveasm.s_cmp_ne_u32
   %cmp1 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.scc
   %cmp2 = waveasm.s_cmp_ne_u32 %s0, %c0 : !waveasm.psreg<0>, !waveasm.imm<0> -> !waveasm.scc
 

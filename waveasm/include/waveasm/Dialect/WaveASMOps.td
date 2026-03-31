@@ -104,8 +104,8 @@ class SALUUnaryWithSCCOp<string mnemonic, list<Trait> traits = []>
         NoMemoryEffect, AlwaysSpeculatableImplTrait
       ], traits)> {
   let arguments = (ins WaveASM_SRegOrImm:$src);
-  let results = (outs WaveASM_AnySGPR:$dst);
-  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
+  let results = (outs WaveASM_AnySGPR:$dst, WaveASM_SCC:$scc);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst) `,` type($scc)";
 }
 
 // SALU Binary: dst = op(src0, src1)
@@ -131,8 +131,8 @@ class SALUBinaryWithSCCOp<string mnemonic, list<Trait> traits = []>
         NoMemoryEffect, AlwaysSpeculatableImplTrait
       ], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
-  let results = (outs WaveASM_AnySGPR:$dst);
-  let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst)";
+  let results = (outs WaveASM_AnySGPR:$dst, WaveASM_SCC:$scc);
+  let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($dst) `,` type($scc)";
 }
 
 // SALU Binary with carry-out: dst, scc = op(src0, src1)
@@ -163,16 +163,13 @@ class SALUBinaryWithCarryInOp<string mnemonic, list<Trait> traits = []>
 // source operands (no destination). The register allocator treats the
 // result as a regular sreg; this wastes one SGPR slot per s_cmp.
 //
-// SALUCmpOp is NOT yet CSE-eligible.  S_CSELECT_B32 and S_ADDC_U32
-// now have explicit SCC operands, but SALUBinaryWithSCCOp ops
-// (S_AND_B32, S_OR_B32, etc.) also write SCC as a side-effect and are
-// already CSE-eligible.  When CSE merges those ops, the SCC that a
-// later s_cselect_b32 reads becomes stale.  Enabling CSE on SALUCmpOp
-// removes s_cmp "SCC barriers" that previously protected those paths.
-// Full fix requires the spill/reload pass to handle ALL SCCDef ops,
-// not just SCCType results.
+// SALUCmpOp is CSE-eligible.  All SCCDef ops (SALUBinaryWithSCCOp,
+// SALUBinaryWithCarryOp, SALUCmpOp) now produce explicit SCCType results,
+// so the SCC spill/reload pass can track all SCC values via SSA and
+// insert spill/reload where SCC-clobbering ops intervene after CSE.
 class SALUCmpOp<string mnemonic, list<Trait> traits = []>
-    : WAVEASMOp<mnemonic, !listconcat([WaveASM_SCCDef], traits)> {
+    : WAVEASMOp<mnemonic, !listconcat([WaveASM_ArithmeticOp, WaveASM_SCCDef,
+        NoMemoryEffect, AlwaysSpeculatableImplTrait], traits)> {
   let arguments = (ins WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
   let results = (outs WaveASM_SCC:$result);  // SCC flag (not a real SGPR)
   let assemblyFormat = "$src0 `,` $src1 attr-dict `:` type($src0) `,` type($src1) `->` type($result)";
