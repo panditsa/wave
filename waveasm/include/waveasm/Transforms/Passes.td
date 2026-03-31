@@ -247,7 +247,7 @@ def WAVEASMExtractScalarization
 }
 
 //===----------------------------------------------------------------------===//
-// SCC Spill/Reload Pass
+// SCC Verifier Pass
 //===----------------------------------------------------------------------===//
 
 def WAVEASMSCCSpillReload : Pass<"waveasm-scc-spill-reload"> {

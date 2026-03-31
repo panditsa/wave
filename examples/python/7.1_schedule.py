@@ -119,8 +119,6 @@ def test_dbuf_4wave_mxfp_gemm(
     schedule = get_mxfp4_dbuf_schedule(use_stagger=False)
 
     options.print_ir_after = "all" if is_debug else []
-    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave.mlir"
-    options.print_mlir = True
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
@@ -308,8 +306,6 @@ def test_dbuf_4wave_mxfp_asymmetric_gemm(
     gemm, options = get_tagged_mxfp4_gemm(
         shape, block, wave_shape=(1, 4), b_address_space=GLOBAL_ADDRESS_SPACE
     )
-    options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_asymmetric.mlir"
-    options.print_mlir = True
     options.dump_binaries = "build/binaries"
     options.dump_intermediates = "build/intermediates"
     options.minimize_shared_allocs = True
@@ -375,7 +371,9 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     eliminate_epilogue=True,
 ):
     """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, block, wave_shape=(2, 2), reorder_workgroups=True
+    )
     options.backend = "asm"
     options.use_buffer_ops = True
     options.wave_runtime = True
@@ -427,12 +425,12 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
 def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     is_debug=False,
     shape=(1024, 1024, 8192),
-    block=(128, 256, 256),
-    eliminate_epilogue=False,
+    block=(256, 192, 256),
+    eliminate_epilogue=True,
 ):
     """Preshuffle-B MXFP4 GEMM with dynamic M, N, K."""
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
-        shape, block, wave_shape=(1, 4), reorder_workgroups=False
+        shape, block, wave_shape=(2, 2), reorder_workgroups=True, output_dtype=tkl.bf16
     )
     # Make M, N, K dynamic so the compiler does not specialize on problem size.
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
@@ -452,7 +450,7 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True, output_dtype=torch.bfloat16)
     print(
         "MXFP GEMM preshuffle-B 4-wave dynamic M, N, K (WaveASM backend) test passed!"
     )
