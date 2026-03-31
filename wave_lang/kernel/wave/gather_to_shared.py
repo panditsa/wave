@@ -105,6 +105,7 @@ class GatherToSharedConfig:
     get_offset: Callable
     elements_per_thread: int
     expected_number_of_loads: int
+    materialized_shape: list[int]
 
 
 def compute_tail_and_drop_padding(
@@ -306,7 +307,47 @@ def get_gather_to_shared_config(
         get_offset,
         elements_per_thread,
         expected_number_of_loads,
+        materialized_shape,
     )
+
+
+def _compute_load_expanded_dims(
+    load_index: int,
+    elements_per_load: int,
+    materialized_shape: list[int],
+    indexing_dims: list[IndexSymbol],
+) -> dict[IndexSymbol, int]:
+    """Compute expanded_dims for a GatherToLDS based on its position in the
+    linearized tile.
+
+    Loads scan the materialized array linearly (slowest dimension first).
+    For each dimension where a single load covers only a subset of that
+    dimension's range, we record the starting coordinate as the expansion
+    ID.  Dimensions where a single load spans the full range (e.g. the
+    fastest-varying K dim in a [M, K] tile) are omitted since they
+    cannot be meaningfully partitioned.
+    """
+    if not materialized_shape or not indexing_dims:
+        return {}
+
+    expanded_dims: dict[IndexSymbol, int] = {}
+    start_elem = load_index * elements_per_load
+
+    for dim_pos, dim_expr in enumerate(indexing_dims):
+        dim = infer_dim(dim_expr)
+        dim_size = materialized_shape[dim_pos]
+        if dim_size == 0:
+            continue
+
+        dim_total = prod(materialized_shape[dim_pos:])
+        if elements_per_load >= dim_total:
+            continue
+
+        suffix = prod(materialized_shape[dim_pos + 1:]) or 1
+        start_coord = (start_elem // suffix) % dim_size
+        expanded_dims[dim] = start_coord
+
+    return expanded_dims
 
 
 def emit_global_to_lds(
@@ -324,6 +365,8 @@ def emit_global_to_lds(
 
     elements_per_thread = config.elements_per_thread
     expected_number_of_loads = config.expected_number_of_loads
+    total_number_of_threads = threads_per_wave * prod(waves_per_block)
+    elements_per_load = total_number_of_threads * elements_per_thread
     global_index = remove_thread_indexing(read.index)
     logger.info(f"global_index={global_index}")
 
@@ -400,6 +443,15 @@ def emit_global_to_lds(
         # Copy the tag from the original read node to preserve it for scheduling
         if hasattr(read, "tag") and read.tag:
             new_write.tag = read.tag
+
+        exp_dims = _compute_load_expanded_dims(
+            i,
+            elements_per_load,
+            config.materialized_shape,
+            read.indexing_dims,
+        )
+        if exp_dims:
+            new_write.expanded_dims = exp_dims
 
         new_writes[write.memory].append(new_write)
         if config.drop_padding:

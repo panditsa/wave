@@ -378,6 +378,8 @@ def _transform_scale_memory(
             if tag:
                 new_write.tag = tag
 
+        new_write.expanded_dims = {global_m_dim: op_i}
+
         all_new_writes.append(new_write)
 
     for write_node, write, input_read in write_group:
@@ -399,11 +401,6 @@ def _transform_scale_memory(
             input_read.update_arg("mapping", None)
             get_custom(input_read.fx_node).erase()
 
-    # --- Transform reads ---
-    # LDS data is now in preshuffle physical order.  Each MMA read needs
-    # one scale byte at logical (k, m).  The preshuffle formula decomposes
-    # into constant_base + lane_id * 4 when k_offset is a multiple of 4
-    # and m_offset is a multiple of 16 (guaranteed by MMA tiling).
     read_infos = []
     for node in trace.walk(lambda n: isinstance(get_custom(n), Read)):
         read = get_custom(node)
