@@ -83,6 +83,17 @@ LogicalResult handleROCDLSetPrio(Operation *op, TranslationContext &ctx) {
   return success();
 }
 
+/// Handle rocdl.sched.barrier — compiler scheduling hint, not a HW instruction.
+/// The WaveASM backend does its own scheduling, so we emit a comment for
+/// traceability rather than a real instruction (the LLVM assembler would
+/// reject s_sched_barrier in raw assembly).
+LogicalResult handleROCDLSchedBarrier(Operation *op, TranslationContext &ctx) {
+  auto schedBarrierOp = cast<ROCDL::SchedBarrier>(op);
+  int32_t mask = schedBarrierOp.getMask();
+  ctx.emitComment("sched_barrier mask=" + std::to_string(mask));
+  return success();
+}
+
 LogicalResult handleAMDGPUMfma(Operation *op, TranslationContext &ctx) {
   auto mfmaOp = cast<amdgpu::MFMAOp>(op);
   auto &builder = ctx.getBuilder();
@@ -405,6 +416,41 @@ static void patchSrdWord2InPlace(OpBuilder &builder, Location loc,
       return;
     }
 
+    // Detect arith.select(arith.cmpi(scalar, scalar), scalar, scalar)
+    // and emit s_cmp + s_cselect directly into SRD word 2.
+    if (auto selectOp = validBytesVal.getDefiningOp<arith::SelectOp>()) {
+      Value condVal = selectOp.getCondition();
+      if (auto cmpOp = condVal.getDefiningOp<arith::CmpIOp>()) {
+        Value cmpLhs = cmpOp.getLhs();
+        Value cmpRhs = cmpOp.getRhs();
+        Value trueVal = selectOp.getTrueValue();
+        Value falseVal = selectOp.getFalseValue();
+
+        auto cmpLhsMapped = ctx.getMapper().getMapped(cmpLhs);
+        auto cmpRhsMapped = ctx.getMapper().getMapped(cmpRhs);
+        auto trueMapped = ctx.getMapper().getMapped(trueVal);
+        auto falseMapped = ctx.getMapper().getMapped(falseVal);
+
+        if (cmpLhsMapped && cmpRhsMapped && trueMapped && falseMapped &&
+            isScalarOrImm(*cmpLhsMapped) && isScalarOrImm(*cmpRhsMapped) &&
+            isScalarOrImm(*trueMapped) && isScalarOrImm(*falseMapped)) {
+          Value sccVal = emitScalarCmp(builder, loc, cmpOp.getPredicate(),
+                        *cmpLhsMapped, *cmpRhsMapped, ctx);
+
+          auto dstType = PSRegType::get(builder.getContext(), srdBase + 2, 1);
+          Value trueV = *trueMapped;
+          Value falseV = *falseMapped;
+          auto sregType = ctx.createSRegType();
+          if (isImmType(trueV.getType()))
+            trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
+          auto result =
+              S_CSELECT_B32::create(builder, loc, dstType, sccVal, trueV, falseV);
+          DCEProtectOp::create(builder, loc, result);
+          return;
+        }
+      }
+    }
+
     auto mapped = ctx.getMapper().getMapped(validBytesVal);
     if (mapped) {
       Value src = *mapped;
@@ -412,7 +458,7 @@ static void patchSrdWord2InPlace(OpBuilder &builder, Location loc,
         auto result = V_READFIRSTLANE_B32::create(builder, loc, dstType, src);
         DCEProtectOp::create(builder, loc, result);
       } else {
-        auto sccType = ctx.createSRegType();
+        auto sccType = ctx.createSCCType();
         auto zeroImm = ctx.createImmType(0);
         auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
         S_ADD_U32::create(builder, loc, dstType, sccType, src, zeroConst);
@@ -480,7 +526,7 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // When adj exists AND the cast doesn't need non-max validBytes, emit
   // the SRD adjustment eagerly.  The fat_raw_buffer_cast is typically
   // outside any scf.for loop while the loads are inside; deferring to
-  // load-time would place the SRD init RawOps inside the loop body.
+  // load-time would place the SRD init ops inside the loop body.
   if (adj && !hasNonMaxValidBytes) {
     Value srd = emitSRDBaseAdjustment(*adj, op->getResult(0), ctx, loc);
     ctx.getMapper().mapValue(op->getResult(0), srd);
@@ -641,11 +687,12 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     int64_t srdWord1Bits = static_cast<int64_t>(swizzleStride | 0x4000) << 16;
     auto maskImm = ctx.createImmType(0xffff);
     auto maskVal = ConstantOp::create(builder, loc, maskImm, 0xffff);
-    Value cleared = S_AND_B32::create(builder, loc, sregTy, srcWord1, maskVal);
+    auto sccTy = ctx.createSCCType();
+    Value cleared = S_AND_B32::create(builder, loc, sregTy, sccTy, srcWord1, maskVal).getDst();
     auto swizzleImm = ctx.createImmType(srdWord1Bits);
     auto swizzleVal =
         ConstantOp::create(builder, loc, swizzleImm, srdWord1Bits);
-    word1 = S_OR_B32::create(builder, loc, sregTy, cleared, swizzleVal);
+    word1 = S_OR_B32::create(builder, loc, sregTy, sccTy, cleared, swizzleVal).getDst();
   } else {
     word1 = S_MOV_B32::create(builder, loc, sregTy, srcWord1);
   }
@@ -920,8 +967,10 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
               auto shiftImm = ctx.createImmType(shiftAmt);
               auto shiftConst =
                   ConstantOp::create(builder, loc, shiftImm, shiftAmt);
-              rowContrib = S_LSHL_B32::create(builder, loc, sregType,
-                                              rowContrib, shiftConst);
+              rowContrib =
+                  S_LSHL_B32::create(builder, loc, sregType,
+                                     ctx.createSCCType(), rowContrib, shiftConst)
+                      .getDst();
             } else {
               auto strideImm = ctx.createImmType(ldsRowStride);
               auto strideConst =
@@ -978,8 +1027,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
             bool m0IsSgpr = !isVGPRType(m0Val.getType());
             if (m0IsSgpr) {
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        totalConst)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, totalConst)
                           .getDst();
             } else {
               m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(),
@@ -1002,8 +1051,9 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
               bool rowIsSgpr = !isVGPRType(rowContrib.getType());
               if (m0IsSgpr && rowIsSgpr) {
                 auto sregType = ctx.createSRegType();
-                m0Val = S_ADD_U32::create(builder, loc, sregType, sregType,
-                                          m0Val, rowContrib)
+                m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                          ctx.createSCCType(), m0Val,
+                                          rowContrib)
                             .getDst();
               } else {
                 m0Val = convertToVgpr(m0Val);
@@ -1022,8 +1072,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
             bool m0IsSgpr = m0Val && !isVGPRType(m0Val.getType());
             if (m0IsSgpr) {
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        colConst)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, colConst)
                           .getDst();
             } else if (m0Val) {
               m0Val = V_ADD_U32::create(builder, loc, ctx.createVRegType(),
@@ -1043,8 +1093,10 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
                   auto shiftImm = ctx.createImmType(shiftAmt);
                   auto shiftConst =
                       ConstantOp::create(builder, loc, shiftImm, shiftAmt);
-                  colVal = S_LSHL_B32::create(builder, loc, sregType, colVal,
-                                              shiftConst);
+                  colVal =
+                      S_LSHL_B32::create(builder, loc, sregType,
+                                         ctx.createSCCType(), colVal, shiftConst)
+                          .getDst();
                 } else {
                   auto scaleImm = ctx.createImmType(ldsElemBytes);
                   auto scaleConst =
@@ -1054,8 +1106,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
                 }
               }
               auto sregType = ctx.createSRegType();
-              m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                        colVal)
+              m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                        ctx.createSCCType(), m0Val, colVal)
                           .getDst();
             } else {
               // At least one is VGPR: fall back to VALU
@@ -1084,8 +1136,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
           bool m0IsSgpr = !isVGPRType(m0Val.getType());
           if (m0IsSgpr) {
             auto sregType = ctx.createSRegType();
-            m0Val = S_ADD_U32::create(builder, loc, sregType, sregType, m0Val,
-                                      baseConst)
+            m0Val = S_ADD_U32::create(builder, loc, sregType,
+                                      ctx.createSCCType(), m0Val, baseConst)
                         .getDst();
           } else {
             Value baseVgpr = V_MOV_B32::create(builder, loc,
