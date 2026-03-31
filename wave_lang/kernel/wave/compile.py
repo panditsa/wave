@@ -1332,6 +1332,7 @@ def _generate_asm_code(mb, options):
             "--waveasm-memory-offset-opt",
             "--canonicalize",
             "--waveasm-scoped-cse",
+            "--loop-invariant-code-motion",
         ]
         # (2,2) wave shapes generate extract_strided_slice -> V_BFE_U32
         # for scale extraction, creating load->VALU data hazards that
@@ -1343,10 +1344,7 @@ def _generate_asm_code(mb, options):
         threads_per_wave = 64
         waves_in_m = wg[0] // threads_per_wave
         waves_in_n = wg[1]
-        # TODO: improve Ticketing logic (better latency-covering heuristics,
-        # smarter coalescing) so ticketed waitcnt can be always-on without
-        # a performance hit, removing this wave-shape conditional.
-        use_ticketed_waitcnt = waves_in_m >= 2 and waves_in_n >= 2
+        use_ticketed_waitcnt = False
         waitcnt_flag = (
             "--waveasm-insert-waitcnt"
             if use_ticketed_waitcnt
@@ -1392,7 +1390,7 @@ def _generate_asm_code(mb, options):
                 result = _run_translate([])
 
         if result.returncode != 0:
-            raise RuntimeError(f"waveasm-translate failed:\n{result.stderr}")
+            raise RuntimeError("waveasm-translate failed (see stderr output above)")
         asm_text = result.stdout
     finally:
         os.unlink(mlir_path)
