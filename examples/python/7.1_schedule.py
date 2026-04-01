@@ -29,6 +29,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
     get_mxfp4_asymmetric_schedule_mirrored,
+    get_mxfp4_asymmetric_schedule_mirrored_3phase,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled_lds,
@@ -36,6 +37,7 @@ from wave_lang.kernel.wave.schedules import (
 from wave_lang.kernel.wave.utils.mxfp_utils import (
     generate_gemm_afp4wfp4_inputs,
     torchScaledGemmMXFP4,
+    a_preshuffle,
     b_preshuffle,
     e8m0_shuffle,
 )
@@ -62,34 +64,48 @@ def _run_mxfp_gemm(gemm, shape):
 
 
 def _run_mxfp_gemm_preshuffle(
-    gemm, shape, all=False, only_scale=False, only_b=False, output_dtype=torch.float32
+    gemm, shape, all=False, only_scale=False, only_b=False, mirrored=False,
+    output_dtype=torch.float32,
 ):
-    """Run compiled GEMM kernel with preshuffled B and B_scale, verify against reference.
+    """Run compiled GEMM kernel with preshuffled operands, verify against reference.
 
     Shuffling is applied based on the flags:
       all        - shuffle a_scale (x_scales), b_scale (w_scales), and b (w_t)
       only_scale - shuffle a_scale (x_scales) and b_scale (w_scales) only
       only_b     - shuffle b_scale (w_scales) only
+      mirrored   - shuffle a (x), a_scale (x_scales), and b_scale (w_scales);
+                   b (w_t) is NOT preshuffled (goes through LDS)
     """
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
     torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
 
     w_t = w.T.contiguous()
 
-    # Apply b (w_t) preshuffle only when all=True
-    w_t_ps = b_preshuffle(w_t) if all else w_t
+    if mirrored:
+        x_ps = a_preshuffle(x)
+        x_scales_ps = e8m0_shuffle(x_scales)
+        w_scales_ps = e8m0_shuffle(w_scales)
 
-    # Apply a_scale shuffle when all=True or only_scale=True
-    x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
+        x_ps, w_t = x_ps.cuda(), w_t.cuda()
+        x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
+        out = torch.zeros(x_ps.shape[0], w_t.shape[0], dtype=output_dtype).cuda()
 
-    # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
-    w_scales_ps = e8m0_shuffle(w_scales) if (all or only_scale or only_b) else w_scales
+        gemm(x_ps, x_scales_ps, w_t, w_scales_ps, out)
+    else:
+        # Apply b (w_t) preshuffle only when all=True
+        w_t_ps = b_preshuffle(w_t) if all else w_t
 
-    x, w_t_ps = x.cuda(), w_t_ps.cuda()
-    x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=output_dtype).cuda()
+        # Apply a_scale shuffle when all=True or only_scale=True
+        x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
 
-    gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
+        # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
+        w_scales_ps = e8m0_shuffle(w_scales) if (all or only_scale or only_b) else w_scales
+
+        x, w_t_ps = x.cuda(), w_t_ps.cuda()
+        x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
+        out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=output_dtype).cuda()
+
+        gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
 
     torch.testing.assert_close(
         torch_out, out.cpu(), check_dtype=False, check_device=False
@@ -477,7 +493,7 @@ def test_mirrored(
         del options.subs[sym]
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
-    options.backend = "llvm"
+    # options.backend = "asm"
     # options.use_wave_asm_backend = True
     options.wave_runtime = True
     options.eliminate_epilogue = eliminate_epilogue
@@ -491,8 +507,43 @@ def test_mirrored(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True)
     print("Mirrored asymmetric MXFP4 GEMM (preshuffle-A, B via LDS) test passed!")
+
+
+def test_mirrored_3phase(
+    is_debug=False,
+    shape=(1024, 1024, 8192),
+    block=(256, 192, 256),
+    eliminate_epilogue=True,
+):
+    """Mirrored 3-phase MXFP4 GEMM: preshuffle-A, B via LDS, aiter phase structure."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_a(
+        shape, block, wave_shape=(4, 1), reorder_workgroups=True
+    )
+    dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
+    for sym in dynamic_symbols:
+        del options.subs[sym]
+    options.dynamic_symbols = dynamic_symbols
+    options.use_buffer_ops = True
+    options.wave_runtime = True
+    options.eliminate_epilogue = eliminate_epilogue
+    options.dump_intermediates = "build/intermediates_3phase/"
+    options.print_mlir_file = (
+        "gemm_mxfp4_dbuf_4wave_asymmetric_mirrored_3phase.mlir"
+    )
+    options.print_mlir = True
+    schedule = get_mxfp4_asymmetric_schedule_mirrored_3phase(
+        eliminate_epilogue=eliminate_epilogue, is_ascale_shuffled=True
+    )
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True)
+    print(
+        "Mirrored 3-phase MXFP4 GEMM (preshuffle-A, B via LDS) test passed!"
+    )
 
 
 if __name__ == "__main__":
