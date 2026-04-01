@@ -79,9 +79,12 @@ public:
           const llvm::DenseSet<int64_t> &reserved)
       : regClass(regClass), maxRegs(maxRegs), free(maxRegs, true) {
     for (int64_t r : reserved) {
-      if (r >= 0 && r < maxRegs)
+      if (r >= 0 && r < maxRegs) {
         free.reset(r);
+        ++currentUsage;
+      }
     }
+    updatePeak();
   }
 
   /// O(1) free-check via bit test.
@@ -104,7 +107,7 @@ public:
   /// Allocate the lowest-numbered free register.
   /// Returns -1 if no register is available.
   int64_t allocSingle() {
-    int idx = free.find_first();
+    int64_t idx = free.find_first();
     if (idx < 0)
       return -1;
     free.reset(idx);

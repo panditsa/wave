@@ -97,13 +97,13 @@ BidirectionalStrategy::allocate(RegPool &pool, const LiveRange &range,
   // entire loop body) while leaving ds_read values (consumed within one half)
   // at the bottom. The ceiling is maxPressure (peak simultaneous VGPRs from
   // liveness), not maxRegs, to avoid allocating into the AGPR region.
-  int64_t lastRangeEnd = allRanges.back().end;
-  int64_t threshold = (lastRangeEnd * 3) / 4;
+  int64_t programEnd = 0;
+  for (const auto &r : allRanges)
+    programEnd = std::max(programEnd, r.end);
+  int64_t threshold = (programEnd * 3) / 4;
   if (rangeLength > threshold) {
     int64_t physReg =
-        (range.size == 1)
-            ? pool.allocSingleFromTop(maxPressure)
-            : pool.allocRangeFromTop(range.size, range.alignment, maxPressure);
+        pool.allocRangeFromTop(range.size, range.alignment, maxPressure);
     if (physReg >= 0)
       return physReg;
   }
