@@ -17,6 +17,8 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
+#include <memory>
+#include <optional>
 
 namespace waveasm {
 
@@ -117,6 +119,7 @@ public:
   int64_t allocRange(int64_t size, int64_t alignment) {
     if (size <= 0)
       return -1;
+    assert(alignment > 0 && "alignment must be positive");
 
     for (int64_t c = 0; c + size <= maxRegs; c += alignment) {
       bool allFree = true;
@@ -159,6 +162,7 @@ public:
                             int64_t ceiling = -1) {
     if (size <= 0)
       return -1;
+    assert(alignment > 0 && "alignment must be positive");
 
     int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
     int64_t highestBase = ((cap - size) / alignment) * alignment;
@@ -213,6 +217,40 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
+// Allocation Strategy
+//===----------------------------------------------------------------------===//
+
+/// Pluggable strategy for choosing how to allocate a physical register for a
+/// given live range. Subclasses override `allocate()` to implement heuristics
+/// such as bidirectional allocation, best-fit, etc.
+///
+/// Returning std::nullopt signals "no preference" and lets the caller fall
+/// through to the default bottom-up allocation.
+class AllocationStrategy {
+public:
+  virtual ~AllocationStrategy() = default;
+
+  /// Try to allocate a physical register for the given live range.
+  /// Returns the allocated register index, or std::nullopt to fall back to
+  /// the default bottom-up allocation.
+  virtual std::optional<int64_t>
+  allocate(RegPool &pool, const LiveRange &range,
+           llvm::ArrayRef<LiveRange> allRanges, int64_t maxPressure) = 0;
+};
+
+/// Allocate long-lived multi-register VGPR ranges from the top of the
+/// expected register usage and short-lived ranges from the bottom. This
+/// separates interleaved buffer_load (prefetch) and ds_read (consumed)
+/// destinations into contiguous regions, reducing fragmentation.
+class BidirectionalStrategy : public AllocationStrategy {
+public:
+  std::optional<int64_t>
+  allocate(RegPool &pool, const LiveRange &range,
+           llvm::ArrayRef<LiveRange> allRanges,
+           int64_t maxPressure) override;
+};
+
+//===----------------------------------------------------------------------===//
 // Linear Scan Register Allocator (Pure SSA)
 //===----------------------------------------------------------------------===//
 
@@ -239,6 +277,12 @@ public:
     tiedOperands[result] = operand;
   }
 
+  /// Set the allocation strategy used for VGPR ranges. When null (or not
+  /// set), all ranges use bottom-up allocation.
+  void setVGPRStrategy(std::unique_ptr<AllocationStrategy> strategy) {
+    vgprStrategy = std::move(strategy);
+  }
+
   /// Run allocation on a kernel program
   /// Returns the physical mapping and statistics, or failure if allocation
   /// fails
@@ -259,6 +303,7 @@ private:
   llvm::DenseSet<int64_t> reservedAGPRs;
   llvm::DenseMap<mlir::Value, int64_t> precoloredValues;
   llvm::DenseMap<mlir::Value, mlir::Value> tiedOperands; // result -> operand
+  std::unique_ptr<AllocationStrategy> vgprStrategy;
 };
 
 } // namespace waveasm
