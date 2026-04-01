@@ -233,9 +233,9 @@ public:
   /// Try to allocate a physical register for the given live range.
   /// Returns the allocated register index, or std::nullopt to fall back to
   /// the default bottom-up allocation.
-  virtual std::optional<int64_t>
-  allocate(RegPool &pool, const LiveRange &range,
-           llvm::ArrayRef<LiveRange> allRanges, int64_t maxPressure) = 0;
+  virtual std::optional<int64_t> allocate(RegPool &pool, const LiveRange &range,
+                                          llvm::ArrayRef<LiveRange> allRanges,
+                                          int64_t maxPressure) = 0;
 };
 
 /// Allocate long-lived multi-register VGPR ranges from the top of the
@@ -244,10 +244,9 @@ public:
 /// destinations into contiguous regions, reducing fragmentation.
 class BidirectionalStrategy : public AllocationStrategy {
 public:
-  std::optional<int64_t>
-  allocate(RegPool &pool, const LiveRange &range,
-           llvm::ArrayRef<LiveRange> allRanges,
-           int64_t maxPressure) override;
+  std::optional<int64_t> allocate(RegPool &pool, const LiveRange &range,
+                                  llvm::ArrayRef<LiveRange> allRanges,
+                                  int64_t maxPressure) override;
 };
 
 //===----------------------------------------------------------------------===//

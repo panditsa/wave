@@ -100,10 +100,10 @@ BidirectionalStrategy::allocate(RegPool &pool, const LiveRange &range,
   int64_t lastRangeEnd = allRanges.back().end;
   int64_t threshold = (lastRangeEnd * 3) / 4;
   if (rangeLength > threshold) {
-    int64_t physReg = (range.size == 1)
-                          ? pool.allocSingleFromTop(maxPressure)
-                          : pool.allocRangeFromTop(range.size, range.alignment,
-                                                   maxPressure);
+    int64_t physReg =
+        (range.size == 1)
+            ? pool.allocSingleFromTop(maxPressure)
+            : pool.allocRangeFromTop(range.size, range.alignment, maxPressure);
     if (physReg >= 0)
       return physReg;
   }
@@ -119,14 +119,12 @@ BidirectionalStrategy::allocate(RegPool &pool, const LiveRange &range,
 /// This is the core linear scan algorithm, parameterized by register class.
 /// An optional AllocationStrategy is consulted before the default bottom-up
 /// allocation; returning std::nullopt falls through to tryAllocate.
-static LogicalResult
-allocateRegClass(ArrayRef<LiveRange> ranges, RegPool &pool,
-                 PhysicalMapping &mapping, AllocationStats &stats,
-                 const llvm::DenseMap<Value, Value> &tiedOperands,
-                 const llvm::DenseMap<Value, int64_t> &precoloredValues,
-                 llvm::StringRef regClassName, ProgramOp program,
-                 int64_t maxRegs, int64_t maxPressure,
-                 AllocationStrategy *strategy) {
+static LogicalResult allocateRegClass(
+    ArrayRef<LiveRange> ranges, RegPool &pool, PhysicalMapping &mapping,
+    AllocationStats &stats, const llvm::DenseMap<Value, Value> &tiedOperands,
+    const llvm::DenseMap<Value, int64_t> &precoloredValues,
+    llvm::StringRef regClassName, ProgramOp program, int64_t maxRegs,
+    int64_t maxPressure, AllocationStrategy *strategy) {
 
   llvm::SmallVector<ActiveRange> active;
 
