@@ -1211,29 +1211,20 @@ normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full
 
 // -----
 
-//
-// shouldPropagateIndexExprs tests
-//
-// shouldPropagateIndexExprs(from, to) (WaveInterfaces.cpp) returns false when
-// the destination lattice's concrete index keys omit some non-unit dimension
-// from the source lattice's vector shape; identityIndexExprsPropagate then
-// skips the join for that edge instead of driving the lattice to top.
-//
-
-// Forward skip: reciprocal A produces a result with vecShape {M=4, K=4}
-// (K is extra, absent from the 1D tensor shape [@M]). Reciprocal B's result
-// has only M in its concrete keys (since the tensor is 1D). Forward propagation
-// from A.result to B.result: from.vecShape non-unit = {M, K}, to keys = {M},
-// K is missing => shouldPropagateIndexExprs returns false => skip.
+// Forward skip: reciprocal A produces a result with sourceVectorShape {M=4}
+// (priority 1). Reciprocal B's result type is 2D [@M, @K], but the source
+// vector shape from A only covers M, not K. Since
+// from.getSourceVectorShapePriority() > 0 and toShape [@M, @K] has K not
+// covered by sourceVS {M=4}, shouldPropagateIndexExprs returns false => skip.
 // B.result keeps M = T0 * 32 from its override, never gets T0 * 99 from A.
 
 normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full_op_types>] attributes { wave_test.disable_backward } {
   // CHECK-LABEL: @propagation_skip_forward
   func.func @propagation_skip_forward(
-    %a: !wave.tensor<[@M] of f16>
-  ) -> !wave.tensor<[@M] of f16> attributes {
+    %a: !wave.tensor<[@M, @K] of f16>
+  ) -> !wave.tensor<[@M, @K] of f16> attributes {
     wave.constraints = [
-      #wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [1, 1, 1]>
+      #wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [1, 1, 1], mma_type = #wave.mma_kind<f32_16x16x16_f16>, vector_shapes = {M = 4, K = 4}>
     ]
   } {
     // CHECK: wave.reciprocal
@@ -1241,9 +1232,9 @@ normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full
     %t = wave.reciprocal %a {
       wave_test.override_result_index = [
         [1, {M = #wave.index_mapping<[#wave.index_symbol<T0>] -> (T0 * 99, 1, 1)>},
-         {M = 4 : i64, K = 4 : i64}]
+         {M = 4 : i64}]
       ]
-    } : (!wave.tensor<[@M] of f16>) -> !wave.tensor<[@M] of f16>
+    } : (!wave.tensor<[@M, @K] of f16>) -> !wave.tensor<[@M, @K] of f16>
     // CHECK: wave.reciprocal
     // CHECK-SAME: T0 * 32
     // CHECK-NOT: T0 * 99
@@ -1252,8 +1243,8 @@ normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full
         [1, {M = #wave.index_mapping<[#wave.index_symbol<T0>] -> (T0 * 32, 1, 1)>},
          {M = 4 : i64}]
       ]
-    } : (!wave.tensor<[@M] of f16>) -> !wave.tensor<[@M] of f16>
-    return %r : !wave.tensor<[@M] of f16>
+    } : (!wave.tensor<[@M, @K] of f16>) -> !wave.tensor<[@M, @K] of f16>
+    return %r : !wave.tensor<[@M, @K] of f16>
   }
 }
 
@@ -1292,11 +1283,13 @@ normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full
 
 // -----
 
-// Backward skip: reciprocal operands have M-only concrete keys with vecShape
-// {M=4, K=4}. The add result has both M and K as non-unit dims in its vecShape.
-// Backward propagation from the add result into each reciprocal operand:
-// from.vecShape non-unit = {M, K}, to keys = {M}, K missing => skip.
-// Reciprocals keep M = T0 * 32; the add result retains M = T0 * 99.
+// Backward skip: the add result has sourceVectorShape {M=4} (priority 1).
+// Backward propagation reaches the reciprocal result, which then attempts
+// backward propagation to the reciprocal operand. The operand type is [@M, @K],
+// but sourceVS from the add only covers M, not K. Since
+// from.getSourceVectorShapePriority() > 0 and toShape [@M, @K] has K not
+// covered by sourceVS {M=4}, shouldPropagateIndexExprs returns false => skip.
+// Reciprocal operand keeps M = T0 * 32; the add result retains M = T0 * 99.
 
 normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full_op_types>] attributes {wave_test.disable_forward} {
   // CHECK-LABEL: @propagation_skip_backward_partial_operand
@@ -1319,8 +1312,8 @@ normalform.module [#wave.normal_form<full_func_boundary>, #wave.normal_form<full
     // CHECK-SAME: M = #wave.index_mapping<[#wave.index_symbol<T0>] -> (T0 * 99, 1, 1)>
     %result = wave.add %a_rp, %a_rp {
       wave_test.override_result_index = [
-        [{M = #wave.index_mapping<[#wave.index_symbol<T0>] -> (T0 * 99, 1, 1)>},
-         {M = 4 : i64, K = 4 : i64}]
+        [1, {M = #wave.index_mapping<[#wave.index_symbol<T0>] -> (T0 * 99, 1, 1)>},
+         {M = 4 : i64}]
       ]
     } : (!wave.tensor<[@M, @K] of f16>, !wave.tensor<[@M, @K] of f16>) -> !wave.tensor<[@M, @K] of f16>
     return %result : !wave.tensor<[@M, @K] of f16>
