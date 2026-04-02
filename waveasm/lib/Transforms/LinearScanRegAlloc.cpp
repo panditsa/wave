@@ -98,9 +98,9 @@ BidirectionalStrategy::allocate(RegPool &pool, const LiveRange &range,
   // at the bottom. The ceiling is maxPressure (peak simultaneous VGPRs from
   // liveness), not maxRegs, to avoid allocating into the AGPR region.
   int64_t programEnd = 0;
-  for (const auto &r : allRanges)
-    programEnd = std::max(programEnd, r.end);
-  int64_t threshold = (programEnd * 3) / 4;
+  for (const auto &lr : allRanges)
+    programEnd = std::max(programEnd, lr.end);
+  int64_t threshold = (programEnd * thresholdPct) / 100;
   if (rangeLength > threshold) {
     int64_t physReg =
         pool.allocRangeFromTop(range.size, range.alignment, maxPressure);

@@ -78,9 +78,9 @@ public:
   RegPool(RegClass regClass, int64_t maxRegs,
           const llvm::DenseSet<int64_t> &reserved)
       : regClass(regClass), maxRegs(maxRegs), free(maxRegs, true) {
-    for (int64_t r : reserved) {
-      if (r >= 0 && r < maxRegs) {
-        free.reset(r);
+    for (int64_t reg : reserved) {
+      if (reg >= 0 && reg < maxRegs) {
+        free.reset(reg);
         ++currentUsage;
       }
     }
@@ -94,10 +94,10 @@ public:
 
   /// Reserve a specific register range (for precoloring / re-reservation).
   void reserve(int64_t reg, int64_t size) {
-    for (int64_t i = 0; i < size; ++i) {
-      int64_t r = reg + i;
-      if (r >= 0 && r < maxRegs && free.test(r)) {
-        free.reset(r);
+    for (int64_t idx = 0; idx < size; ++idx) {
+      int64_t target = reg + idx;
+      if (target >= 0 && target < maxRegs && free.test(target)) {
+        free.reset(target);
         ++currentUsage;
       }
     }
@@ -124,20 +124,21 @@ public:
       return -1;
     assert(alignment > 0 && "alignment must be positive");
 
-    for (int64_t c = 0; c + size <= maxRegs; c += alignment) {
+    for (int64_t candidate = 0; candidate + size <= maxRegs;
+         candidate += alignment) {
       bool allFree = true;
-      for (int64_t o = 0; o < size; ++o) {
-        if (!free.test(c + o)) {
+      for (int64_t offset = 0; offset < size; ++offset) {
+        if (!free.test(candidate + offset)) {
           allFree = false;
           break;
         }
       }
       if (allFree) {
-        for (int64_t o = 0; o < size; ++o)
-          free.reset(c + o);
+        for (int64_t offset = 0; offset < size; ++offset)
+          free.reset(candidate + offset);
         currentUsage += size;
         updatePeak();
-        return c;
+        return candidate;
       }
     }
     return -1;
@@ -146,13 +147,12 @@ public:
   /// Allocate the highest-numbered free register below ceiling.
   int64_t allocSingleFromTop(int64_t ceiling = -1) {
     int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
-    // Scan from cap-1 downward for the first free register.
-    for (int64_t i = cap - 1; i >= 0; --i) {
-      if (free.test(i)) {
-        free.reset(i);
+    for (int64_t reg = cap - 1; reg >= 0; --reg) {
+      if (free.test(reg)) {
+        free.reset(reg);
         ++currentUsage;
         updatePeak();
-        return i;
+        return reg;
       }
     }
     return -1;
@@ -169,20 +169,21 @@ public:
 
     int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
     int64_t highestBase = ((cap - size) / alignment) * alignment;
-    for (int64_t c = highestBase; c >= 0; c -= alignment) {
+    for (int64_t candidate = highestBase; candidate >= 0;
+         candidate -= alignment) {
       bool allFree = true;
-      for (int64_t o = 0; o < size; ++o) {
-        if (!free.test(c + o)) {
+      for (int64_t offset = 0; offset < size; ++offset) {
+        if (!free.test(candidate + offset)) {
           allFree = false;
           break;
         }
       }
       if (allFree) {
-        for (int64_t o = 0; o < size; ++o)
-          free.reset(c + o);
+        for (int64_t offset = 0; offset < size; ++offset)
+          free.reset(candidate + offset);
         currentUsage += size;
         updatePeak();
-        return c;
+        return candidate;
       }
     }
     return -1;
@@ -247,9 +248,15 @@ public:
 /// destinations into contiguous regions, reducing fragmentation.
 class BidirectionalStrategy : public AllocationStrategy {
 public:
+  explicit BidirectionalStrategy(int64_t thresholdPct = 75)
+      : thresholdPct(thresholdPct) {}
+
   std::optional<int64_t> allocate(RegPool &pool, const LiveRange &range,
                                   llvm::ArrayRef<LiveRange> allRanges,
                                   int64_t maxPressure) override;
+
+private:
+  int64_t thresholdPct;
 };
 
 //===----------------------------------------------------------------------===//

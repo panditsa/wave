@@ -41,7 +41,9 @@ def WAVEASMLinearScan : Pass<"waveasm-linear-scan"> {
     Option<"maxSGPRs", "max-sgprs", "int64_t", "102",
            "Maximum user-addressable SGPRs (s0-s101 on GFX9+)">,
     Option<"maxAGPRs", "max-agprs", "int64_t", "256",
-           "Maximum AGPRs available">
+           "Maximum AGPRs available">,
+    Option<"bidirectionalThreshold", "bidirectional-threshold", "int64_t", "75",
+           "Lifetime percentage threshold for top-down VGPR allocation (0 to disable)">
   ];
 
   let statistics = [
