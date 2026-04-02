@@ -658,7 +658,9 @@ Value emitSRDBaseAdjustment(const TranslationContext::PendingSRDBaseAdjust &adj,
       auto sccType2 = ctx.createSCCType();
       auto zeroImm = ctx.createImmType(0);
       auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-      S_ADD_U32::create(builder, loc, numRecType, sccType2, nrVal, zeroConst);
+      auto addResult =
+          S_ADD_U32::create(builder, loc, numRecType, sccType2, nrVal, zeroConst);
+      DCEProtectOp::create(builder, loc, addResult.getDst());
     }
   } else {
     int64_t bufferSize = ctx.getBufferSizeForSRD(adj.srcSrdBase);

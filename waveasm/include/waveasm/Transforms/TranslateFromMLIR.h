@@ -699,22 +699,23 @@ public:
     mlir::ArrayAttr workgroupSizeAttr =
         program->getAttrOfType<mlir::ArrayAttr>("workgroup_size");
 
-    if (!workgroupSizeAttr || workgroupSizeAttr.size() < 2)
+    if (!workgroupSizeAttr || workgroupSizeAttr.empty())
       return false;
 
-    int64_t wgY = 1, wgZ = 1;
+    int64_t wgX = 1, wgY = 1, wgZ = 1;
     if (auto intAttr =
-            llvm::dyn_cast<mlir::IntegerAttr>(workgroupSizeAttr[1])) {
-      wgY = intAttr.getInt();
-    }
-    if (workgroupSizeAttr.size() >= 3) {
+            llvm::dyn_cast<mlir::IntegerAttr>(workgroupSizeAttr[0]))
+      wgX = intAttr.getInt();
+    if (workgroupSizeAttr.size() >= 2)
       if (auto intAttr =
-              llvm::dyn_cast<mlir::IntegerAttr>(workgroupSizeAttr[2])) {
+              llvm::dyn_cast<mlir::IntegerAttr>(workgroupSizeAttr[1]))
+        wgY = intAttr.getInt();
+    if (workgroupSizeAttr.size() >= 3)
+      if (auto intAttr =
+              llvm::dyn_cast<mlir::IntegerAttr>(workgroupSizeAttr[2]))
         wgZ = intAttr.getInt();
-      }
-    }
-    // Multi-wave if y > 1 or z > 1 (matching Python abi.py convention)
-    return wgY > 1 || wgZ > 1;
+    // Multi-wave when the total thread count exceeds one wave (64 threads).
+    return (wgX * wgY * wgZ) > 64;
   }
 
   /// Get workgroup size as (x, y, z) tuple

@@ -425,7 +425,9 @@ static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
         auto sccType = ctx.createSCCType();
         auto zeroImm = ctx.createImmType(0);
         auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-        S_ADD_U32::create(builder, loc, dstType, sccType, src, zeroConst);
+        auto addResult =
+            S_ADD_U32::create(builder, loc, dstType, sccType, src, zeroConst);
+        DCEProtectOp::create(builder, loc, addResult.getDst());
       }
       return;
     }
@@ -453,15 +455,14 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   Value validBytesVal = castOp.getValidBytes();
 
   bool hasCacheSwizzle = false;
+  bool hasDynamicStride = false;
   int64_t swizzleStride = 0;
   if (op->getNumOperands() >= 3) {
-    // Enable cache swizzle whenever the stride operand exists, even if
-    // the value is dynamic (not a compile-time constant). The SRD
-    // encoding (0x40400000 in word 1, 0x27000 in word 3) is constant
-    // regardless of the actual stride value.
     hasCacheSwizzle = true;
     if (auto swizzleVal = getArithConstantValue(op->getOperand(2))) {
       swizzleStride = *swizzleVal;
+    } else {
+      hasDynamicStride = true;
     }
   }
 
@@ -497,11 +498,9 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   }
 
   // Suppress cache swizzle for SRDs whose consumers are exclusively
-  // direct buffer loads (vector.load).  Swizzle is only meaningful for
-  // gather_to_lds which writes into swizzled LDS.  When the handler
-  // passes through (hasNonMaxValidBytes == false), the source SRD
-  // naturally lacks swizzle.  We must replicate that behaviour when
-  // constructing a new SRD for non-max validBytes.
+  // direct buffer loads (vector.load).  The stride/swizzle encoding
+  // in word1 is only needed for gather_to_lds (LDS cache-line DMA).
+  // For raw MUBUF loads the stride field is ignored by hardware.
   bool suppressWord3Swizzle = false;
   if (hasCacheSwizzle) {
     bool hasGatherUser = false;
@@ -510,7 +509,6 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
         hasGatherUser = true;
         break;
       }
-      // Also check through fat_raw_buffer_cast chains (loop body re-casts).
       if (isa<amdgpu::FatRawBufferCastOp>(use.getOwner())) {
         for (auto &innerUse : use.getOwner()->getResult(0).getUses()) {
           if (innerUse.getOwner()->getName().getStringRef() ==
@@ -552,9 +550,6 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     }
     ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
     if (adj) {
-      // When hasNonMaxValidBytes, propagate the validBytes so that
-      // emitSRDBaseAdjustment sets a tight NUM_RECORDS instead of
-      // the default 0x7FFFFFFE.
       Value numRecordsOverride;
       if (hasNonMaxValidBytes && validBytesVal) {
         if (auto mapped = ctx.getMapper().getMapped(validBytesVal))
@@ -628,15 +623,60 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // Word 2 (num_records) is already correct in the source SRD.
 
   if (hasCacheSwizzle && !suppressWord3Swizzle) {
-    int64_t srdWord1Bits = static_cast<int64_t>(swizzleStride | 0x4000) << 16;
-    std::string and1 = "s_and_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
-                       std::to_string(srcSrdBase + 1) + ", 0xffff";
-    RawOp::create(builder, loc, and1);
+    std::string w1 = std::to_string(newSrdBase + 1);
+    std::string w1src = std::to_string(srcSrdBase + 1);
 
-    std::string or1 = "s_or_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
-                      std::to_string(newSrdBase + 1) + ", 0x" +
-                      llvm::utohexstr(srdWord1Bits);
-    RawOp::create(builder, loc, or1);
+    RawOp::create(builder, loc,
+                  "s_and_b32 s" + w1 + ", s" + w1src + ", 0xffff");
+
+    if (!hasDynamicStride) {
+      int64_t srdWord1Bits =
+          static_cast<int64_t>(swizzleStride | 0x4000) << 16;
+      RawOp::create(builder, loc,
+                    "s_or_b32 s" + w1 + ", s" + w1 + ", 0x" +
+                        llvm::utohexstr(srdWord1Bits));
+    } else {
+      // Dynamic cacheSwizzleStride: compute SRD word 1 stride+swizzle bits
+      // at runtime.  Use the word 3 register as a temporary since it gets
+      // overwritten with format bits immediately after this block.
+      //
+      // SRD word 1 bits [30:16] = (stride[13:0] | (1 << 14)):
+      //   bit 30 = CACHE_SWIZZLE enable
+      //   bits [29:16] = STRIDE[13:0]
+      int64_t tempReg = newSrdBase + 3;
+      std::string t = std::to_string(tempReg);
+      auto tempDst = PSRegType::get(builder.getContext(), tempReg, 1);
+
+      auto strideMapped = ctx.getMapper().getMapped(op->getOperand(2));
+      if (strideMapped) {
+        Value src = *strideMapped;
+        if (isVGPRType(src.getType())) {
+          auto result =
+              V_READFIRSTLANE_B32::create(builder, loc, tempDst, src);
+          DCEProtectOp::create(builder, loc, result);
+        } else if (isImmType(src.getType())) {
+          auto result = S_MOV_B32::create(builder, loc, tempDst, src);
+          DCEProtectOp::create(builder, loc, result);
+        } else {
+          auto sccType = ctx.createSCCType();
+          auto zeroImm = ctx.createImmType(0);
+          auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
+          auto addResult =
+              S_ADD_U32::create(builder, loc, tempDst, sccType, src, zeroConst);
+          DCEProtectOp::create(builder, loc, addResult.getDst());
+        }
+
+        RawOp::create(builder, loc,
+                      "s_or_b32 s" + t + ", s" + t + ", 0x4000");
+        RawOp::create(builder, loc,
+                      "s_lshl_b32 s" + t + ", s" + t + ", 16");
+        RawOp::create(builder, loc,
+                      "s_or_b32 s" + w1 + ", s" + w1 + ", s" + t);
+      } else {
+        RawOp::create(builder, loc,
+                      "s_or_b32 s" + w1 + ", s" + w1 + ", 0x40000000");
+      }
+    }
   }
 
   uint64_t word3 =
@@ -806,6 +846,7 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
   bool canUseImmediateM0 = hasLdsBaseOffset && !hasLdsDynamicBaseOffset;
   int64_t colIdxConst = 0;
   bool hasConstCol = false;
+  bool hasDynamicCol = false;
 
   if (op->getNumOperands() > 4) {
     mlir::Value ldsColIndex = op->getOperand(4);
@@ -814,6 +855,8 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
       if (auto immType = dyn_cast<ImmType>(ldsColMapped->getType())) {
         colIdxConst = immType.getValue();
         hasConstCol = true;
+      } else {
+        hasDynamicCol = true;
       }
     }
   }
@@ -832,9 +875,9 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
         } else {
           m0Const = ldsBaseOffsetConst + rowIdxConst;
         }
-        // Can use immediate only if base is static and col is const
+        // Can use immediate only if base is static and col is fully resolved.
         canUseImmediateM0 =
-            !hasLdsDynamicBaseOffset && (hasConstCol || (colIdxConst == 0));
+            !hasLdsDynamicBaseOffset && !hasDynamicCol;
       } else {
         canUseImmediateM0 = false;
       }
