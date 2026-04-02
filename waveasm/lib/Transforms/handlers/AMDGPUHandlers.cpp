@@ -1129,6 +1129,11 @@ LogicalResult handleGatherToLds(Operation *op, TranslationContext &ctx) {
         auto sregType = ctx.createSRegType();
         m0Src = V_READFIRSTLANE_B32::create(builder, loc, sregType, m0Src);
       }
+      // Protect m0Src from the register allocator reusing its SGPR.
+      // S_MOV_B32_M0 writes to M0 (a special register) and has no SSA
+      // result, so without DCEProtectOp the allocator does not extend
+      // the source operand's live range to this point.
+      DCEProtectOp::create(builder, loc, m0Src);
       S_MOV_B32_M0::create(builder, loc, m0Src);
     } else {
       auto zeroImm = ctx.createImmType(0);
