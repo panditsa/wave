@@ -549,6 +549,5 @@ func.func @bitcast_test(%arg0: !wave.tensor<[@M, @K2] of i8, <register>>) -> !wa
     # CHECK-SAME: !wave.tensor<[@M, @K] of f4E2M1FN, <register>>
     print(bitcast_test_module)
 
-
 # CHECK: wave_ok
 print("wave_ok")
