@@ -211,15 +211,28 @@ private:
           insertionPoints.push_back(next);
         }
       }
+
+      // Check for s_mov_b32_m0 → buffer_load_*_lds hazard (gfx940+).
+      // LLVM GCNHazardRecognizer::checkReadM0Hazards requires 1 wait state
+      // between an SALU write to M0 and a subsequent LDS DMA instruction
+      // (buffer_load_dword_lds / buffer_load_dwordx4_lds).  Without the
+      // wait state the buffer_load may read a stale M0 value, writing data
+      // to the wrong LDS offset.
+      if (isa<S_MOV_B32_M0>(current) &&
+          isa<BUFFER_LOAD_DWORD_LDS, BUFFER_LOAD_DWORDX4_LDS>(next)) {
+        insertionPoints.push_back(next);
+      }
+
     }
 
-    // Insert s_nop instructions
+    // Insert s_nop instructions for M0 and other hazards
     for (Operation *insertBefore : insertionPoints) {
       OpBuilder builder(insertBefore);
       S_NOP::create(builder, insertBefore->getLoc(),
                     builder.getI32IntegerAttr(0));
       numNopsInserted++;
     }
+
   }
 };
 

@@ -115,15 +115,39 @@ private:
           }
         }
       }
-      if (isa<S_CSELECT_B32>(&op) && !lastSCCWriter) {
-        op.emitError()
-            << "SCC hazard: s_cselect_b32 has no preceding SCC writer";
-        ++errors;
+      if (auto cselOp = dyn_cast<S_CSELECT_B32>(&op)) {
+        if (!lastSCCWriter) {
+          op.emitError()
+              << "SCC hazard: s_cselect_b32 has no preceding SCC writer";
+          ++errors;
+        } else {
+          Value scc = cselOp.getSccIn();
+          Operation *sccDef = scc.getDefiningOp();
+          if (sccDef && lastSCCWriter != sccDef) {
+            auto clobbers = findSCCClobbersBetween(sccDef, &op);
+            if (!clobbers.empty()) {
+              emitSCCClobberError(&op, sccDef, clobbers);
+              ++errors;
+            }
+          }
+        }
       }
-      if (isa<S_ADDC_U32>(&op) && !lastSCCWriter) {
-        op.emitError()
-            << "SCC hazard: s_addc_u32 has no preceding SCC writer";
-        ++errors;
+      if (auto addcOp = dyn_cast<S_ADDC_U32>(&op)) {
+        if (!lastSCCWriter) {
+          op.emitError()
+              << "SCC hazard: s_addc_u32 has no preceding SCC writer";
+          ++errors;
+        } else {
+          Value scc = addcOp.getSccIn();
+          Operation *sccDef = scc.getDefiningOp();
+          if (sccDef && lastSCCWriter != sccDef) {
+            auto clobbers = findSCCClobbersBetween(sccDef, &op);
+            if (!clobbers.empty()) {
+              emitSCCClobberError(&op, sccDef, clobbers);
+              ++errors;
+            }
+          }
+        }
       }
       if (writesSCC(&op))
         lastSCCWriter = &op;

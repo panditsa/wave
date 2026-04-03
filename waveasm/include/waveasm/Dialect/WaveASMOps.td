@@ -783,7 +783,10 @@ def WaveASM_S_SUB_I32 : SALUBinaryWithCarryOp<"s_sub_i32">;
 // NOT CSE-eligible: result depends on SCC state.  NoMemoryEffect allows DCE.
 def WaveASM_S_CSELECT_B32 : WAVEASMOp<"s_cselect_b32",
     [WaveASM_SCCUse, NoMemoryEffect]> {
-  let arguments = (ins WaveASM_SCC:$scc_in, WaveASM_AnySGPR:$src0, WaveASM_SRegOrImm:$src1);
+  // src0/src1: both can be SGPR or inline constant (SOP2 allows inline
+  // constants for both SSRC0 and SSRC1; only literal constants are
+  // limited to one per instruction).
+  let arguments = (ins WaveASM_SCC:$scc_in, WaveASM_SRegOrImm:$src0, WaveASM_SRegOrImm:$src1);
   let results = (outs WaveASM_AnySGPR:$dst);
   let assemblyFormat = "$scc_in `,` $src0 `,` $src1 attr-dict `:` type($scc_in) `,` type($src0) `,` type($src1) `->` type($dst)";
 }
