@@ -1364,9 +1364,21 @@ def _generate_asm_code(mb, options):
             mlir_path,
         ]
 
+        # Support for dumping IR between WaveASM passes (debugging).
+        # Set options.waveasm_print_ir_after = "all" to print after every pass,
+        # or options.waveasm_print_ir_after = "pass-name" to print after a
+        # specific pass (substring match).
+        ir_dump_flags = []
+        waveasm_ir_dump = getattr(options, "waveasm_print_ir_after", None)
+        if waveasm_ir_dump == "all":
+            ir_dump_flags = ["--print-ir-after-all"]
+        elif waveasm_ir_dump:
+            ir_dump_flags = [f"--print-ir-after={waveasm_ir_dump}"]
+
         def _run_translate(extra_passes):
             full_cmd = (
                 [waveasm_translate, f"--target={options.target}"]
+                + ir_dump_flags
                 + base_passes
                 + extra_passes
                 + tail_passes

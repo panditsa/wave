@@ -77,6 +77,16 @@ static llvm::cl::opt<bool>
                  llvm::cl::desc("Emit AMDGCN assembly instead of MLIR"),
                  llvm::cl::init(false));
 
+static llvm::cl::opt<bool> printIRAfterAll(
+    "print-ir-after-all",
+    llvm::cl::desc("Print IR after each pass (for debugging pass pipelines)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> printIRAfterPass(
+    "print-ir-after",
+    llvm::cl::desc("Print IR after a specific pass (substring match)"),
+    llvm::cl::value_desc("pass-name"), llvm::cl::init(""));
+
 static llvm::cl::opt<bool> runPreTranslationCSE(
     "mlir-cse",
     llvm::cl::desc("Run MLIR CSE before translation (reduces redundant index "
@@ -155,6 +165,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Disable multi-threading early if IR printing is requested, before
+  // any PassManager is created.
+  if (printIRAfterAll || !printIRAfterPass.empty())
+    context.disableMultithreading();
+
   // Check if input is already WAVEASM IR (has waveasm.program ops)
   bool hasWaveASMPrograms = false;
   module->walk([&](waveasm::ProgramOp) { hasWaveASMPrograms = true; });
@@ -223,6 +238,29 @@ int main(int argc, char **argv) {
   // TODO: Upstream areTypesCompatible to LoopLikeOpInterface.
   if (disablePassVerifier)
     pm.enableVerifier(false);
+
+  // Enable IR printing for debugging if requested.
+  if (printIRAfterAll || !printIRAfterPass.empty())
+    context.disableMultithreading();
+  if (printIRAfterAll) {
+    pm.enableIRPrinting(/*shouldPrintBeforePass=*/[](Pass *, Operation *) { return false; },
+                        /*shouldPrintAfterPass=*/[](Pass *, Operation *) { return true; },
+                        /*printModuleScope=*/true,
+                        /*printAfterOnlyOnChange=*/false,
+                        /*printAfterOnlyOnFailure=*/false,
+                        llvm::errs());
+  } else if (!printIRAfterPass.empty()) {
+    std::string passFilter = printIRAfterPass;
+    pm.enableIRPrinting(
+        /*shouldPrintBeforePass=*/[](Pass *, Operation *) { return false; },
+        /*shouldPrintAfterPass=*/[passFilter](Pass *pass, Operation *) {
+          return llvm::StringRef(pass->getName()).contains(passFilter);
+        },
+        /*printModuleScope=*/true,
+        /*printAfterOnlyOnChange=*/false,
+        /*printAfterOnlyOnFailure=*/false,
+        llvm::errs());
+  }
 
   if (pm.size() > 0) {
     if (failed(pm.run(*module))) {
