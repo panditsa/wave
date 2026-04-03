@@ -623,58 +623,75 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // Word 2 (num_records) is already correct in the source SRD.
 
   if (hasCacheSwizzle && !suppressWord3Swizzle) {
-    std::string w1 = std::to_string(newSrdBase + 1);
-    std::string w1src = std::to_string(srcSrdBase + 1);
+    auto sccType = ctx.createSCCType();
+    auto w1Dst = PSRegType::get(builder.getContext(), newSrdBase + 1, 1);
 
-    RawOp::create(builder, loc,
-                  "s_and_b32 s" + w1 + ", s" + w1src + ", 0xffff");
+    // Read source SRD word 1 (creates a loop-body-local SSA value from
+    // the precolored register, preventing LICM from hoisting the AND/OR
+    // out of the loop).
+    auto srcW1Type = PSRegType::get(builder.getContext(), srcSrdBase + 1, 1);
+    auto srcW1 =
+        PrecoloredSRegOp::create(builder, loc, srcW1Type, srcSrdBase + 1, 1);
+
+    // Mask upper 16 bits: w1 = src_w1 & 0xFFFF  (keep base_address[47:32])
+    auto maskImm = ctx.createImmType(0xFFFF);
+    auto maskConst = ConstantOp::create(builder, loc, maskImm, 0xFFFF);
+    auto w1Masked =
+        S_AND_B32::create(builder, loc, w1Dst, sccType, srcW1, maskConst);
 
     if (!hasDynamicStride) {
+      // Static stride: fold into immediate OR.
       int64_t srdWord1Bits =
           static_cast<int64_t>(swizzleStride | 0x4000) << 16;
-      RawOp::create(builder, loc,
-                    "s_or_b32 s" + w1 + ", s" + w1 + ", 0x" +
-                        llvm::utohexstr(srdWord1Bits));
+      auto bitsImm = ctx.createImmType(srdWord1Bits);
+      auto bitsConst =
+          ConstantOp::create(builder, loc, bitsImm, srdWord1Bits);
+      auto w1Final = S_OR_B32::create(builder, loc, w1Dst, sccType,
+                                       w1Masked.getDst(), bitsConst);
+      DCEProtectOp::create(builder, loc, w1Final.getDst());
     } else {
-      // Dynamic cacheSwizzleStride: compute SRD word 1 stride+swizzle bits
-      // at runtime.  Use the word 3 register as a temporary since it gets
-      // overwritten with format bits immediately after this block.
-      //
-      // SRD word 1 bits [30:16] = (stride[13:0] | (1 << 14)):
-      //   bit 30 = CACHE_SWIZZLE enable
-      //   bits [29:16] = STRIDE[13:0]
-      int64_t tempReg = newSrdBase + 3;
-      std::string t = std::to_string(tempReg);
-      auto tempDst = PSRegType::get(builder.getContext(), tempReg, 1);
-
+      // Dynamic cacheSwizzleStride: compute (stride | 0x4000) << 16 as
+      // SSA ops in virtual SGPRs.  LICM may hoist the OR and shift out
+      // of loops, which is correct since the stride is loop-invariant.
+      // The final S_OR_B32 into the precolored w1 register is NOT
+      // hoistable because it depends on w1Masked (defined inside the
+      // loop via PrecoloredSRegOp).
       auto strideMapped = ctx.getMapper().getMapped(op->getOperand(2));
       if (strideMapped) {
         Value src = *strideMapped;
-        if (isVGPRType(src.getType())) {
-          auto result =
-              V_READFIRSTLANE_B32::create(builder, loc, tempDst, src);
-          DCEProtectOp::create(builder, loc, result);
-        } else if (isImmType(src.getType())) {
-          auto result = S_MOV_B32::create(builder, loc, tempDst, src);
-          DCEProtectOp::create(builder, loc, result);
-        } else {
-          auto sccType = ctx.createSCCType();
-          auto zeroImm = ctx.createImmType(0);
-          auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-          auto addResult =
-              S_ADD_U32::create(builder, loc, tempDst, sccType, src, zeroConst);
-          DCEProtectOp::create(builder, loc, addResult.getDst());
-        }
+        auto sregType = ctx.createSRegType();
 
-        RawOp::create(builder, loc,
-                      "s_or_b32 s" + t + ", s" + t + ", 0x4000");
-        RawOp::create(builder, loc,
-                      "s_lshl_b32 s" + t + ", s" + t + ", 16");
-        RawOp::create(builder, loc,
-                      "s_or_b32 s" + w1 + ", s" + w1 + ", s" + t);
+        // Convert VGPR to SGPR if needed.
+        if (isVGPRType(src.getType()))
+          src = V_READFIRSTLANE_B32::create(builder, loc, sregType, src);
+
+        // stride | 0x4000  (set cache-swizzle enable bit)
+        auto enableConst =
+            ConstantOp::create(builder, loc, ctx.createImmType(0x4000), 0x4000);
+        Value strideOred =
+            S_OR_B32::create(builder, loc, sregType, sccType, src, enableConst)
+                .getDst();
+
+        // (stride | 0x4000) << 16  (shift into SRD word 1 position)
+        auto shiftConst =
+            ConstantOp::create(builder, loc, ctx.createImmType(16), 16);
+        Value swizzleBits =
+            S_LSHL_B32::create(builder, loc, sregType, sccType, strideOred,
+                               shiftConst)
+                .getDst();
+
+        // OR precomputed swizzle bits into the masked word 1.
+        auto w1Final = S_OR_B32::create(builder, loc, w1Dst, sccType,
+                                         w1Masked.getDst(), swizzleBits);
+        DCEProtectOp::create(builder, loc, w1Final.getDst());
       } else {
-        RawOp::create(builder, loc,
-                      "s_or_b32 s" + w1 + ", s" + w1 + ", 0x40000000");
+        // No stride operand mapped: just set the enable bit.
+        auto enableImm = ctx.createImmType(0x40000000);
+        auto enableConst =
+            ConstantOp::create(builder, loc, enableImm, 0x40000000);
+        auto w1Final = S_OR_B32::create(builder, loc, w1Dst, sccType,
+                                         w1Masked.getDst(), enableConst);
+        DCEProtectOp::create(builder, loc, w1Final.getDst());
       }
     }
   }
