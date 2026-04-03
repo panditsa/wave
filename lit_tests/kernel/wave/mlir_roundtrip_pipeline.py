@@ -196,6 +196,7 @@ def gemm_progressive_roundtrip():
     )
 
     options = WaveCompileOptions(
+        linearize_reads=False,
         subs=hyperparams,
         compile_to_mlir=True,
     )
@@ -226,6 +227,7 @@ def attention_progressive_roundtrip():
     )
 
     options = WaveCompileOptions(
+        linearize_reads=False,
         subs=hyperparams,
         compile_to_mlir=True,
     )
@@ -250,6 +252,7 @@ def mxfp4_gemm_progressive_roundtrip():
     )
     schedule = get_mxfp4_dbuf_schedule(use_stagger=False)
     options.compile_to_mlir = True
+    options.linearize_reads = False
 
     # Passes whose MLIR roundtrip is known to fail for this kernel.
     # Passes 1-11: emitter lacks ScaledMmaOp in the Water MLIR dialect.
