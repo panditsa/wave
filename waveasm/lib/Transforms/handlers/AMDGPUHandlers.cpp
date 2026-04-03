@@ -422,12 +422,13 @@ static void emitSrdNumRecords(OpBuilder &builder, Location loc, int64_t srdBase,
         auto result = V_READFIRSTLANE_B32::create(builder, loc, dstType, src);
         DCEProtectOp::create(builder, loc, result);
       } else {
-        auto sccType = ctx.createSCCType();
-        auto zeroImm = ctx.createImmType(0);
-        auto zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
-        auto addResult =
-            S_ADD_U32::create(builder, loc, dstType, sccType, src, zeroConst);
-        DCEProtectOp::create(builder, loc, addResult.getDst());
+        // Copy validBytes into s[srdBase+2] via S_MOV_B32.
+        // Using S_MOV_B32 (not S_ADD_U32) avoids clobbering SCC.
+        // The source operand must be live at this point.  S_MOV_B32
+        // accepts SRegOrImm, which handles both SGPR and immediate
+        // sources without requiring a zero constant.
+        auto result = S_MOV_B32::create(builder, loc, dstType, src);
+        DCEProtectOp::create(builder, loc, result);
       }
       return;
     }
