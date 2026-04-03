@@ -168,6 +168,8 @@ public:
     assert(alignment > 0 && "alignment must be positive");
 
     int64_t cap = (ceiling > 0 && ceiling <= maxRegs) ? ceiling : maxRegs;
+    if (size > cap)
+      return -1;
     int64_t highestBase = ((cap - size) / alignment) * alignment;
     for (int64_t candidate = highestBase; candidate >= 0;
          candidate -= alignment) {
