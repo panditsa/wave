@@ -500,11 +500,10 @@ struct MulNegPow2ToShiftNegPattern : public OpRewritePattern<V_MUL_LO_U32> {
 };
 
 //===----------------------------------------------------------------------===//
-// Pattern: Add zero elimination
+// Pattern: Add constant simplification
 //
-// Removes:
-//   %dst = v_add_u32 %src, 0
-// Replacing with %src directly.
+// 1. Both operands constant -> fold to v_mov_b32 of computed sum.
+// 2. Either operand zero    -> identity elimination.
 //===----------------------------------------------------------------------===//
 
 struct AddZeroPattern : public OpRewritePattern<V_ADD_U32> {
@@ -512,22 +511,34 @@ struct AddZeroPattern : public OpRewritePattern<V_ADD_U32> {
 
   LogicalResult matchAndRewrite(V_ADD_U32 addOp,
                                 PatternRewriter &rewriter) const override {
-    auto checkOperand = [&](Value constVal, Value other) -> LogicalResult {
-      auto constOp = constVal.getDefiningOp<ConstantOp>();
-      if (!constOp)
-        return failure();
+    auto val0 = getConstantValue(addOp.getSrc0());
+    auto val1 = getConstantValue(addOp.getSrc1());
 
-      if (constOp.getValue() != 0)
-        return failure();
+    // Fold: both operands constant -> compute result at compile time.
+    if (val0 && val1) {
+      int64_t result = static_cast<int64_t>(
+          (static_cast<uint64_t>(*val0) + static_cast<uint64_t>(*val1)) &
+          0xFFFFFFFF);
+      auto loc = addOp.getLoc();
+      auto immType = rewriter.getType<ImmType>(result);
+      auto constOp = ConstantOp::create(rewriter, loc, immType, result);
+      auto vregType = rewriter.getType<VRegType>(1, 1);
+      auto movOp = V_MOV_B32::create(rewriter, loc, vregType, constOp);
+      rewriter.replaceOp(addOp, movOp.getResult());
+      return success();
+    }
 
-      rewriter.replaceOp(addOp, other);
+    // Fold: either operand is zero -> identity elimination.
+    // Guard: the surviving operand must be a VGPR; replacing a VGPR result
+    // with an SGPR/immediate would create a type mismatch for downstream users.
+    if (val0 && *val0 == 0 && isVGPRType(addOp.getSrc1().getType())) {
+      rewriter.replaceOp(addOp, addOp.getSrc1());
       return success();
-    };
-
-    if (succeeded(checkOperand(addOp.getSrc0(), addOp.getSrc1())))
+    }
+    if (val1 && *val1 == 0 && isVGPRType(addOp.getSrc0().getType())) {
+      rewriter.replaceOp(addOp, addOp.getSrc0());
       return success();
-    if (succeeded(checkOperand(addOp.getSrc1(), addOp.getSrc0())))
-      return success();
+    }
 
     return failure();
   }
@@ -547,11 +558,10 @@ struct MulOnePattern : public OpRewritePattern<V_MUL_LO_U32> {
   LogicalResult matchAndRewrite(V_MUL_LO_U32 mulOp,
                                 PatternRewriter &rewriter) const override {
     auto checkOperand = [&](Value constVal, Value other) -> LogicalResult {
-      auto constOp = constVal.getDefiningOp<ConstantOp>();
-      if (!constOp)
+      auto val = getConstantValue(constVal);
+      if (!val || *val != 1)
         return failure();
-
-      if (constOp.getValue() != 1)
+      if (!isVGPRType(other.getType()))
         return failure();
 
       rewriter.replaceOp(mulOp, other);
@@ -568,12 +578,10 @@ struct MulOnePattern : public OpRewritePattern<V_MUL_LO_U32> {
 };
 
 //===----------------------------------------------------------------------===//
-// Pattern: Multiply by zero -> constant zero
+// Pattern: Multiply constant simplification
 //
-// Transforms:
-//   %dst = v_mul_lo_u32 %src, 0
-// Into:
-//   %dst = constant 0
+// 1. Both operands constant -> fold to v_mov_b32 of computed product.
+// 2. Either operand zero    -> result is zero.
 //===----------------------------------------------------------------------===//
 
 struct MulZeroPattern : public OpRewritePattern<V_MUL_LO_U32> {
@@ -581,16 +589,28 @@ struct MulZeroPattern : public OpRewritePattern<V_MUL_LO_U32> {
 
   LogicalResult matchAndRewrite(V_MUL_LO_U32 mulOp,
                                 PatternRewriter &rewriter) const override {
-    auto checkOperand = [&](Value constVal) -> bool {
-      auto constOp = constVal.getDefiningOp<ConstantOp>();
-      return constOp && constOp.getValue() == 0;
-    };
+    auto val0 = getConstantValue(mulOp.getSrc0());
+    auto val1 = getConstantValue(mulOp.getSrc1());
 
-    if (checkOperand(mulOp.getSrc0()) || checkOperand(mulOp.getSrc1())) {
+    // Fold: both operands constant -> compute result at compile time.
+    if (val0 && val1) {
+      int64_t result = static_cast<int64_t>(
+          (static_cast<uint64_t>(*val0) * static_cast<uint64_t>(*val1)) &
+          0xFFFFFFFF);
+      auto loc = mulOp.getLoc();
+      auto immType = rewriter.getType<ImmType>(result);
+      auto constOp = ConstantOp::create(rewriter, loc, immType, result);
+      auto vregType = rewriter.getType<VRegType>(1, 1);
+      auto movOp = V_MOV_B32::create(rewriter, loc, vregType, constOp);
+      rewriter.replaceOp(mulOp, movOp.getResult());
+      return success();
+    }
+
+    // Fold: either operand is zero -> result is zero.
+    if ((val0 && *val0 == 0) || (val1 && *val1 == 0)) {
       auto loc = mulOp.getLoc();
       auto immType = rewriter.getType<ImmType>(0);
       auto zeroConst = ConstantOp::create(rewriter, loc, immType, 0);
-      // Move to VGPR if needed
       auto vregType = rewriter.getType<VRegType>(1, 1);
       auto movOp = V_MOV_B32::create(rewriter, loc, vregType, zeroConst);
       rewriter.replaceOp(mulOp, movOp.getResult());
