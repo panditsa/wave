@@ -784,14 +784,17 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
           // If the LHS max value (from BitRange) is less than the divisor,
           // floor(lhs / divisor) == 0 for all inputs. Generalizes the old
           // thread-ID upper-bound check to work with any tracked bit-range.
-          if (lhsRange.highBit < 31) {
-            int64_t maxVal = (1LL << (lhsRange.highBit + 1)) - 1;
-            if (maxVal < divisor) {
-              auto immZero = ctx.createImmType(0);
-              return ExprResult(ConstantOp::create(builder, loc, immZero, 0),
-                                BitRange(0, 0));
-            }
-          }
+          // DISABLED: the BitRange tracks which bits *may* be set, but
+          // (1 << (highBit+1)) - 1 overapproximates the maximum when
+          // the value was produced by OR of non-adjacent bit fields.
+          // E.g. tid_y*8 | (tid_x/8) occupies bits (3,4) | (0,2) = (0,4)
+          // with maxVal=31, but adding a constant 64 via OR gives range
+          // (0,6) with maxVal=127, while the true max is 95.  Subsequent
+          // floordiv by 96 should NOT be eliminated because 95/96 = 0 is
+          // correct only by coincidence; for other thread counts the
+          // true max can exceed the divisor.  Removing this shortcut is
+          // safe — the magic-number division path handles all cases
+          // correctly, at a cost of a few extra VALU instructions.
 
           // Check if divisor is power of 2 -> use right shift
           if (isPowerOf2(divisor)) {
