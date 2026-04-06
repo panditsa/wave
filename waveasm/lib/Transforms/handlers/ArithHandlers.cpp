@@ -537,8 +537,8 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     if (auto cmpOp = condMLIR.getDefiningOp<arith::CmpIOp>()) {
       auto cmpLhs = ctx.getMapper().getMapped(cmpOp.getLhs());
       auto cmpRhs = ctx.getMapper().getMapped(cmpOp.getRhs());
-      if (cmpLhs && cmpRhs &&
-          isScalarOrImm(*cmpLhs) && isScalarOrImm(*cmpRhs)) {
+      if (cmpLhs && cmpRhs && isScalarOrImm(*cmpLhs) &&
+          isScalarOrImm(*cmpRhs)) {
         auto sregType = ctx.createSRegType();
         Value lhsOp = *cmpLhs;
         Value rhsOp = *cmpRhs;
@@ -546,14 +546,14 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
           lhsOp = S_MOV_B32::create(builder, loc, sregType, lhsOp);
         if (isImmType(rhsOp.getType()))
           rhsOp = S_MOV_B32::create(builder, loc, sregType, rhsOp);
-        Value sccVal =
-            emitScalarCmp(builder, loc, cmpOp.getPredicate(), lhsOp, rhsOp, ctx);
+        Value sccVal = emitScalarCmp(builder, loc, cmpOp.getPredicate(), lhsOp,
+                                     rhsOp, ctx);
         Value trueV = *trueVal;
         Value falseV = *falseVal;
         if (isImmType(trueV.getType()))
           trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
-        auto result =
-            S_CSELECT_B32::create(builder, loc, sregType, sccVal, trueV, falseV);
+        auto result = S_CSELECT_B32::create(builder, loc, sregType, sccVal,
+                                            trueV, falseV);
         ctx.getMapper().mapValue(selectOp.getResult(), result);
         return success();
       }
@@ -568,14 +568,15 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     Value condV = *cond;
     if (isImmType(condV.getType()))
       condV = S_MOV_B32::create(builder, loc, ctx.createSRegType(), condV);
-    Value sccVal =
-        S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(), condV, zeroConst);
+    Value sccVal = S_CMP_NE_U32::create(builder, loc, ctx.createSCCType(),
+                                        condV, zeroConst);
     auto sregType = ctx.createSRegType();
     Value trueV = *trueVal;
     Value falseV = *falseVal;
     if (isImmType(trueV.getType()))
       trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
-    auto result = S_CSELECT_B32::create(builder, loc, sregType, sccVal, trueV, falseV);
+    auto result =
+        S_CSELECT_B32::create(builder, loc, sregType, sccVal, trueV, falseV);
     ctx.getMapper().mapValue(selectOp.getResult(), result);
     return success();
   }
