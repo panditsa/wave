@@ -250,8 +250,7 @@ void TranslationContext::emitSRDPrologue() {
       auto offsetImm = builder.getType<ImmType>(kernargOffset);
       auto offsetConst =
           ConstantOp::create(builder, loc, offsetImm, kernargOffset);
-      auto loadOp = S_LOAD_DWORDX2::create(builder, loc,
-                                           TypeRange{loadDstType},
+      auto loadOp = S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType},
                                            kernargBase, offsetConst);
       argLoadResults[pending.argIndex] = loadOp->getResult(0);
     }
@@ -267,8 +266,7 @@ void TranslationContext::emitSRDPrologue() {
       auto offsetImm = builder.getType<ImmType>(kernargOffset);
       auto offsetConst =
           ConstantOp::create(builder, loc, offsetImm, kernargOffset);
-      auto loadOp = S_LOAD_DWORDX2::create(builder, loc,
-                                           TypeRange{loadDstType},
+      auto loadOp = S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType},
                                            kernargBase, offsetConst);
       argLoadResults[pending.argIndex] = loadOp->getResult(0);
     }
@@ -301,8 +299,7 @@ void TranslationContext::emitSRDPrologue() {
       auto offsetImm = builder.getType<ImmType>(kernargOffset);
       auto offsetConst =
           ConstantOp::create(builder, loc, offsetImm, kernargOffset);
-      auto loadOp = S_LOAD_DWORDX2::create(builder, loc,
-                                           TypeRange{loadDstType},
+      auto loadOp = S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType},
                                            kernargBase, offsetConst);
       overflowLoadResults[overflowIdx] = loadOp->getResult(0);
       overflowIdx++;
@@ -413,8 +410,7 @@ void TranslationContext::emitSRDPrologue() {
       auto offsetImm = builder.getType<ImmType>(kernargOffset);
       auto offsetConst =
           ConstantOp::create(builder, loc, offsetImm, kernargOffset);
-      auto loadOp = S_LOAD_DWORDX2::create(builder, loc,
-                                           TypeRange{loadDstType},
+      auto loadOp = S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType},
                                            kernargBase, offsetConst);
       srdLoadResults[srdBase] = loadOp->getResult(0);
     }
@@ -428,8 +424,7 @@ void TranslationContext::emitSRDPrologue() {
       auto offsetImm = builder.getType<ImmType>(kernargOffset);
       auto offsetConst =
           ConstantOp::create(builder, loc, offsetImm, kernargOffset);
-      auto loadOp = S_LOAD_DWORDX2::create(builder, loc,
-                                           TypeRange{loadDstType},
+      auto loadOp = S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType},
                                            kernargBase, offsetConst);
       scalarLoadResults[(int64_t)i] = loadOp->getResult(0);
     }
@@ -450,8 +445,8 @@ void TranslationContext::emitSRDPrologue() {
       auto loadIt = srdLoadResults.find(srdBase);
       if (loadIt != srdLoadResults.end()) {
         auto dstB64Type = PSRegType::get(builder.getContext(), srdBase, 2);
-        auto movB64 = S_MOV_B64::create(builder, loc, dstB64Type,
-                                         loadIt->second);
+        auto movB64 =
+            S_MOV_B64::create(builder, loc, dstB64Type, loadIt->second);
         DCEProtectOp::create(builder, loc, movB64);
       }
 
@@ -485,8 +480,8 @@ void TranslationContext::emitSRDPrologue() {
       auto loadIt = scalarLoadResults.find((int64_t)i);
       if (loadIt != scalarLoadResults.end()) {
         auto sregTy = createSRegType(1, 1);
-        Value lowWord = ExtractOp::create(builder, loc, sregTy,
-                                          loadIt->second, 0);
+        Value lowWord =
+            ExtractOp::create(builder, loc, sregTy, loadIt->second, 0);
         auto dstPsType = PSRegType::get(builder.getContext(), sgprIdx, 1);
         auto movOp = S_MOV_B32::create(builder, loc, dstPsType, lowWord);
         DCEProtectOp::create(builder, loc, movOp);

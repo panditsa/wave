@@ -377,8 +377,6 @@ public:
   /// Get next available SRD index
   int64_t getNextSRDIndex();
 
-
-
   /// Update buffer size for a pending SRD (called when we see reinterpret_cast)
   void updateSRDBufferSize(mlir::Value memref, int64_t bufferSize);
 
