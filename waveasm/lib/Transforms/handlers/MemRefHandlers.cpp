@@ -305,8 +305,7 @@ LogicalResult handleMemRefStore(Operation *op, TranslationContext &ctx) {
     Value storeData = *data;
     if (isAGPRType(storeData.getType())) {
       auto vregType = ctx.createVRegType();
-      storeData =
-          V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
+      storeData = V_ACCVGPR_READ_B32::create(builder, loc, vregType, storeData);
     }
 
     BUFFER_STORE_DWORD::create(builder, loc, storeData, srd, voffset,

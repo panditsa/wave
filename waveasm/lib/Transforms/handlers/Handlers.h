@@ -308,8 +308,9 @@ inline mlir::Value ensureVGPR(mlir::OpBuilder &builder, mlir::Location loc,
 
 /// Emit add: S_ADD_U32 when both operands are scalar, V_ADD_U32 otherwise.
 /// Commutative: swaps to put immediate in src1 (SALU src0 must be SGPR).
-inline mlir::Value emitAdd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                           mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitAdd(mlir::Value a, mlir::Value b,
+                           mlir::OpBuilder &builder, mlir::Location loc,
+                           TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) &&
       !(isImmType(a.getType()) && isImmType(b.getType()))) {
     if (isImmType(a.getType()))
@@ -324,8 +325,9 @@ inline mlir::Value emitAdd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
 
 /// Emit sub: S_SUB_U32 when both operands are scalar, V_SUB_U32 otherwise.
 /// Not commutative: src0 (minuend) must be SGPR.
-inline mlir::Value emitSub(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                           mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitSub(mlir::Value a, mlir::Value b,
+                           mlir::OpBuilder &builder, mlir::Location loc,
+                           TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) && isSGPRType(a.getType())) {
     auto sregType = ctx.createSRegType();
     auto sccType = ctx.createSCCType();
@@ -337,8 +339,9 @@ inline mlir::Value emitSub(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
 
 /// Emit mul: S_MUL_I32 when both operands are scalar, V_MUL_LO_U32 otherwise.
 /// Commutative: swaps to put immediate in src1.
-inline mlir::Value emitMul(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                           mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitMul(mlir::Value a, mlir::Value b,
+                           mlir::OpBuilder &builder, mlir::Location loc,
+                           TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) &&
       !(isImmType(a.getType()) && isImmType(b.getType()))) {
     if (isImmType(a.getType()))
@@ -386,8 +389,9 @@ inline mlir::Value emitLshl(mlir::Value value, mlir::Value shiftAmt,
 
 /// Emit bitwise AND: S_AND_B32 when both scalar, V_AND_B32 otherwise.
 /// Commutative: swaps to put immediate in src1.
-inline mlir::Value emitAnd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                           mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitAnd(mlir::Value a, mlir::Value b,
+                           mlir::OpBuilder &builder, mlir::Location loc,
+                           TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) &&
       !(isImmType(a.getType()) && isImmType(b.getType()))) {
     if (isImmType(a.getType()))
@@ -402,8 +406,9 @@ inline mlir::Value emitAnd(mlir::Value a, mlir::Value b, mlir::OpBuilder &builde
 
 /// Emit bitwise OR: S_OR_B32 when both scalar, V_OR_B32 otherwise.
 /// Commutative: swaps to put immediate in src1.
-inline mlir::Value emitOr(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                          mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitOr(mlir::Value a, mlir::Value b,
+                          mlir::OpBuilder &builder, mlir::Location loc,
+                          TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) &&
       !(isImmType(a.getType()) && isImmType(b.getType()))) {
     if (isImmType(a.getType()))
@@ -418,8 +423,9 @@ inline mlir::Value emitOr(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder
 
 /// Emit bitwise XOR: S_XOR_B32 when both scalar, V_XOR_B32 otherwise.
 /// Commutative: swaps to put immediate in src1.
-inline mlir::Value emitXor(mlir::Value a, mlir::Value b, mlir::OpBuilder &builder,
-                           mlir::Location loc, TranslationContext &ctx) {
+inline mlir::Value emitXor(mlir::Value a, mlir::Value b,
+                           mlir::OpBuilder &builder, mlir::Location loc,
+                           TranslationContext &ctx) {
   if (isScalarOrImm(a) && isScalarOrImm(b) &&
       !(isImmType(a.getType()) && isImmType(b.getType()))) {
     if (isImmType(a.getType()))

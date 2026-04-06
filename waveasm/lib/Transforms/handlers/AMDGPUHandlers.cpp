@@ -435,7 +435,7 @@ static void patchSrdWord2InPlace(OpBuilder &builder, Location loc,
             isScalarOrImm(*cmpLhsMapped) && isScalarOrImm(*cmpRhsMapped) &&
             isScalarOrImm(*trueMapped) && isScalarOrImm(*falseMapped)) {
           Value sccVal = emitScalarCmp(builder, loc, cmpOp.getPredicate(),
-                        *cmpLhsMapped, *cmpRhsMapped, ctx);
+                                       *cmpLhsMapped, *cmpRhsMapped, ctx);
 
           auto dstType = PSRegType::get(builder.getContext(), srdBase + 2, 1);
           Value trueV = *trueMapped;
@@ -443,8 +443,8 @@ static void patchSrdWord2InPlace(OpBuilder &builder, Location loc,
           auto sregType = ctx.createSRegType();
           if (isImmType(trueV.getType()))
             trueV = S_MOV_B32::create(builder, loc, sregType, trueV);
-          auto result =
-              S_CSELECT_B32::create(builder, loc, dstType, sccVal, trueV, falseV);
+          auto result = S_CSELECT_B32::create(builder, loc, dstType, sccVal,
+                                              trueV, falseV);
           DCEProtectOp::create(builder, loc, result);
           return;
         }
