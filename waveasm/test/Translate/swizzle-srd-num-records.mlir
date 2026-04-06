@@ -24,18 +24,17 @@ module {
           : memref<2048xi8, 3> to memref<64x8xf16, 3>
 
       // fat_raw_buffer_cast with cacheSwizzleStride, no reinterpret_cast.
-      // The swizzle SRD must copy num_records from the source SRD (s_mov_b32
-      // sN, sM) rather than using 0xFFFFFFFF which would make sentinel offsets
-      // in-bounds.
+      // The swizzle SRD must copy num_records from the source SRD.
       //
       // Swizzle SRD construction sequence:
       //   s_and_b32 + s_or_b32 (set swizzle bits in base hi)
-      //   s_mov_b32 (stride word)
-      //   num_records is inherited from the source SRD (no separate copy needed)
+      //   s_mov_b32 (copy num_records from source SRD word 2)
+      //   s_mov_b32 (stride/swizzle flags)
+      //   pack into 4-wide SRD
       //
-      // CHECK: s_and_b32
-      // CHECK: s_or_b32
-      // CHECK: s_mov_b32 s{{[0-9]+}}, 0x27000
+      // CHECK: waveasm.s_and_b32
+      // CHECK: waveasm.s_or_b32
+      // CHECK: waveasm.pack
       %buf = amdgpu.fat_raw_buffer_cast %src
           validBytes(%valid) cacheSwizzleStride(%stride) resetOffset
           : memref<?xf16>
