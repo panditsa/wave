@@ -618,8 +618,8 @@ public:
 // Lattice for propagating index expressions across wave dialect operations.
 // In addition to the bottom and top states, it can represent a concrete state
 // including:
-//   - a dictionary attribute mapping symbol names to index mappings;
-//   - a dictionary attribute mapping symbol names to vector shapes;
+//   - an attribute mapping symbol names to index mappings;
+//   - an attribute mapping symbol names to vector shapes;
 //   - a priority for each symbol;
 //   - a separate, "source" vector shape and priority referring to the operation
 //     where the lattice initially originated.
@@ -630,8 +630,8 @@ public:
 // XXX: the latter is required for compatibility with the python prototype and
 // its propagation heuristic, it must be revised towards a more principled
 // approach.
-// TODO: consider using a single dictionary attribute with one entry per symbol
-// rather than separate ones for the three fields.
+// TODO: consider using a single mapping attribute with one entry per symbol
+// rather than separate ones for all fields.
 class IndexExprsLatticeStorage {
 public:
   // Priorities for specific operations that may be used.
@@ -647,12 +647,12 @@ public:
                            int32_t priority,
                            wave::WaveSymbolMappingAttr vectorShape);
   IndexExprsLatticeStorage(WaveSymbolMappingAttr concreteValue,
-                           mlir::DictionaryAttr priorities,
+                           WaveSymbolMappingAttr priorities,
                            wave::WaveSymbolMappingAttr vectorShape);
 
 private:
   IndexExprsLatticeStorage(WaveSymbolMappingAttr concreteValue,
-                           mlir::DictionaryAttr priorities,
+                           WaveSymbolMappingAttr priorities,
                            wave::WaveSymbolMappingAttr vectorShape,
                            wave::WaveSymbolMappingAttr sourceVectorShape,
                            int32_t sourceVectorShapePriority);
@@ -675,12 +675,11 @@ public:
   WaveSymbolMappingAttr getConcreteValue() const;
 
   // Return the priority for a specific key, defaulting to kLowestPriority.
-  int32_t getPriorityForKey(mlir::StringAttr key) const;
   int32_t getPriorityForKey(WaveSymbolAttr key) const;
 
-  // Return the per-key priorities as a DictionaryAttr mapping StringAttr keys
-  // to IntegerAttr values. Asserts on non-concrete values.
-  mlir::DictionaryAttr getPriorities() const {
+  // Return the per-key priorities as a WaveSymbolMappingAttr mapping
+  // WaveSymbolAttr keys to IntegerAttr values. Asserts on non-concrete values.
+  WaveSymbolMappingAttr getPriorities() const {
     assert(getConcreteValue() && "no priorities for lattice top/bottom");
     return priorities;
   }
@@ -756,16 +755,16 @@ public:
   LLVM_DUMP_METHOD void dump() const;
 
 private:
-  // The internal storage is either a dictionary attribute with one entry per
+  // The internal storage is either a mapping attribute with one entry per
   // symbol indexing the value or one of the top/bottom flags.
   llvm::PointerIntPair<mlir::Attribute, 2> value;
 
-  // Per-key priorities as a DictionaryAttr mapping symbol names to IntegerAttr
-  // priority values. Each symbol in the dictionary has its own priority.
+  // Per-key priorities as a WaveSymbolMappingAttr mapping WaveSymbolAttr keys
+  // to IntegerAttr priority values. Each symbol has its own priority.
   // Higher-priority entries override lower-priority entries in joins; entries
-  // with equal priorities are structurally merged. Using DictionaryAttr avoids
-  // per-instance heap allocation since attrs are interned.
-  mlir::DictionaryAttr priorities;
+  // with equal priorities are structurally merged. Using an interned attribute
+  // avoids per-instance heap allocation.
+  WaveSymbolMappingAttr priorities;
 
   // The vector shape associated with this lattice value. This is a mapping from
   // wave symbols to vector dimension sizes. Two concrete lattice values with
