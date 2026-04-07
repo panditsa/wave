@@ -389,13 +389,14 @@ def _remap_scaled_index_keys(
 
 def _build_index_mapping_dict(
     index: dict[IndexSymbol, IndexSequence], allowed_induction_symbols: set[IndexSymbol]
-) -> ir.DictAttr:
+) -> wave.WaveSymbolMappingAttr:
     """
-    Convert a Wave index dictionary into a DictionaryAttr of
+    Convert a Wave index dictionary into a WaveSymbolMappingAttr of
     WaveIndexMappingAttr.
 
-    For MMA, multiple DictAttr objects are assembled into an ArrayAttr (one per
-    operand). For all other nodes a single-element ArrayAttr is used.
+    For MMA, multiple WaveSymbolMappingAttr objects are assembled into an
+    ArrayAttr (one per operand). For all other nodes a single-element ArrayAttr
+    is used.
 
     Out-of-scope induction symbols are stripped before conversion.
     """
@@ -417,7 +418,7 @@ def _build_index_mapping_dict(
         index_mappings[_derived_dim_clean_name(dim)] = wave.WaveIndexMappingAttr.get(
             symbol_attrs, start, size, stride
         )
-    return ir.DictAttr.get(index_mappings)
+    return wave.WaveSymbolMappingAttr.get(index_mappings)
 
 
 def _attach_attributes(
