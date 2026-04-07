@@ -352,6 +352,34 @@ def _get_splat_input(src: Optional[Value]) -> Optional[Value]:
     return None
 
 
+def _can_elide_maskedload_with_hardware_oob(
+    emitter: WaveEmitter,
+    index: dict[IndexExpr, IndexExpr],
+    bounds: Optional[dict[IndexSymbol, IndexExpr]],
+    mapping: Optional[IndexMapping],
+    mask: Optional[Value],
+    buffer_ops_enabled: bool,
+) -> bool:
+    """Return True when a global read mask is redundant with SRD OOB clamping.
+
+    This is only safe for the buffer-ops path when:
+      * validBytes encodes the real remaining buffer size
+      * the mask is a scalar broadcast, so the whole vector is either valid or OOB
+      * the fastest-varying dimension is not part of the bounds check, avoiding
+        row-wrap cases where a logical OOB lane can still land on in-bounds bytes
+      * no index mapping is involved
+    """
+    if not (buffer_ops_enabled and emitter.options.eliminate_epilogue):
+        return False
+    if mapping is not None or mask is None or not bounds:
+        return False
+    if _get_splat_input(mask) is None:
+        return False
+
+    fastest_dim = list(index)[get_fastest_index(index)]
+    return fastest_dim not in bounds
+
+
 def _elem_bytes(elem_type: IrType) -> int:
     """Return the byte width of *elem_type*, rounding up for sub-byte types
     (e.g. 4-bit mxfp4 -> 1 byte) so that SRD valid-bytes and OOB index
@@ -1358,7 +1386,14 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
                         element_type,
                         valid_bytes,
                     )
-            if mask is None:
+            if mask is None or _can_elide_maskedload_with_hardware_oob(
+                emitter,
+                index,
+                bounds,
+                mapping,
+                mask,
+                buffer_ops_enabled,
+            ):
                 result = vector_d.load(vector_type, lin_src, [total_offset])
             else:
                 element_type = vector_type.element_type
