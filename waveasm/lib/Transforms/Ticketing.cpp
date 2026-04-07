@@ -501,18 +501,6 @@ private:
         handleNonMemoryOp(op, st);
         handleLoopBoundary(op, st);
       }
-    } else {
-      // Even without ticketed waitcnt, barriers need vmcnt(0) to ensure
-      // gather_to_lds writes are visible before ds_reads. Force-insert
-      // s_waitcnt_vmcnt 0 before every barrier.
-      for (Operation *op : allOps) {
-        if (!isa<S_BARRIER>(op))
-          continue;
-        OpBuilder builder(op->getContext());
-        builder.setInsertionPoint(op);
-        S_WAITCNT_VMCNT::create(builder, op->getLoc(),
-                                builder.getI32IntegerAttr(0));
-      }
     }
 
     combineAdjacentWaitcnts(program);
