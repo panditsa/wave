@@ -2229,18 +2229,35 @@ def get_mxfp4_asymmetric_schedule_mirrored(
         sorted_g2s_b_scale_0 = _sort_by_dst_buffer(prologue_g2s_b_scale_0)
         sorted_g2s_b_scale_1 = _sort_by_dst_buffer(prologue_g2s_b_scale_1)
 
-        # First group: all multi_buffer_0 ops (4 data + 1 scale per
-        # N-partition = 10 ops for buf0), then buf1 ops.
-        # s2v_b_0 reads from multi_buffer_0, so these must complete first.
+        # Split data ops in half across two interleaved groups, with one
+        # scale op per group per N-partition.
+        # s2v_b_0 reads from multi_buffer_0, so group 0 must complete first.
+        half_b_0 = len(sorted_g2s_b_0) // 2
+        half_b_1 = len(sorted_g2s_b_1) // 2
+        assert len(sorted_g2s_b_scale_0) % 2 == 0, (
+            f"B-scale ops for partition 0 not divisible by 2: {len(sorted_g2s_b_scale_0)}"
+        )
+        assert len(sorted_g2s_b_scale_1) % 2 == 0, (
+            f"B-scale ops for partition 1 not divisible by 2: {len(sorted_g2s_b_scale_1)}"
+        )
+        half_bs_0 = len(sorted_g2s_b_scale_0) // 2
+        half_bs_1 = len(sorted_g2s_b_scale_1) // 2
         prologue_g2s_interleaved_0 = (
-            sorted_g2s_b_0[:4] + [sorted_g2s_b_scale_0[0]]
-            + sorted_g2s_b_1[:4] + [sorted_g2s_b_scale_1[0]]
+            sorted_g2s_b_0[:half_b_0] + sorted_g2s_b_scale_0[:half_bs_0]
+            + sorted_g2s_b_1[:half_b_1] + sorted_g2s_b_scale_1[:half_bs_1]
         )
         prologue_g2s_interleaved_1 = (
-            sorted_g2s_b_0[4:8] + [sorted_g2s_b_scale_0[1]]
-            + sorted_g2s_b_1[4:8] + [sorted_g2s_b_scale_1[1]]
+            sorted_g2s_b_0[half_b_0:] + sorted_g2s_b_scale_0[half_bs_0:]
+            + sorted_g2s_b_1[half_b_1:] + sorted_g2s_b_scale_1[half_bs_1:]
         )
 
+        prologue_load_count = (
+            len(prologue_g2s_interleaved_0)
+            + len(prologue_g2v_a)
+            + len(prologue_g2v_a_scale)
+            + len(prologue_g2s_interleaved_1)
+            - half_b_0 - half_bs_0
+        )
         prologue_clusters = [
             tkw.cluster(
                 [
@@ -2248,7 +2265,7 @@ def get_mxfp4_asymmetric_schedule_mirrored(
                     prologue_g2v_a,
                     prologue_g2v_a_scale,
                     prologue_g2s_interleaved_1,
-                    tkw.MemoryCounterWaitBarrier(load=30),
+                    tkw.MemoryCounterWaitBarrier(load=prologue_load_count),
                     tkw.SchedulingBarrier([]),
                     prologue_s2v_b_0,
                     prologue_s2v_b_scale_0,
@@ -2352,7 +2369,7 @@ def get_mxfp4_asymmetric_schedule_mirrored(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=loop_A_g2v_bs + 5, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=loop_A_g2v_bs + half_b_0 + half_bs_0, ds=0),
                     tkw.SchedulingBarrier([]),
                 ],
             ),

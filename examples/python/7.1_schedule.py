@@ -37,7 +37,6 @@ from wave_lang.kernel.wave.schedules import (
 from wave_lang.kernel.wave.utils.mxfp_utils import (
     generate_gemm_afp4wfp4_inputs,
     torchScaledGemmMXFP4,
-    a_preshuffle,
     b_preshuffle,
     e8m0_shuffle,
 )
@@ -81,31 +80,20 @@ def _run_mxfp_gemm_preshuffle(
 
     w_t = w.T.contiguous()
 
-    if mirrored:
-        x_ps = a_preshuffle(x)
-        x_scales_ps = e8m0_shuffle(x_scales)
-        w_scales_ps = e8m0_shuffle(w_scales)
+    # Apply b (w_t) preshuffle only when all=True
+    w_t_ps = b_preshuffle(w_t) if all else w_t
 
-        x_ps, w_t = x_ps.cuda(), w_t.cuda()
-        x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-        out = torch.zeros(x_ps.shape[0], w_t.shape[0], dtype=output_dtype).cuda()
+    # Apply a_scale shuffle when all=True or only_scale=True
+    x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
 
-        gemm(x_ps, x_scales_ps, w_t, w_scales_ps, out)
-    else:
-        # Apply b (w_t) preshuffle only when all=True
-        w_t_ps = b_preshuffle(w_t) if all else w_t
+    # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
+    w_scales_ps = e8m0_shuffle(w_scales) if (all or only_scale or only_b) else w_scales
 
-        # Apply a_scale shuffle when all=True or only_scale=True
-        x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
+    x, w_t_ps = x.cuda(), w_t_ps.cuda()
+    x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
+    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=output_dtype).cuda()
 
-        # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
-        w_scales_ps = e8m0_shuffle(w_scales) if (all or only_scale or only_b) else w_scales
-
-        x, w_t_ps = x.cuda(), w_t_ps.cuda()
-        x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-        out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=output_dtype).cuda()
-
-        gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
+    gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
 
     torch.testing.assert_close(
         torch_out, out.cpu(), check_dtype=False, check_device=False
@@ -482,7 +470,7 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
 
 def test_mirrored(
     is_debug=False,
-    shape=(1024, 1024, 8192),
+    shape=(8192, 3072, 8192),
     block=(256, 192, 256),
     eliminate_epilogue=True,
 ):
@@ -493,8 +481,8 @@ def test_mirrored(
         del options.subs[sym]
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
-    # options.backend = "asm"
-    # options.use_wave_asm_backend = True
+    options.backend = "asm"
+    options.use_wave_asm_backend = True
     options.wave_runtime = True
     options.eliminate_epilogue = eliminate_epilogue
     options.dump_intermediates = "build/intermediatesmirrored/"
@@ -507,7 +495,7 @@ def test_mirrored(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True)
+    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True, only_scale=True)
     print("Mirrored asymmetric MXFP4 GEMM (preshuffle-A, B via LDS) test passed!")
 
 
@@ -540,7 +528,7 @@ def test_mirrored_3phase(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True)
+    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True, all=True)
     print(
         "Mirrored 3-phase MXFP4 GEMM (preshuffle-A, B via LDS) test passed!"
     )
