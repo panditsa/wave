@@ -1263,7 +1263,12 @@ LogicalResult handleVectorMaskedLoad(Operation *op, TranslationContext &ctx) {
 
   auto [voffset, instOffset] = computeVOffsetFromIndices(
       memrefType, maskedLoadOp.getIndices(), ctx, loc, maskedLoadOp.getBase());
-  Value srd = lookupSRD(maskedLoadOp.getBase(), ctx, loc);
+  Value srd;
+  if (auto *adj = ctx.getPendingSRDBaseAdjust(maskedLoadOp.getBase())) {
+    srd = emitSRDBaseAdjustment(*adj, maskedLoadOp.getBase(), ctx, loc);
+  } else {
+    srd = lookupSRD(maskedLoadOp.getBase(), ctx, loc);
+  }
   auto loadResults =
       emitBufferLoads(srd, voffset, instOffset, numBytes, ctx, loc);
 
