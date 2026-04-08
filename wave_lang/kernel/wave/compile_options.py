@@ -111,10 +111,18 @@ class WaveCompileOptions:
     # 1 - one iteration apart, 2 - two, etc
     cluster_barrier_delay: Optional[int] = None
 
-    # Enable dynamic strides through Wave runtime and LLVM backend
+    # When True with LLVM dynamic stride ABI (see ``dynamic_strides``), skip
+    # flatten_read_indices for globals without ``MemoryLayout``.  Use for tests
+    # that pass non-contiguous slice views where symbolic dense strides may not
+    # match runtime leading strides.  Default False: typical GEMM/MXFP4 paths
+    # keep read linearization without annotating every buffer.
+    allow_noncontiguous_runtime_buffers: bool = False
+
+    # Dynamic strides are enabled whenever wave_runtime is active,
+    # supported by both LLVM and waveasm backends.
     @property
     def dynamic_strides(self) -> bool:
-        return self.wave_runtime and self.backend == "llvm"
+        return self.wave_runtime
 
     # === Print options ===
     mlir_print_ir_after_all: bool = False
