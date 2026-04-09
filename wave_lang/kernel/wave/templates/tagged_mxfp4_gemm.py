@@ -10,14 +10,15 @@ Tagged MXFP4 Scaled GEMM kernel templates for CDNA4 (GFX950).
 All ops are tagged for use with MXFP4 schedule functions (e.g. get_mxfp4_dbuf_schedule).
 
 Provides:
-  - get_tagged_mxfp4_gemm:                  vanilla (A, B via LDS)
-  - get_tagged_mxfp4_gemm_preshuffle_b:     B + B_scale preshuffled (direct global reads)
+  - get_tagged_mxfp4_gemm:                           vanilla (A, B via LDS)
+  - get_tagged_mxfp4_gemm_preshuffle_b:              B + B_scale preshuffled (direct global reads)
+  - get_tagged_mxfp4_gemm_preshuffle_b_wide_store:   same + wide epilogue stores via permlane swap
 
 Required tags: k_loop, read_a, read_a_scale, read_b, read_b_scale,
 bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale, scaled_mma.
 """
 
-from sympy import Eq, Piecewise, ceiling, floor, Max
+from sympy import Eq, Max, Piecewise, ceiling, floor
 
 import wave_lang.kernel.lang as tkl
 import wave_lang.kernel.wave as tkw
@@ -377,36 +378,20 @@ def get_tagged_mxfp4_gemm_preshuffle_scales_and_B(
     )
 
 
-def get_tagged_mxfp4_gemm_preshuffle_b(
-    shape: tuple[int, int, int] = (1024, 1024, 8192),
-    block_shape: tuple[int, int, int] = (256, 256, 256),
-    wave_shape: tuple[int, int] = (2, 2),
-    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
-    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+def _get_tagged_mxfp4_gemm_preshuffle_b_impl(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    wave_shape: tuple[int, int],
+    mfma_variant: ScaledMMAType,
+    a_address_space: tkl.AddressSpace,
+    *,
     a_scale_preshuffle: bool = True,
-    reorder_workgroups=True,
-    group_size_n=32,
+    reorder_workgroups: bool = True,
+    group_size_n: int = 32,
     output_dtype=tkl.f32,
+    wide_stores: bool = False,
 ):
-    """Return a tagged MXFP4 scaled GEMM kernel with preshuffled B and B_scale.
-
-    B data is read directly from global memory using a preshuffle mapping
-    (aiter shuffle_weight permutation).  B scales are also read from global
-    memory using an e8m0 scale preshuffle mapping.  A and A_scale go through
-    shared memory (LDS) as usual.
-
-    All ops are tagged for use with MXFP4 schedule functions.
-
-    Args:
-        shape: (M, N, K) problem dimensions.
-        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
-        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
-        mfma_variant: Scaled MMA instruction type.
-        a_address_space: Address space for A and A_scale (typically SHARED).
-
-    Returns:
-        (kernel_function, WaveCompileOptions)
-    """
+    """Shared implementation for preshuffle-B MXFP4 GEMM with optional wide stores."""
     M = tkl.sym.M
     N = tkl.sym.N
     K = tkl.sym.K
@@ -418,6 +403,10 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     C_ADDRESS_SPACE = tkl.sym.C_ADDRESS_SPACE
     K_PACKED = tkl.sym.K_PACKED
     K_SCALE_SHUFFLED = tkl.sym.K_SCALE_SHUFFLED
+
+    if wide_stores:
+        m_symbol = tkl.sym.m_symbol
+        n_symbol = tkl.sym.n_symbol
 
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
@@ -435,6 +424,11 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
 
     # K is always large enough for software pipelining.
     constraints += [tkw.Assumption(K > BLOCK_K * 6)]
+
+    if wide_stores:
+        constraints += [tkw.IteratorBindings({m_symbol: M, n_symbol: N})]
+        constraints += [tkw.Assumption(Eq(M % BLOCK_M, 0))]
+        constraints += [tkw.Assumption(Eq(N % BLOCK_N, 0))]
 
     if reorder_workgroups:
         new_wg0, new_wg1 = _reorder_mxfp4_workgroups(
@@ -516,6 +510,11 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         outputs={K: k_s, N: n_s},
     )
 
+    if wide_stores:
+        reg_dim_0, reg_dim_1 = N, M
+    else:
+        reg_dim_0, reg_dim_1 = M, N
+
     @tkw.wave(constraints)
     def gemm(
         a: tkl.Memory[M, K / 2, A_ADDRESS_SPACE, tkl.i8],
@@ -524,12 +523,12 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
     ):
-        c_reg = tkl.Register[M, N, tkl.f32](0.0)
+        c_reg = tkl.Register[reg_dim_0, reg_dim_1, tkl.f32](0.0)
 
         @tkw.iterate(K, init_args=[c_reg], tag="k_loop")
         def repeat(
-            acc: tkl.Register[M, N, tkl.f32],
-        ) -> tkl.Register[M, N, tkl.f32]:
+            acc: tkl.Register[reg_dim_0, reg_dim_1, tkl.f32],
+        ) -> tkl.Register[reg_dim_0, reg_dim_1, tkl.f32]:
             a_reg = tkw.read(a, tag="read_a")
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
             a_scale_reg = tkw.read(a_scale, mapping=a_scale_mapping, tag="read_a_scale")
@@ -538,14 +537,25 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
             b_scale_reg = tkw.read(b_scale, mapping=b_scale_mapping, tag="read_b_scale")
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
-            acc = tkw.scaled_mma(
-                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
-            )
+            if wide_stores:
+                acc = tkw.scaled_mma(
+                    b_reg, b_scale_reg, a_reg, a_scale_reg, acc, tag="scaled_mma"
+                )
+            else:
+                acc = tkw.scaled_mma(
+                    a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+                )
             return acc
 
         if output_dtype == tkl.bf16:
             repeat = tkw.cast(repeat, tkl.bf16)
-        tkw.write(repeat, c)
+
+        if wide_stores:
+            tkw.write(
+                repeat, c, source=(n_symbol, m_symbol), target=(m_symbol, n_symbol)
+            )
+        else:
+            tkw.write(repeat, c)
 
     hyperparams = {
         A_ADDRESS_SPACE: a_address_space,
@@ -571,6 +581,94 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     )
 
     return gemm, options
+
+
+def get_tagged_mxfp4_gemm_preshuffle_b(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    block_shape: tuple[int, int, int] = (256, 256, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    a_scale_preshuffle: bool = True,
+    reorder_workgroups=True,
+    group_size_n=32,
+    output_dtype=tkl.f32,
+):
+    """Return a tagged MXFP4 scaled GEMM kernel with preshuffled B and B_scale.
+
+    B data is read directly from global memory using a preshuffle mapping
+    (aiter shuffle_weight permutation).  B scales are also read from global
+    memory using an e8m0 scale preshuffle mapping.  A and A_scale go through
+    shared memory (LDS) as usual.
+
+    All ops are tagged for use with MXFP4 schedule functions.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
+        mfma_variant: Scaled MMA instruction type.
+        a_address_space: Address space for A and A_scale (typically SHARED).
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    return _get_tagged_mxfp4_gemm_preshuffle_b_impl(
+        shape,
+        block_shape,
+        wave_shape,
+        mfma_variant,
+        a_address_space,
+        a_scale_preshuffle=a_scale_preshuffle,
+        reorder_workgroups=reorder_workgroups,
+        group_size_n=group_size_n,
+        output_dtype=output_dtype,
+        wide_stores=False,
+    )
+
+
+def get_tagged_mxfp4_gemm_preshuffle_b_wide_store(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    block_shape: tuple[int, int, int] = (256, 256, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    a_scale_preshuffle: bool = True,
+    reorder_workgroups=True,
+    group_size_n=32,
+    output_dtype=tkl.bf16,
+):
+    """Return a tagged MXFP4 scaled GEMM kernel with preshuffled B, B_scale, and wide stores.
+
+    Like :func:`get_tagged_mxfp4_gemm_preshuffle_b` but swaps MFMA operands
+    (B as LHS, A as RHS) so the accumulator's 4-contiguous values align with
+    the output memory's stride-1 dimension.  The ``coalesce_wide_stores`` pass
+    emits ``v_permlane16_swap_b32`` + ``buffer_store_dwordx4`` (8 bf16 per
+    store) instead of scalar ``buffer_store_short``.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
+        mfma_variant: Scaled MMA instruction type.
+        a_address_space: Address space for A and A_scale (typically SHARED).
+        output_dtype: Output element type (default bf16).
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    return _get_tagged_mxfp4_gemm_preshuffle_b_impl(
+        shape,
+        block_shape,
+        wave_shape,
+        mfma_variant,
+        a_address_space,
+        a_scale_preshuffle=a_scale_preshuffle,
+        reorder_workgroups=reorder_workgroups,
+        group_size_n=group_size_n,
+        output_dtype=output_dtype,
+        wide_stores=True,
+    )
 
 
 def _reorder_mxfp4_workgroups(m, n, block_m, block_n, group_size_n):
