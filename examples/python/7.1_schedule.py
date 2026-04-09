@@ -11,6 +11,7 @@ Usage:
     python 7.1_schedule.py --list_tests
 """
 
+import os
 import torch
 import wave_lang.kernel.lang as tkl
 
@@ -29,7 +30,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
     get_mxfp4_asymmetric_schedule_mirrored,
-    get_mxfp4_asymmetric_schedule_mirrored_3phase,
+    get_mxfp4_asymmetric_schedule_mirrored_3phase_experimental,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled_lds,
@@ -63,7 +64,7 @@ def _run_mxfp_gemm(gemm, shape):
 
 
 def _run_mxfp_gemm_preshuffle(
-    gemm, shape, all=False, only_scale=False, only_b=False, mirrored=False,
+    gemm, shape, all=False, only_scale=False, only_b=False,
     output_dtype=torch.float32,
 ):
     """Run compiled GEMM kernel with preshuffled operands, verify against reference.
@@ -72,8 +73,6 @@ def _run_mxfp_gemm_preshuffle(
       all        - shuffle a_scale (x_scales), b_scale (w_scales), and b (w_t)
       only_scale - shuffle a_scale (x_scales) and b_scale (w_scales) only
       only_b     - shuffle b_scale (w_scales) only
-      mirrored   - shuffle a (x), a_scale (x_scales), and b_scale (w_scales);
-                   b (w_t) is NOT preshuffled (goes through LDS)
     """
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
     torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
@@ -495,17 +494,17 @@ def test_mirrored(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True, only_scale=True)
+    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
     print("Mirrored asymmetric MXFP4 GEMM (preshuffle-A, B via LDS) test passed!")
 
 
 def test_mirrored_3phase(
     is_debug=False,
-    shape=(1024, 1024, 8192),
+    shape=(8192, 3072, 8192),
     block=(256, 192, 256),
     eliminate_epilogue=True,
 ):
-    """Mirrored 3-phase MXFP4 GEMM: preshuffle-A, B via LDS, aiter phase structure."""
+    """Mirrored AITER-exact bringup schedule; assembly first, correctness later."""
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_a(
         shape, block, wave_shape=(4, 1), reorder_workgroups=True
     )
@@ -515,23 +514,212 @@ def test_mirrored_3phase(
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
     options.wave_runtime = True
+    use_llvm = os.environ.get("USE_LLVM_BACKEND", "0") == "1"
+    if use_llvm:
+        options.backend = "llvm"
+        options.use_wave_asm_backend = False
+    else:
+        options.backend = "asm"
+        options.use_wave_asm_backend = True
     options.eliminate_epilogue = eliminate_epilogue
     options.dump_intermediates = "build/intermediates_3phase/"
     options.print_mlir_file = (
         "gemm_mxfp4_dbuf_4wave_asymmetric_mirrored_3phase.mlir"
     )
     options.print_mlir = True
-    schedule = get_mxfp4_asymmetric_schedule_mirrored_3phase(
+    schedule = get_mxfp4_asymmetric_schedule_mirrored_3phase_experimental(
         eliminate_epilogue=eliminate_epilogue, is_ascale_shuffled=True
     )
     options.print_ir_after = "all" if is_debug else []
+    # options.waveasm_print_ir_after = "all"
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, mirrored=True, all=True)
-    print(
-        "Mirrored 3-phase MXFP4 GEMM (preshuffle-A, B via LDS) test passed!"
-    )
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+    w_t = w.T.contiguous()
+    w_t_ps = b_preshuffle(w_t)
+    x_scales_ps = e8m0_shuffle(x_scales)
+    w_scales_ps = e8m0_shuffle(w_scales)
+    x, w_t_ps = x.cuda(), w_t_ps.cuda()
+    x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
+    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=torch.float32).cuda()
+    gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
+    out_cpu = out.cpu()
+    ref = torch_out
+
+    ref = ref.cpu() if ref.is_cuda else ref
+    diff = (out_cpu - ref).abs()
+    ref_abs = ref.abs().clamp(min=1e-6)
+    rel = diff / ref_abs
+
+    print(f"Max abs diff: {diff.max():.8f}, Max rel err: {rel.max():.8f}")
+    print(f"Mean abs diff: {diff.mean():.8f}, Mean rel err: {rel.mean():.8f}")
+    try:
+        torch.testing.assert_close(ref, out_cpu, check_dtype=False, check_device=False)
+        print("assert_close PASSED (default tol)")
+    except AssertionError as e:
+        msg = str(e)
+        print(f"assert_close FAILED: {msg[:500]}")
+    mismatch = rel > 0.01
+    n_bad = mismatch.sum().item()
+    n_total = mismatch.numel()
+    print(f"Shape: {out_cpu.shape}, bad elements: {n_bad}/{n_total} ({100*n_bad/n_total:.2f}%)")
+
+    if n_bad > 0:
+        bad_rows = mismatch.any(dim=1).nonzero(as_tuple=True)[0]
+        bad_cols = mismatch.any(dim=0).nonzero(as_tuple=True)[0]
+        print(f"Bad rows: {bad_rows.numel()}/{out_cpu.shape[0]}")
+        print(f"Bad cols: {bad_cols.numel()}/{out_cpu.shape[1]}")
+
+        M, N = out_cpu.shape
+        BLOCK_M, BLOCK_N = block[0], block[1]
+        n_blocks_m = (M + BLOCK_M - 1) // BLOCK_M
+        n_blocks_n = (N + BLOCK_N - 1) // BLOCK_N
+        print(f"\nBlock layout: {n_blocks_m} x {n_blocks_n} blocks ({BLOCK_M}x{BLOCK_N})")
+
+        print("\nPer-block-row bad column distribution:")
+        for bm in range(min(n_blocks_m, 8)):
+            r0, r1 = bm * BLOCK_M, min((bm + 1) * BLOCK_M, M)
+            block_mismatch = mismatch[r0:r1, :]
+            bad_in_block_row = block_mismatch.sum().item()
+            if bad_in_block_row > 0:
+                bad_cols_here = block_mismatch.any(dim=0).nonzero(as_tuple=True)[0]
+                print(f"  block_row {bm} (rows {r0}-{r1-1}): {bad_in_block_row} bad, cols: {bad_cols_here[:20].tolist()}{'...' if len(bad_cols_here)>20 else ''}")
+
+        print("\nPer-block-col bad row distribution:")
+        for bn in range(min(n_blocks_n, 8)):
+            c0, c1 = bn * BLOCK_N, min((bn + 1) * BLOCK_N, N)
+            block_mismatch = mismatch[:, c0:c1]
+            bad_in_block_col = block_mismatch.sum().item()
+            if bad_in_block_col > 0:
+                bad_rows_here = block_mismatch.any(dim=1).nonzero(as_tuple=True)[0]
+                print(f"  block_col {bn} (cols {c0}-{c1-1}): {bad_in_block_col} bad, rows: {bad_rows_here[:20].tolist()}{'...' if len(bad_rows_here)>20 else ''}")
+
+        print("\nFirst 10 bad elements (row, col, got, expected, rel_err):")
+        bad_idx = mismatch.nonzero()
+        for i in range(min(10, len(bad_idx))):
+            r, c = bad_idx[i][0].item(), bad_idx[i][1].item()
+            print(f"  ({r}, {c}): got={out_cpu[r,c]:.6f} ref={ref[r,c]:.6f} rel={rel[r,c]:.4f}")
+
+        print(f"\nBad rows mod {BLOCK_M}: {sorted(set((r.item() % BLOCK_M) for r in bad_rows[:100]))}")
+        print(f"Bad cols mod {BLOCK_N}: {sorted(set((c.item() % BLOCK_N) for c in bad_cols[:100]))}")
+
+        print(f"\nBad rows mod 16: {sorted(set((r.item() % 16) for r in bad_rows[:200]))}")
+        print(f"Bad cols mod 16: {sorted(set((c.item() % 16) for c in bad_cols[:200]))}")
+
+        print(f"\nBad rows mod 64: {sorted(set((r.item() % 64) for r in bad_rows[:200]))}")
+        print(f"Bad cols mod 64: {sorted(set((c.item() % 64) for c in bad_cols[:200]))}")
+
+        # Map mismatch to thread/workgroup structure
+        print("\n=== Thread/Workgroup Analysis ===")
+        # Within block (256x192): wave_shape=(4,1), MFMA 16x16x128
+        # M-row within block: wave_id*64 + lane_group*4 + row_in_group
+        #   wave_id = thread_id // 64 (0-3)
+        #   lane_group = (thread_id % 64) // 16 (0-3)
+        #   row_in_group = 0-3 (from accumulator index)
+        #   M-row offsets per wave: 0-3, 16-19, 32-35, 48-51
+        # N-col within block: (thread_id % 16) + n_tile*16
+        #   n_tile = 0-11 (12 tiles of 16 cols each = 192)
+
+        # Analyze first block (0,0) in detail
+        blk_mm = mismatch[:BLOCK_M, :BLOCK_N]
+        if blk_mm.sum().item() > 0:
+            print(f"\nBlock (0,0) detail: {blk_mm.sum().item()} bad elements")
+            bad_local = blk_mm.nonzero()
+            # Count by intra-block row
+            row_counts = {}
+            for idx in range(len(bad_local)):
+                lr = bad_local[idx][0].item()
+                row_counts[lr] = row_counts.get(lr, 0) + 1
+            print(f"  Bad intra-block rows ({len(row_counts)}): {sorted(row_counts.keys())[:30]}{'...' if len(row_counts)>30 else ''}")
+
+            # Map rows to wave_id
+            wave_bad = {}
+            for lr in sorted(row_counts.keys()):
+                wave_id = lr // 64
+                wave_bad[wave_id] = wave_bad.get(wave_id, 0) + row_counts[lr]
+            print(f"  Per-wave bad counts: {wave_bad}")
+
+            # Map to lane_group within wave
+            lg_bad = {}
+            for lr in sorted(row_counts.keys()):
+                wave_id = lr // 64
+                local_row = lr % 64
+                # Rows 0-3,16-19,32-35,48-51 map to lane_groups 0-3
+                row_group = local_row // 16
+                row_in_group = local_row % 16
+                if row_in_group < 4:
+                    lane_group = 0
+                elif 4 <= row_in_group < 8:
+                    lane_group = 1
+                elif 8 <= row_in_group < 12:
+                    lane_group = 2
+                else:
+                    lane_group = 3
+                key = (wave_id, row_group, lane_group, row_in_group)
+                lg_bad[key] = lg_bad.get(key, 0) + row_counts[lr]
+            print(f"  (wave, row_group, lane_group, row_in_grp) -> count:")
+            for k in sorted(lg_bad.keys())[:20]:
+                print(f"    {k}: {lg_bad[k]} bad cols")
+
+            # N-col pattern within block
+            col_counts = {}
+            for idx in range(len(bad_local)):
+                lc = bad_local[idx][1].item()
+                col_counts[lc] = col_counts.get(lc, 0) + 1
+            n_tile_bad = {}
+            lane_in_tile_bad = {}
+            for lc in sorted(col_counts.keys()):
+                n_tile = lc // 16
+                lane_in_tile = lc % 16
+                n_tile_bad[n_tile] = n_tile_bad.get(n_tile, 0) + col_counts[lc]
+                lane_in_tile_bad[lane_in_tile] = lane_in_tile_bad.get(lane_in_tile, 0) + col_counts[lc]
+            print(f"\n  Per N-tile (0-11) bad counts: {n_tile_bad}")
+            print(f"  Per lane-in-tile (0-15) bad counts: {lane_in_tile_bad}")
+
+        # Check if pattern is identical across blocks
+        print("\n=== Cross-block pattern consistency ===")
+        ref_pattern = mismatch[:BLOCK_M, :BLOCK_N]
+        same_count = 0
+        diff_count = 0
+        for bm in range(min(4, (M + BLOCK_M - 1) // BLOCK_M)):
+            for bn in range(min(4, (N + BLOCK_N - 1) // BLOCK_N)):
+                if bm == 0 and bn == 0:
+                    continue
+                r0, r1 = bm * BLOCK_M, min((bm+1)*BLOCK_M, M)
+                c0, c1 = bn * BLOCK_N, min((bn+1)*BLOCK_N, N)
+                blk = mismatch[r0:r1, c0:c1]
+                if blk.shape == ref_pattern.shape and (blk == ref_pattern).all():
+                    same_count += 1
+                else:
+                    diff_count += 1
+        print(f"  Blocks matching (0,0) pattern: {same_count}, different: {diff_count}")
+
+        n_zero_out = (out_cpu.abs() < 1e-10).sum().item()
+        n_nan_out = out_cpu.isnan().sum().item()
+        n_inf_out = out_cpu.isinf().sum().item()
+        print(f"\nOutput stats: zeros={n_zero_out}, nans={n_nan_out}, infs={n_inf_out}")
+        print(f"Output range: [{out_cpu.min():.4f}, {out_cpu.max():.4f}]")
+        print(f"Ref range: [{ref.min():.4f}, {ref.max():.4f}]")
+
+        print(f"\nMax rel error: {rel.max():.6f}")
+        print(f"Mean rel error (bad only): {rel[mismatch].mean():.6f}")
+
+        print("\nMismatch heatmap (8x16 blocks):")
+        for bm in range(min(n_blocks_m, 8)):
+            r0, r1 = bm * BLOCK_M, min((bm + 1) * BLOCK_M, M)
+            row_str = f"  bm{bm:2d}: "
+            for bn in range(min(n_blocks_n, 16)):
+                c0, c1 = bn * BLOCK_N, min((bn + 1) * BLOCK_N, N)
+                pct = 100 * mismatch[r0:r1, c0:c1].float().mean().item()
+                if pct == 0:
+                    row_str += " . "
+                elif pct < 10:
+                    row_str += f" {pct:.0f} "
+                else:
+                    row_str += f"{pct:3.0f}"
+            print(row_str)
 
 
 if __name__ == "__main__":

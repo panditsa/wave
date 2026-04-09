@@ -685,6 +685,22 @@ def get_tagged_mxfp4_gemm_preshuffle_a(
     else:
         b_scale_mapping = None
 
+
+    # --- B data preshuffle mapping (aiter shuffle_weight) ---
+    n_it = tkw.IndexMapping.iterator(0)
+    k_it = tkw.IndexMapping.iterator(1)
+    within_nblk = (
+        (k_it // 32) * 512 + ((k_it // 16) % 2) * 256 + (n_it % 16) * 16 + k_it % 16
+    )
+    b_preshuffle_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={
+            N: (n_it // 16) * 16 + within_nblk // K_PACKED,
+            K: within_nblk % K_PACKED,
+        },
+        outputs={N: n_it, K: k_it},
+    )
+
     @tkw.wave(constraints)
     def gemm(
         a: tkl.Memory[M, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
@@ -703,7 +719,7 @@ def get_tagged_mxfp4_gemm_preshuffle_a(
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
             a_scale_reg = tkw.read(a_scale, mapping=a_scale_mapping, tag="read_a_scale")
             a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
-            b_reg = tkw.read(b, tag="read_b")
+            b_reg = tkw.read(b, mapping=b_preshuffle_mapping, tag="read_b")
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
             b_scale_reg = tkw.read(b_scale, mapping=b_scale_mapping, tag="read_b_scale")
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
