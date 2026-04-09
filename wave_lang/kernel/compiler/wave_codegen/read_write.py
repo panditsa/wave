@@ -5,15 +5,16 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import functools
+import math
 from typing import Any, Optional
 
-import math
 import sympy
 import torch.fx as fx
 
 from wave_lang.kernel.wave.utils.graph_utils import propagate_loop_carried_vars
 from wave_lang.support.ir_imports import (
     Attribute,
+    BF16Type,
     DenseElementsAttr,
     IndexType,
     InsertionPoint,
@@ -31,10 +32,8 @@ from wave_lang.support.ir_imports import (
     gpu_d,
     llvm_d,
     memref_d,
+    rocdl_d,
     vector_d,
-)
-from .ir_utils import (
-    is_float_type,
 )
 
 from ..._support.indexing import (
@@ -44,25 +43,30 @@ from ..._support.indexing import (
     IndexSymbol,
     subs_idxc,
 )
-from ..base import ValidationError
-from ..builder import IRProxyValue
-from ..utils import strides_from_symbolic_shape
 from ...lang.global_symbols import *
 from ...lang.wave_types import IndexMapping
 from ...ops.wave_ops import (
     CustomOp,
+    MemoryAccessFlags,
     gather_to_lds,
-    tensor_load_to_lds,
     get_custom,
     read,
-    write,
-    scatter_add,
     read_meets_hw_transpose_requirements,
-    MemoryAccessFlags,
+    scatter_add,
+    tensor_load_to_lds,
+    write,
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
 from ...wave.utils.mapping_utils import transform_index_on_mapping
 from ...wave.utils.symbol_utils import safe_subs, simplify
+from ..base import ValidationError
+from ..builder import IRProxyValue
+from ..utils import (
+    strides_from_symbolic_shape,
+)
+from ..utils import (
+    symbolic_strides_match_physical_memory as _symbolic_strides_match_physical,
+)
 from .emitter import (
     WaveEmitter,
     add_emitter_subs,
@@ -74,6 +78,9 @@ from .emitter import (
     get_constant_attr,
     get_type_or_element_type,
     handle_op,
+)
+from .ir_utils import (
+    is_float_type,
 )
 
 
@@ -110,7 +117,7 @@ def _split_index(
     # Compute thread-independent index as `orig_index - thread_dependent_index`
     # All thread symbols and dynamic should cancel-out in the result.
     diff = src - thread_dependent_index
-    # Avoid sympy.simplify on Piecewise expressions — it recurses into boolean
+    # Avoid sympy.simplify on Piecewise expressions : it recurses into boolean
     # condition simplification and can hang for complex dynamic-shape indices.
     # expand() handles basic polynomial cancellation and is O(fast).
     if isinstance(diff, sympy.Basic) and diff.has(sympy.Piecewise):
@@ -589,7 +596,7 @@ def _cast_buffer_and_encode_stride(
         stride_int = _get_constant_value(stride_candidate)
         # Emit swizzle stride for both static and dynamic cases.
         # Static: only if stride fits in signed i14 (max 8192).
-        # Dynamic: always emit — the SRD swizzle encoding is constant
+        # Dynamic: always emit : the SRD swizzle encoding is constant
         # (0x40400000 + 0x27000) regardless of the actual stride value.
         if stride_int is None or stride_int <= 8192:
             swizzle_stride = arith_d.index_cast(uint14, stride_candidate)
@@ -1331,6 +1338,54 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
     )
 
     use_llvm_store = flags != MemoryAccessFlags.NONE
+
+    if getattr(node, "_permlane_pack_global", False):
+        is_shared = get_custom(memory).type.address_space == SHARED_ADDRESS_SPACE
+        if not is_shared and isinstance(element_type, BF16Type):
+            role = getattr(node, "_permlane_pack_role", "unpaired")
+
+            if role == "first":
+                node._stashed_codegen = {
+                    "insert_vector": insert_vector,
+                    "kb_dest": kb_dest,
+                    "output_shape": output_shape,
+                    "start_indices": start_indices,
+                    "start_indices_wg": start_indices_wg,
+                    "start_indices_th": start_indices_th,
+                    "memory_custom": get_custom(memory),
+                    "index": index,
+                }
+                return
+
+            if role == "second":
+                partner = node._permlane_partner
+                s = partner._stashed_codegen
+                _write_permlane_pair_to_global(
+                    emitter,
+                    s["insert_vector"],
+                    insert_vector,
+                    s["kb_dest"],
+                    kb_dest,
+                    s["output_shape"],
+                    output_shape,
+                    s["start_indices"],
+                    s["start_indices_wg"],
+                    s["start_indices_th"],
+                    start_indices,
+                    start_indices_wg,
+                    start_indices_th,
+                    s["memory_custom"],
+                    get_custom(memory),
+                    s["index"],
+                    index,
+                )
+                return
+
+            assert False, (
+                "Unexpected unpaired wide-store write. "
+                "coalesce_wide_stores should pair all eligible writes."
+            )
+
     if use_llvm_store:
         _create_llvm_read_write(
             kb_dest, kb_ir_type, start_indices, insert_type, flags, insert_vector
@@ -1350,6 +1405,150 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
             mask,
             node_index=index,
         )
+
+
+def _write_permlane_pair_to_global(
+    emitter: WaveEmitter,
+    vec_a: Value,
+    vec_b: Value,
+    kb_dest_a: Value,
+    kb_dest_b: Value,
+    output_shape_a: tuple,
+    output_shape_b: tuple,
+    start_indices_a: tuple,
+    start_indices_wg_a: tuple,
+    start_indices_th_a: tuple,
+    start_indices_b: tuple,
+    start_indices_wg_b: tuple,
+    start_indices_th_b: tuple,
+    memory_custom_a,
+    memory_custom_b,
+    index_a: dict,
+    index_b: dict,
+):
+    """Pair two tile groups via permlane16_swap for duplicate-free wide stores.
+
+    Pairs tile A and tile B by passing them as separate ``old_dst`` /
+    ``src`` operands to ``v_permlane16_swap_b32``.  Both outputs of the
+    swap carry distinct data, so each lane writes a *different* tile
+    group's wide store : no duplicate stores:
+
+    * Lower lane (lane % 32 < 16) writes tile A:
+      ``[own_A_lo, own_A_hi, partner_A_lo, partner_A_hi]``
+    * Upper lane (lane % 32 >= 16) writes tile B:
+      ``[partner_B_lo, partner_B_hi, own_B_lo, own_B_hi]``
+
+    This halves both the ``permlane16_swap`` count and the global store
+    count compared to the single-write approach.
+
+    Preconditions (same as ``_write_permlane_pack_to_global``):
+      - Swapped MFMA operands, F32_16x16x128_F8F6F4 layout, bf16 output.
+      - Both Write nodes tagged by ``coalesce_wide_stores``.
+
+    .. note::
+        The store is emitted using tile A's ``output_shape``,
+        ``memory_custom``, ``kb_dest``, and ``index``.  This is correct
+        when both tiles target the same output buffer with identical
+        shape and buffer descriptor (the standard MXFP4 GEMM case).
+        If the two tiles ever target different buffers, the
+        ``_create_vec_read_write`` call would need to be split into
+        two lane-divergent stores.
+    """
+    num_elems_a = vec_a.type.shape[0] if hasattr(vec_a.type, "shape") else 1
+    num_elems_b = vec_b.type.shape[0] if hasattr(vec_b.type, "shape") else 1
+    assert num_elems_a == 4 and num_elems_b == 4, (
+        f"_write_permlane_pair_to_global expects 4 bf16 elements per thread "
+        f"per tile, got {num_elems_a} and {num_elems_b}."
+    )
+
+    bf16_type = BF16Type.get()
+    i32_type = IntegerType.get_signless(32)
+    idx_type = IndexType.get()
+    v2i32_type = VectorType.get([2], i32_type)
+    v4i32_type = VectorType.get([4], i32_type)
+    v8bf16_type = VectorType.get([8], bf16_type)
+
+    i32_a = vector_d.bitcast(v2i32_type, vec_a)
+    a_lo = vector_d.extract(i32_a, static_position=[0], dynamic_position=[])
+    a_hi = vector_d.extract(i32_a, static_position=[1], dynamic_position=[])
+
+    i32_b = vector_d.bitcast(v2i32_type, vec_b)
+    b_lo = vector_d.extract(i32_b, static_position=[0], dynamic_position=[])
+    b_hi = vector_d.extract(i32_b, static_position=[1], dynamic_position=[])
+
+    swap_type = llvm_d.StructType.get_literal([i32_type, i32_type])
+
+    # old_dst = a, src = b  →  result[0] = partner's b, result[1] = partner's a
+    swap_lo = rocdl_d.permlane16_swap(swap_type, a_lo, b_lo, False, False)
+    swap_hi = rocdl_d.permlane16_swap(swap_type, a_hi, b_hi, False, False)
+
+    partner_b_lo = llvm_d.extractvalue(i32_type, swap_lo, [0])
+    partner_a_lo = llvm_d.extractvalue(i32_type, swap_lo, [1])
+    partner_b_hi = llvm_d.extractvalue(i32_type, swap_hi, [0])
+    partner_a_hi = llvm_d.extractvalue(i32_type, swap_hi, [1])
+
+    lane_in_wave = arith_d.remui(emitter.thread_ids[0], arith_d.constant(idx_type, 64))
+    half_pos = arith_d.remui(lane_in_wave, arith_d.constant(idx_type, 32))
+    is_lower = arith_d.cmpi(
+        arith_d.CmpIPredicate.ult, half_pos, arith_d.constant(idx_type, 16)
+    )
+
+    # Lower lane: [own_A_lo, own_A_hi, partner_A_lo, partner_A_hi]
+    # Upper lane: [partner_B_lo, partner_B_hi, own_B_lo, own_B_hi]
+    d0 = arith_d.select(is_lower, a_lo, partner_b_lo)
+    d1 = arith_d.select(is_lower, a_hi, partner_b_hi)
+    d2 = arith_d.select(is_lower, partner_a_lo, b_lo)
+    d3 = arith_d.select(is_lower, partner_a_hi, b_hi)
+
+    wide_i32 = vector_d.from_elements(v4i32_type, [d0, d1, d2, d3])
+    wide_vec = vector_d.bitcast(v8bf16_type, wide_i32)
+
+    elems_per_thread = arith_d.constant(idx_type, 4)
+
+    # Lower lane uses tile A's address; upper lane uses tile B's address.
+    # Upper lane subtracts elems_per_thread from the last dim to align
+    # to the lower lane's column position (same as the single-write path).
+    adj_th = list(start_indices_th_a)
+    adj_full = list(start_indices_a)
+    for dim_idx in range(len(adj_th)):
+        if dim_idx == len(adj_th) - 1:
+            adj_b_th = arith_d.subi(start_indices_th_b[-1], elems_per_thread)
+            adj_b_full = arith_d.subi(start_indices_b[-1], elems_per_thread)
+            adj_th[dim_idx] = arith_d.select(is_lower, adj_th[dim_idx], adj_b_th)
+            adj_full[dim_idx] = arith_d.select(is_lower, adj_full[dim_idx], adj_b_full)
+        else:
+            adj_th[dim_idx] = arith_d.select(
+                is_lower, start_indices_th_a[dim_idx], start_indices_th_b[dim_idx]
+            )
+            adj_full[dim_idx] = arith_d.select(
+                is_lower, start_indices_a[dim_idx], start_indices_b[dim_idx]
+            )
+
+    adj_wg = list(start_indices_wg_a)
+    for dim_idx in range(len(adj_wg)):
+        adj_wg[dim_idx] = arith_d.select(
+            is_lower, start_indices_wg_a[dim_idx], start_indices_wg_b[dim_idx]
+        )
+
+    sel_output_shape = output_shape_a
+    sel_memory_custom = memory_custom_a
+    sel_kb_dest = kb_dest_a
+    sel_index = index_a
+
+    _create_vec_read_write(
+        emitter,
+        sel_output_shape,
+        sel_kb_dest,
+        wide_vec,
+        None,
+        tuple(adj_full),
+        tuple(adj_wg),
+        tuple(adj_th),
+        8,
+        sel_memory_custom,
+        None,
+        node_index=sel_index,
+    )
 
 
 def assume_index_subgroup_uniform(value: Value, element_type: IrType) -> Value:
