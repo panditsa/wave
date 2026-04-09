@@ -252,18 +252,13 @@ bool mlirAttributeIsAWaveHyperparameterAttr(MlirAttribute attr) {
 }
 
 MlirAttribute mlirWaveHyperparameterAttrGet(MlirAttribute mapping) {
-  auto dictAttr = llvm::cast<DictionaryAttr>(unwrap(mapping));
-
-  MLIRContext *ctx = dictAttr.getContext();
-
-  assert(llvm::all_of(dictAttr,
-                      [](const NamedAttribute &namedAttr) {
-                        return llvm::isa<IntegerAttr, wave::WaveExprListAttr>(
-                            namedAttr.getValue());
-                      }) &&
-         "expected mapping to contain only integer or WaveExprListAttr values");
-
-  return wrap(wave::WaveHyperparameterAttr::get(ctx, dictAttr));
+  auto symMapping = llvm::cast<wave::WaveSymbolMappingAttr>(unwrap(mapping));
+  assert(llvm::all_of(llvm::make_second_range(symMapping),
+                      llvm::IsaPred<IntegerAttr, wave::WaveExprListAttr>) &&
+         "expected mapping to contain only IntegerAttr or WaveExprListAttr "
+         "values");
+  MLIRContext *ctx = symMapping.getContext();
+  return wrap(wave::WaveHyperparameterAttr::get(ctx, symMapping));
 }
 
 MlirTypeID mlirWaveHyperparameterAttrGetTypeID() {
