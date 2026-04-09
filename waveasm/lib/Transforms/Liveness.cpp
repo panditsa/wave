@@ -45,6 +45,16 @@ static bool isSwapPatternIterArg(Value iterArg, Block &bodyBlock, unsigned i) {
 /// S_ADD_U32 is placed in the middle of the body; if it shares a
 /// register with the IV block_arg, the second unrolled copy's use of
 /// the original IV reads the wrong value.
+///
+/// Special case: VMEM loads (buffer_load_*) are async. The destination
+/// VGPR is not written at the issue point; data arrives when a vmcnt
+/// fence retires the load. The first consumer of the load result is
+/// guaranteed to be placed after such a fence (otherwise it would read
+/// stale data). Using that first-use point as the "effective write"
+/// eliminates false WAR hazards for pipelined async prefetches, which
+/// is critical for matching AITER-style A-data prefetch patterns where
+/// buffer_loads issue at the top of the loop while MFMAs still consume
+/// the previous iteration's data from the same register.
 static bool hasWARHazard(Value iterArg, Value blockArg,
                          const LivenessInfo &info) {
   if (isa<BlockArgument>(iterArg))
@@ -53,17 +63,32 @@ static bool hasWARHazard(Value iterArg, Value blockArg,
   if (!defOp)
     return false;
 
-  // Check for def/use overlap: if the iter_arg is defined at a point
-  // where block_arg still has subsequent uses, tying them creates a
-  // WAR hazard.
-  auto iterDefIt = info.defPoints.find(iterArg);
+  int64_t effectiveWrite;
+
+  if (isa<VMEMLoadOpInterface>(defOp)) {
+    // Async VMEM load: the register is not written at the issue point.
+    // Use the earliest consumer as the effective write point. This is
+    // safe because any consumer must be placed after the vmcnt fence
+    // that retires the load.
+    auto iterUseIt = info.usePoints.find(iterArg);
+    if (iterUseIt == info.usePoints.end() || iterUseIt->second.empty())
+      return false;
+    effectiveWrite = *std::min_element(iterUseIt->second.begin(),
+                                       iterUseIt->second.end());
+  } else {
+    auto iterDefIt = info.defPoints.find(iterArg);
+    if (iterDefIt == info.defPoints.end())
+      return false;
+    effectiveWrite = iterDefIt->second;
+  }
+
   auto baUseIt = info.usePoints.find(blockArg);
-  if (iterDefIt != info.defPoints.end() && baUseIt != info.usePoints.end()) {
-    int64_t iterDef = iterDefIt->second;
-    for (int64_t usePoint : baUseIt->second) {
-      if (usePoint > iterDef)
-        return true;
-    }
+  if (baUseIt == info.usePoints.end())
+    return false;
+
+  for (int64_t usePoint : baUseIt->second) {
+    if (usePoint > effectiveWrite)
+      return true;
   }
   return false;
 }
