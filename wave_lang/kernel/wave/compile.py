@@ -543,6 +543,52 @@ def build_graph_passes(
         partial(decompose_topk_ops, trace, launchable.constraints),
     ]
 
+    graph_passes += [
+        partial(simplify_indices, trace, launchable.constraints),
+        partial(
+            partition_gather_like_ops, trace, launchable.constraints, options.target
+        ),
+        partial(
+            generate_bounds_exprs,
+            trace,
+            launchable.constraints,
+            launchable.reordering_constraints,
+        ),
+        *(
+            [partial(flatten_read_indices, trace, launchable.constraints)]
+            if options.linearize_reads
+            and not options.dynamic_strides
+            and not options.use_water_backend
+            else []
+        ),
+        partial(
+            merge_contiguous_reads,
+            trace,
+            launchable.constraints,
+            options.target,
+        ),
+        *(
+            [partial(annotate_iv_strides, trace, launchable.constraints)]
+            if options.linearize_reads
+            else []
+        ),
+    ]
+
+    if options.use_bound_check:
+        graph_passes += [
+            partial(generate_bound_checks, trace),
+        ]
+
+    graph_passes.append(
+        partial(
+            location_check_pass,
+            trace,
+            "enforce-locations",
+            log=False,
+            enforce_locations=options.enforce_locations,
+        )
+    )
+
     # Schedule the iterate ops.
     scheduling_type = options.schedule
     use_scheduling_barriers = options.use_scheduling_barriers
@@ -589,7 +635,9 @@ def build_graph_passes(
                 options.minimize_shared_allocs,
             ),
         ]
+
     graph_passes += [
+        partial(compute_shared_memory_usage, trace, options.kernel_launch_info),
         partial(
             add_shared_memory_barriers,
             trace,
@@ -597,51 +645,7 @@ def build_graph_passes(
             is_specialized=options.specialize,
         ),
         partial(add_cluster_barriers, trace, launchable.constraints, options),
-        partial(compute_shared_memory_usage, trace, options.kernel_launch_info),
-        partial(simplify_indices, trace, launchable.constraints),
-        partial(
-            partition_gather_like_ops, trace, launchable.constraints, options.target
-        ),
-        partial(
-            generate_bounds_exprs,
-            trace,
-            launchable.constraints,
-            launchable.reordering_constraints,
-        ),
-        *(
-            [partial(flatten_read_indices, trace, launchable.constraints)]
-            if options.linearize_reads
-            and not options.dynamic_strides
-            and not options.use_water_backend
-            else []
-        ),
-        partial(
-            merge_contiguous_reads,
-            trace,
-            launchable.constraints,
-            options.target,
-        ),
-        *(
-            [partial(annotate_iv_strides, trace, launchable.constraints)]
-            if options.linearize_reads
-            else []
-        ),
     ]
-
-    if options.use_bound_check:
-        graph_passes += [
-            partial(generate_bound_checks, trace),
-        ]
-
-    graph_passes.append(
-        partial(
-            location_check_pass,
-            trace,
-            "enforce-locations",
-            log=False,
-            enforce_locations=options.enforce_locations,
-        )
-    )
 
     raw_graph_passes = [raw_graph_pass(graph_pass) for graph_pass in graph_passes]
     return wrap_graph_passes_with_region_adapters(trace, raw_graph_passes)

@@ -34,7 +34,12 @@ from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
 from ...compiler.utils import strides_from_symbolic_shape
 from ...lang.global_symbols import LINEAR_INDEX, SHARED_ADDRESS_SPACE
-from ...ops.wave_ops import MemoryAccessFlags, Read, get_custom
+from ...ops.wave_ops import (
+    GatherToLDS,
+    MemoryAccessFlags,
+    Read,
+    get_custom,
+)
 from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
 from ..utils.general_utils import (
