@@ -55,8 +55,11 @@ def annotate_iv_strides(
         if hasattr(custom, "has_identity_mapping") and custom.has_identity_mapping():
             continue
 
-        symbolic_shape = custom.type.symbolic_shape
         mem_sym_shape = get_custom(mem_node).type.symbolic_shape
+        if custom.type is not None:
+            symbolic_shape = custom.type.symbolic_shape
+        else:
+            symbolic_shape = mem_sym_shape
         phys_strides = strides_from_symbolic_shape(
             idxc, mem_sym_shape, allow_mixed_shapes=True
         )

@@ -1403,9 +1403,24 @@ def _generate_asm_code(mb, options):
                 result = _run_translate([])
 
         if result.returncode != 0:
-            raise RuntimeError("waveasm-translate failed (see stderr output above)")
+            raise RuntimeError(
+                f"waveasm-translate failed (exit {result.returncode}):\n{result.stderr}"
+            )
         asm_text = result.stdout
+
+        if waveasm_ir_dump and result.stderr and options.dump_intermediates:
+            ir_path = os.path.join(
+                options.dump_intermediates, f"{kernel_name}.waveasm_ir_dump.txt"
+            )
+            os.makedirs(options.dump_intermediates, exist_ok=True)
+            with open(ir_path, "w") as f:
+                f.write(result.stderr)
     finally:
+        if options.dump_intermediates:
+            import shutil
+            saved_mlir = os.path.join(options.dump_intermediates, f"{kernel_name}.mlir")
+            os.makedirs(options.dump_intermediates, exist_ok=True)
+            shutil.copy2(mlir_path, saved_mlir)
         os.unlink(mlir_path)
 
     if options.dump_intermediates:
@@ -1425,6 +1440,15 @@ def _compile_asm_to_binary(asm_code, options):
     from wave_lang.support.detect_waveasm import get_clang
 
     clang = get_clang()
+    kernel_name = options.func_name
+
+    preserved_asm_dir = options.dump_intermediates or get_temp_binary_dir()
+    os.makedirs(preserved_asm_dir, exist_ok=True)
+    preserved_asm_output = os.path.join(
+        preserved_asm_dir, f"{kernel_name}.clang_input.s"
+    )
+    with open(preserved_asm_output, "w") as preserved_file:
+        preserved_file.write(asm_code)
 
     # Create temporary file for assembly output.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".s", delete=False) as asm_file:
@@ -1433,7 +1457,6 @@ def _compile_asm_to_binary(asm_code, options):
 
     try:
         # Generate code object using clang++.
-        kernel_name = options.func_name
         obj_file = os.path.join(get_temp_binary_dir(), f"{kernel_name}.o")
         hsaco_file = os.path.join(get_temp_binary_dir(), f"{kernel_name}.hsaco")
 
@@ -1455,7 +1478,17 @@ def _compile_asm_to_binary(asm_code, options):
 
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"Assembly compilation failed: {result.stderr}")
+            preserved_stderr = os.path.join(
+                preserved_asm_dir, f"{kernel_name}.clang_compile.stderr.txt"
+            )
+            with open(preserved_stderr, "w") as stderr_file:
+                stderr_file.write(result.stderr)
+            raise RuntimeError(
+                "Assembly compilation failed. "
+                f"Preserved clang input at {preserved_asm_output}. "
+                f"Preserved stderr at {preserved_stderr}.\n"
+                f"{result.stderr}"
+            )
 
         # Step 2: Link object file to hsaco file.
         link_cmd = [
@@ -1471,7 +1504,17 @@ def _compile_asm_to_binary(asm_code, options):
 
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"Hsaco linking failed: {result.stderr}")
+            preserved_stderr = os.path.join(
+                preserved_asm_dir, f"{kernel_name}.clang_link.stderr.txt"
+            )
+            with open(preserved_stderr, "w") as stderr_file:
+                stderr_file.write(result.stderr)
+            raise RuntimeError(
+                "Hsaco linking failed. "
+                f"Preserved clang input at {preserved_asm_output}. "
+                f"Preserved stderr at {preserved_stderr}.\n"
+                f"{result.stderr}"
+            )
 
     finally:
         # Clean up temporary files

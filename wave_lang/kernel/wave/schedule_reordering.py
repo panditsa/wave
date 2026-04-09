@@ -261,7 +261,9 @@ def reorder_graph(graph, clusters):
     ]
 
     reordered_original_nodes = topological_sort_with_dependencies(
-        original_cluster_nodes, exhaustive_cluster_nodes, pre_cluster_nodes
+        original_cluster_nodes,
+        exhaustive_cluster_nodes,
+        pre_cluster_nodes + post_cluster_nodes,
     )
 
     total_reordered_node = (

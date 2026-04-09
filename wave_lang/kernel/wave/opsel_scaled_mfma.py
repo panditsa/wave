@@ -34,6 +34,7 @@ from iree.compiler.ir import (
     ArrayAttr,
     Block,
     Float8E8M0FNUType,
+    IndexType,
     InsertionPoint,
     IntegerAttr,
     IntegerType,
@@ -45,6 +46,7 @@ from iree.compiler.ir import (
 )
 from iree.compiler.dialects import (
     amdgpu as amdgpu_d,
+    arith as arith_d,
     scf as scf_d,
     vector as vector_d,
 )
@@ -397,6 +399,41 @@ def _coalesce_vector_iter_args(module: Module) -> None:
             v1xi8, source, offsets, _sizes_1, _strides_1
         )
 
+    def make_wide_yield_load(byte_yield: Value, byte_offset: int) -> Optional[Value]:
+        """Create a vector<4xi8> load from any member of a merged yield group."""
+        byte_owner = byte_yield.owner
+        if isinstance(byte_owner, Block):
+            logger.debug("yield byte is a block argument; cannot widen")
+            return None
+
+        byte_op = _look_through_select(byte_owner)
+        if not _is_op_named(byte_op, "vector.load"):
+            byte_name = getattr(byte_op, "name", type(byte_op).__name__)
+            logger.debug(
+                f"yield byte is not backed by vector.load ({byte_name})"
+            )
+            return None
+
+        load_view = byte_op.opview
+        indices = list(load_view.indices)
+        if not indices:
+            logger.debug("yield byte load has no indices; cannot widen")
+            return None
+
+        base_index = indices[-1]
+        if byte_offset:
+            index_type = IndexType.get()
+            with InsertionPoint(byte_op):
+                byte_offset_const = arith_d.constant(
+                    index_type, IntegerAttr.get(index_type, byte_offset)
+                )
+                base_index = arith_d.subi(base_index, byte_offset_const)
+        indices[-1] = base_index
+
+        v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
+        with InsertionPoint(byte_op):
+            return vector_d.load(v4xi8, load_view.base, indices)
+
     for_ops = [
         op for op in _walk_operations(module.operation) if _is_op_named(op, "scf.for")
     ]
@@ -441,32 +478,31 @@ def _coalesce_vector_iter_args(module: Module) -> None:
                 )
                 continue
 
-            if 0 not in members:
+            base_offset = min(members)
+            base_member_yield = old_yield_operands[members[base_offset]]
+            wide_load = make_wide_yield_load(base_member_yield, base_offset)
+            if wide_load is None:
                 logger.debug(
-                    f"Group {g_idx}: no byte-0 member, cannot determine base "
-                    f"address for wide load — skipping"
+                    f"Group {g_idx}: could not reconstruct wide yield load "
+                    f"from byte offset {base_offset}"
                 )
                 continue
-            byte0_yield = old_yield_operands[members[0]]
-            byte0_op = byte0_yield.owner
-            if not _is_op_named(byte0_op, "vector.load"):
-                logger.debug(
-                    f"Group {g_idx}: byte-0 yield is not a vector.load "
-                    f"({byte0_op.name}) — skipping"
-                )
-                continue
-            load_view = byte0_op.opview
-            memref = load_view.base
-            indices = list(load_view.indices)
-            v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
-            with InsertionPoint(byte0_op):
-                wide_load = vector_d.load(v4xi8, memref, indices)
             groups[g_idx] = (init_source, wide_load, members)
             logger.debug(
                 f"Created wide vector<{SCALE_VECTOR_WIDTH}xi8> load for "
-                f"group {g_idx} yield value (replaces {len(members)} "
-                f"sub-word loads)"
+                f"group {g_idx} yield value from byte offset {base_offset} "
+                f"(replaces {len(members)} sub-word loads)"
             )
+
+        unresolved_groups = sum(1 for _, yield_source, _ in groups if yield_source is None)
+        if unresolved_groups:
+            logger.debug(
+                f"Skipping {unresolved_groups} unresolved iter-arg coalesce "
+                f"group(s) after wide-load reconstruction"
+            )
+            groups = [group for group in groups if group[1] is not None]
+            if not groups:
+                continue
 
         plan = _build_coalesce_plan(groups, for_view, yield_op)
         old_iter_args = list(for_view.inner_iter_args)
@@ -609,98 +645,110 @@ def _merge_scale_byte_loads(module: Module) -> None:
         if len(loads) < 2:
             continue
 
-        addr_to_offset: dict[int, int] = {}
-        base_op: Optional[Operation] = None
+        by_aligned_base: dict[int, list[tuple[Operation, int]]] = defaultdict(list)
         for load_op in loads:
             addr_val = load_op.opview.indices[-1]
             off = _get_affine_constant_offset(addr_val.owner)
             if off is None:
                 continue
-            if off >= SCALE_VECTOR_WIDTH:
-                continue
-            addr_to_offset[id(load_op)] = off
-            if off == 0:
-                base_op = load_op
-
-        if base_op is None:
-            continue
-
-        base_view = base_op.opview
-        v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
-
-        earliest = base_op
-        for load_op in loads:
-            if id(load_op) in addr_to_offset:
-                earliest = load_op
-                break
-
-        with InsertionPoint(earliest):
-            wide = vector_d.load(v4xi8, base_view.base, list(base_view.indices))
-
-        replaced = 0
-        for load_op in loads:
-            if id(load_op) not in addr_to_offset:
-                continue
-            off = addr_to_offset[id(load_op)]
             rtype = load_op.results[0].type
             n = rtype.shape[0]
-            if off + n > SCALE_VECTOR_WIDTH:
+            aligned_base = off - (off % SCALE_VECTOR_WIDTH)
+            rel_off = off - aligned_base
+            if rel_off + n > SCALE_VECTOR_WIDTH:
+                continue
+            by_aligned_base[aligned_base].append((load_op, off))
+
+        for aligned_base, bucket in by_aligned_base.items():
+            if len(bucket) < 2:
                 continue
 
-            if n == 1:
-                with InsertionPoint(load_op):
-                    offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
-                    sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                    strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                    ext = vector_d.ExtractStridedSliceOp(
-                        v1xi8, wide, offsets, sizes, strides
-                    )
-                load_op.results[0].replace_all_uses_with(ext.result)
-                load_op.erase()
-                replaced += 1
-            else:
-                ess_users = []
-                for use in list(load_op.results[0].uses):
-                    user_op = use.owner
-                    if (
-                        _is_op_named(user_op, "vector.extract_strided_slice")
-                        and IntegerAttr(user_op.opview.sizes[0]).value == 1
-                    ):
-                        inner_off = IntegerAttr(user_op.opview.offsets[0]).value
-                        byte_off = off + inner_off
-                        if byte_off < SCALE_VECTOR_WIDTH:
-                            ess_users.append((user_op, byte_off))
+            base_op, base_abs_off = min(bucket, key=lambda item: item[1])
+            base_view = base_op.opview
+            v4xi8 = VectorType.get([SCALE_VECTOR_WIDTH], i8)
 
-                for user_op, byte_off in ess_users:
-                    with InsertionPoint(user_op):
-                        offsets = ArrayAttr.get([IntegerAttr.get(i64, byte_off)])
+            bucket_offsets = {id(op): off for op, off in bucket}
+            earliest = base_op
+            for load_op in loads:
+                if id(load_op) in bucket_offsets:
+                    earliest = load_op
+                    break
+
+            indices = list(base_view.indices)
+            base_index = indices[-1]
+            delta = base_abs_off - aligned_base
+            if delta:
+                index_type = IndexType.get()
+                with InsertionPoint(earliest):
+                    delta_cst = arith_d.constant(
+                        index_type, IntegerAttr.get(index_type, delta)
+                    )
+                    base_index = arith_d.subi(base_index, delta_cst)
+            indices[-1] = base_index
+
+            with InsertionPoint(earliest):
+                wide = vector_d.load(v4xi8, base_view.base, indices)
+
+            replaced = 0
+            for load_op, abs_off in bucket:
+                rel_off = abs_off - aligned_base
+                rtype = load_op.results[0].type
+                n = rtype.shape[0]
+
+                if n == 1:
+                    with InsertionPoint(load_op):
+                        offsets = ArrayAttr.get([IntegerAttr.get(i64, rel_off)])
                         sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
                         strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
                         ext = vector_d.ExtractStridedSliceOp(
                             v1xi8, wide, offsets, sizes, strides
                         )
-                    user_op.results[0].replace_all_uses_with(ext.result)
-                    user_op.erase()
+                    load_op.results[0].replace_all_uses_with(ext.result)
+                    load_op.erase()
+                    replaced += 1
+                else:
+                    ess_users = []
+                    for use in list(load_op.results[0].uses):
+                        user_op = use.owner
+                        if (
+                            _is_op_named(user_op, "vector.extract_strided_slice")
+                            and IntegerAttr(user_op.opview.sizes[0]).value == 1
+                        ):
+                            inner_off = IntegerAttr(user_op.opview.offsets[0]).value
+                            byte_off = rel_off + inner_off
+                            if byte_off < SCALE_VECTOR_WIDTH:
+                                ess_users.append((user_op, byte_off))
 
-                has_remaining = any(True for _ in load_op.results[0].uses)
-                if has_remaining:
-                    with InsertionPoint(load_op):
-                        offsets = ArrayAttr.get([IntegerAttr.get(i64, off)])
-                        sizes = ArrayAttr.get([IntegerAttr.get(i64, n)])
-                        strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
-                        fallback = vector_d.ExtractStridedSliceOp(
-                            rtype, wide, offsets, sizes, strides
-                        )
-                    load_op.results[0].replace_all_uses_with(fallback.result)
+                    for user_op, byte_off in ess_users:
+                        with InsertionPoint(user_op):
+                            offsets = ArrayAttr.get([IntegerAttr.get(i64, byte_off)])
+                            sizes = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                            strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                            ext = vector_d.ExtractStridedSliceOp(
+                                v1xi8, wide, offsets, sizes, strides
+                            )
+                        user_op.results[0].replace_all_uses_with(ext.result)
+                        user_op.erase()
 
-                load_op.erase()
-                replaced += 1
+                    has_remaining = any(True for _ in load_op.results[0].uses)
+                    if has_remaining:
+                        with InsertionPoint(load_op):
+                            offsets = ArrayAttr.get([IntegerAttr.get(i64, rel_off)])
+                            sizes = ArrayAttr.get([IntegerAttr.get(i64, n)])
+                            strides = ArrayAttr.get([IntegerAttr.get(i64, 1)])
+                            fallback = vector_d.ExtractStridedSliceOp(
+                                rtype, wide, offsets, sizes, strides
+                            )
+                        load_op.results[0].replace_all_uses_with(fallback.result)
 
-        if replaced:
-            logger.debug(
-                f"Merged {replaced} sub-word LDS loads into one "
-                f"vector<{SCALE_VECTOR_WIDTH}xi8> load"
-            )
+                    load_op.erase()
+                    replaced += 1
+
+            if replaced:
+                logger.debug(
+                    f"Merged {replaced} sub-word LDS loads into one "
+                    f"vector<{SCALE_VECTOR_WIDTH}xi8> load"
+                )
 
 
 def apply_opsel_scaled_mfma(module: Module):

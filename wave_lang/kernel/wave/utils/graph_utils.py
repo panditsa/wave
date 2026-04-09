@@ -47,6 +47,7 @@ from ...ops.wave_ops import (
     SharedMemoryBarrierSignal,
     SharedMemoryBarrierWait,
     MemoryCounterWaitBarrier,
+    WorkgroupBarrier,
     Write,
     get_custom,
 )
@@ -1419,6 +1420,10 @@ def is_barrier_between_same_graph(
         if isinstance(custom_next_node, SharedMemoryBarrierWait):
             if custom_next_node.barId == barId and barId in barrier_check:
                 return next_node
+
+        # Check for explicit workgroup barriers and combined wait+barrier ops.
+        if isinstance(custom_next_node, WorkgroupBarrier):
+            return next_node
 
         # Check for MemoryCounterWaitBarrier (amdgpu.memory_counter_wait + rocdl.s.barrier)
         if isinstance(custom_next_node, MemoryCounterWaitBarrier):
