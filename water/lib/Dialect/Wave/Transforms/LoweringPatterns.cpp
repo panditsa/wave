@@ -62,11 +62,10 @@ wave::materializeAffine(Location loc, ArrayRef<Attribute> symbols,
   baseSymVals.reserve(map.getNumSymbols());
   for (Attribute attr : symbols) {
     if (auto symbol = dyn_cast<wave::WaveSymbolAttr>(attr)) {
-      StringRef name = symbol.getName();
-      std::optional<int64_t> value = hyper.getSymbolValue(name);
+      std::optional<int64_t> value = hyper.getSymbolValue(symbol);
 #ifndef NDEBUG
       if (!value) {
-        llvm::errs() << "symbol: " << name << "\n";
+        llvm::errs() << "symbol: " << symbol.getName() << "\n";
         assert(false && "unknown symbol, should have been caught by verifiers");
       }
 #endif
@@ -426,7 +425,7 @@ public:
                      arith::IntegerOverflowFlags overflowFlags)
       : AffineExprVisitor<AffineExprExpander, Value>(), builder(builder),
         loc(loc), symbols(symbols), operands(operands),
-        hypeparameters(hypeparameters), targetType(targetType),
+        hyperparameters(hypeparameters), targetType(targetType),
         overflowFlags(overflowFlags) {}
 
   // Build a (splat) constant matching the target type.
@@ -497,8 +496,7 @@ public:
       return operands[operandAttr.getOperandNumber()];
     } else if (auto symbolAttr = dyn_cast<wave::WaveSymbolAttr>(
                    symbols[expr.getPosition()])) {
-      std::optional<int64_t> value =
-          hypeparameters.getSymbolValue(symbolAttr.getName());
+      std::optional<int64_t> value = hyperparameters.getSymbolValue(symbolAttr);
       assert(value && "failed to get symbol value");
       return getConstant(*value);
     }
@@ -514,7 +512,7 @@ private:
   Location loc;
   ArrayRef<Attribute> symbols;
   ArrayRef<Value> operands;
-  wave::WaveHyperparameterAttr hypeparameters;
+  wave::WaveHyperparameterAttr hyperparameters;
   Type targetType;
   arith::IntegerOverflowFlags overflowFlags;
 };
