@@ -24,6 +24,9 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "waveasm-linear-scan"
 
 using namespace mlir;
 using namespace waveasm;
@@ -67,6 +70,112 @@ static bool isInsideLoopBody(Operation *op) {
       return true;
   }
   return false;
+}
+
+/// Defer prefetch buffer_loads that issue before their consuming MFMAs.
+///
+/// In a software-pipelined loop, buffer_loads for the next iteration's
+/// A-data share registers with the current iteration's blockArgs
+/// (coalesced iter_args). On AMD CDNA the destination VGPR is written
+/// at an indeterminate time after the buffer_load issues. If any MFMA
+/// that reads the old blockArg value executes after the memory system
+/// returns the new data, it reads wrong values.
+///
+/// This moves pure-prefetch buffer_loads (only used by ConditionOp) to
+/// just after the last MFMA that reads the corresponding blockArg.
+/// The coalescing decision then sees def > all blockArg uses, allowing
+/// register sharing without v_mov copies and without a timing hazard.
+/// Adjust a vmcnt fence to account for one fewer in-flight VMEM load
+/// preceding it.  vmcnt(N) means "wait until at most N loads remain";
+/// removing one pending load before the fence requires N → N−1 so the
+/// same number of completions is enforced.  vmcnt(0) is left alone.
+static void decrementVmcnt(Operation *op) {
+  if (auto w = dyn_cast<S_WAITCNT_VMCNT>(op)) {
+    int64_t cnt = w.getCount();
+    if (cnt > 0)
+      op->setAttr("count",
+                  IntegerAttr::get(w.getCountAttr().getType(), cnt - 1));
+  } else if (auto w = dyn_cast<S_WAITCNT>(op)) {
+    if (auto attr = w.getVmcntAttr()) {
+      int64_t cnt = attr.getValue().getSExtValue();
+      if (cnt > 0)
+        op->setAttr("vmcnt", IntegerAttr::get(attr.getType(), cnt - 1));
+    }
+  }
+}
+
+static void deferPrefetchBufferLoads(ProgramOp program) {
+  program.walk([](LoopOp loopOp) {
+    Block &bodyBlock = loopOp.getBodyBlock();
+    auto condOp = dyn_cast<ConditionOp>(bodyBlock.getTerminator());
+    if (!condOp)
+      return;
+
+    // Process each iter_arg independently.  After each move the IR
+    // is updated, so subsequent moves see the correct ordering.
+    for (unsigned i = 0; i < condOp.getIterArgs().size(); ++i) {
+      if (i >= bodyBlock.getNumArguments())
+        continue;
+
+      Value iterArg = condOp.getIterArgs()[i];
+      auto *defOp = iterArg.getDefiningOp();
+      if (!defOp || !isa<VMEMLoadOpInterface>(defOp))
+        continue;
+
+      // Only defer pure prefetch loads (sole use is the ConditionOp).
+      if (!iterArg.hasOneUse())
+        continue;
+
+      BlockArgument blockArg = bodyBlock.getArgument(i);
+
+      // Find the last use of blockArg, excluding the ConditionOp.
+      Operation *lastUser = nullptr;
+      for (OpOperand &use : blockArg.getUses()) {
+        Operation *user = use.getOwner();
+        if (user == condOp.getOperation())
+          continue;
+        if (!lastUser || lastUser->isBeforeInBlock(user))
+          lastUser = user;
+      }
+
+      if (!lastUser)
+        continue;
+
+      // Already after the last blockArg consumer; nothing to do.
+      if (lastUser->isBeforeInBlock(defOp))
+        continue;
+
+      // Verify all operands are defined before the target position.
+      bool canMove = true;
+      for (Value operand : defOp->getOperands()) {
+        if (isa<BlockArgument>(operand))
+          continue;
+        auto *operandDef = operand.getDefiningOp();
+        if (!operandDef)
+          continue;
+        if (operandDef->getBlock() == &bodyBlock &&
+            lastUser->isBeforeInBlock(operandDef)) {
+          canMove = false;
+          break;
+        }
+      }
+
+      if (!canMove)
+        continue;
+
+      // Walk from the buffer_load to the target and adjust every
+      // vmcnt fence crossed.  Each moved load removes one pending
+      // VMEM op before the fence.
+      auto endIt = std::next(lastUser->getIterator());
+      for (auto it = std::next(defOp->getIterator()); it != endIt; ++it)
+        decrementVmcnt(&*it);
+
+      defOp->moveAfter(lastUser);
+      LLVM_DEBUG(llvm::dbgs()
+                 << "deferPrefetchBufferLoads: moved VMEM load past "
+                    "last blockArg consumer\n");
+    }
+  });
 }
 
 /// Check if an operation can be cheaply rematerialized (cloned near each
@@ -352,6 +461,11 @@ private:
         }
       }
     });
+
+    // Move prefetch buffer_loads past their consuming MFMAs so that
+    // iter_arg coalescing is safe without timing hazards. Must run
+    // before liveness analysis sees the instruction ordering.
+    deferPrefetchBufferLoads(program);
 
     // Rematerialize cheap VGPR ops (v_mov_b32 from immediates) near their
     // use sites to shorten live ranges and reduce peak register pressure.
