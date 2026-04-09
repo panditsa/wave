@@ -21,6 +21,7 @@ Requires use_global_to_shared=True and threads_per_wave=64.
 import wave_lang.kernel.lang as tkl
 import wave_lang.kernel.wave as tkw
 import wave_lang.kernel.wave.wave_schedule as wave_schedule
+from wave_lang.kernel.ops.wave_ops import get_custom
 
 
 def get_mxfp4_dbuf_schedule(use_stagger: bool = True):
@@ -510,11 +511,14 @@ def get_mxfp4_dbuf_pingpong_schedule_Bshuffled(
         # Matrix A scale
         all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
 
-        # Matrix B data
-        all_read_b = tkw.get_node_by_tag("read_b")
+        # Matrix B data - filter to Read nodes only to exclude
+        # Reshape/ExtractSlice bridge nodes from partition_gather_like_ops.
+        all_read_b = tkw.filter_nodes(tkw.get_node_by_tag("read_b"), node_type=tkw.Read)
 
-        # Matrix B scale
-        all_read_b_scale = tkw.get_node_by_tag("read_b_scale")
+        # Matrix B scale - filter to Read nodes only
+        all_read_b_scale = tkw.filter_nodes(
+            tkw.get_node_by_tag("read_b_scale"), node_type=tkw.Read
+        )
 
         # Bitcast operations (needed alongside compute)
         bitcast_a = tkw.get_node_by_tag("bitcast_a")
@@ -1621,13 +1625,30 @@ def get_mxfp4_asymmetric_schedule(
 
         # partition s2v_a by M
         s2v_a_0, s2v_a_1 = tkw.partition_by_dim(s2v_a, dim=M, num_partitions=2)
-        s2v_a_scale_0, s2v_a_scale_1 = tkw.partition_by_dim(
-            s2v_a_scale, dim=M, num_partitions=2
-        )
+
+        # For small block tiles (e.g. BLOCK_M=32), merge_contiguous_reads may
+        # collapse all M-partitioned a_scale reads into a single wide read,
+        # leaving fewer than 2 unique M IDs. Skip the partition in that case.
+        a_scale_m_ids = {
+            get_custom(n).expanded_dims[M]
+            for n in s2v_a_scale
+            if get_custom(n).expanded_dims and M in get_custom(n).expanded_dims
+        }
+        if len(a_scale_m_ids) >= 2:
+            s2v_a_scale_0, s2v_a_scale_1 = tkw.partition_by_dim(
+                s2v_a_scale, dim=M, num_partitions=2
+            )
+        else:
+            s2v_a_scale_0, s2v_a_scale_1 = s2v_a_scale, []
 
         # Matrix B data and B scale - Global to Vector
-        g2v_b = tkw.get_node_by_tag("read_b")
-        g2v_b_scale = tkw.get_node_by_tag("read_b_scale")
+        # Filter to Read nodes only: partition_gather_like_ops may create
+        # Reshape/ExtractSlice bridge nodes that inherit tags but don't
+        # generate buffer loads and must not inflate vmcnt counts.
+        g2v_b = tkw.filter_nodes(tkw.get_node_by_tag("read_b"), node_type=tkw.Read)
+        g2v_b_scale = tkw.filter_nodes(
+            tkw.get_node_by_tag("read_b_scale"), node_type=tkw.Read
+        )
 
         # Bitcast operations (needed alongside compute)
         bitcast_a = tkw.get_node_by_tag("bitcast_a")
@@ -1692,11 +1713,6 @@ def get_mxfp4_asymmetric_schedule(
             2  # prefetch depth of A and A_scale is 2 iterations (triple buffer)
         )
 
-        if is_bscale_shuffled:
-            b_scale_shuffling_factor = 4
-        else:
-            b_scale_shuffling_factor = 1
-
         # =====================================================================
         # Prologue: G2S_A + G2S_A_scale + G2V_B + G2V_B_scale + vmcnt(25) + s2v_a_0 + s2v_a_scale_0
         # =====================================================================
@@ -1716,9 +1732,7 @@ def get_mxfp4_asymmetric_schedule(
         # A is prefetched twice in the prologue, we want to wait for just the first prefetch
         A_g2s_total = len(prologue_g2s_a) + len(prologue_g2s_a_scale)
         A_g2s_per_iter = A_g2s_total // num_pf_iters
-        B_g2v_prologue = len(prologue_g2v_b) + (
-            len(prologue_g2v_b_scale) // b_scale_shuffling_factor
-        )
+        B_g2v_prologue = len(prologue_g2v_b) + len(prologue_g2v_b_scale)
 
         prologue_clusters = [
             tkw.cluster(
@@ -1815,9 +1829,7 @@ def get_mxfp4_asymmetric_schedule(
             start_after_groups=[[], [], [1], [0]],
         )
 
-        loop_B_g2v_bs = len(loop_g2v_b) + (
-            len(loop_g2v_b_scale) // b_scale_shuffling_factor
-        )
+        loop_B_g2v_bs = len(loop_g2v_b) + len(loop_g2v_b_scale)
         loop_A_s2v_bs = len(loop_g2s_a) + len(loop_g2s_a_scale)
         clusters = [
             tkw.cluster(

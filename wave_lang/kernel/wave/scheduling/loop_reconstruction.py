@@ -37,6 +37,7 @@ from .loop_reconstruction_utils import (
     interleave_instructions,
     liveness_analysis,
     partition_graph_by_stage,
+    propagate_scheduling_parameters_to_bridge_nodes,
 )
 from .resources import get_custom_operation_type
 from typing import Optional
@@ -60,7 +61,10 @@ def update_index(
     index: dict[IndexSymbol, IndexSequence | IndexExpr],
     subs: dict[IndexSymbol, IndexSymbol],
 ) -> dict[IndexSymbol, IndexSequence | IndexExpr]:
-    return {k: v.subs(subs) for k, v in index.items()}
+    return {
+        (k.subs(subs) if hasattr(k, "subs") else k): v.subs(subs)
+        for k, v in index.items()
+    }
 
 
 def update_loop_dependent_args_if_present(
@@ -915,6 +919,7 @@ def construct_pipelined_loop(
         final_results: List of nodes representing the final values after epilogue completes
     """
     induction_variable = get_induction_variable(reduction, constraints)
+    propagate_scheduling_parameters_to_bridge_nodes(graph)
     num_rotating_registers = liveness_analysis(graph)
     multi_buffer_count = compute_multi_buffer_count(
         graph, initiation_interval, multi_buffer_count

@@ -543,61 +543,7 @@ def build_graph_passes(
         partial(decompose_topk_ops, trace, launchable.constraints),
     ]
 
-    # Schedule the iterate ops.
-    scheduling_type = options.schedule
-    use_scheduling_barriers = options.use_scheduling_barriers
-    if options.schedule == SchedulingType.MANUAL:
-        graph_passes.append(
-            partial(
-                launchable.run_manual_schedule,
-                trace,
-                launchable.constraints,
-                schedule,
-                use_scheduling_barriers,
-            ),
-        )
-    else:
-        graph_passes.append(
-            partial(
-                schedule_graph,
-                trace,
-                launchable.constraints,
-                use_scheduling_barriers,
-                scheduling_type,
-                options.override_schedule,
-                options.dump_schedule,
-                options.multi_buffer_count,
-            )
-        )
-
-    graph_passes.append(
-        partial(guard_g2s_with_bounds_check, trace, launchable.constraints)
-    )
-
-    if options.optimization_level:
-        graph_passes += [
-            partial(
-                schedule_reordering,
-                trace,
-                launchable.constraints,
-                scheduling_type,
-                options.use_global_to_shared,
-            ),
-            partial(
-                minimize_shared_allocs,
-                trace,
-                options.minimize_shared_allocs,
-            ),
-        ]
     graph_passes += [
-        partial(
-            add_shared_memory_barriers,
-            trace,
-            target=options.target,
-            is_specialized=options.specialize,
-        ),
-        partial(add_cluster_barriers, trace, launchable.constraints, options),
-        partial(compute_shared_memory_usage, trace, options.kernel_launch_info),
         partial(simplify_indices, trace, launchable.constraints),
         partial(
             partition_gather_like_ops, trace, launchable.constraints, options.target
@@ -647,6 +593,64 @@ def build_graph_passes(
             enforce_locations=options.enforce_locations,
         )
     )
+
+    # Schedule the iterate ops.
+    scheduling_type = options.schedule
+    use_scheduling_barriers = options.use_scheduling_barriers
+    if options.schedule == SchedulingType.MANUAL:
+        graph_passes.append(
+            partial(
+                launchable.run_manual_schedule,
+                trace,
+                launchable.constraints,
+                schedule,
+                use_scheduling_barriers,
+            ),
+        )
+    else:
+        graph_passes.append(
+            partial(
+                schedule_graph,
+                trace,
+                launchable.constraints,
+                use_scheduling_barriers,
+                scheduling_type,
+                options.override_schedule,
+                options.dump_schedule,
+                options.multi_buffer_count,
+            )
+        )
+
+    graph_passes.append(
+        partial(guard_g2s_with_bounds_check, trace, launchable.constraints)
+    )
+
+    if options.optimization_level:
+        graph_passes += [
+            partial(
+                schedule_reordering,
+                trace,
+                launchable.constraints,
+                scheduling_type,
+                options.use_global_to_shared,
+            ),
+            partial(
+                minimize_shared_allocs,
+                trace,
+                options.minimize_shared_allocs,
+            ),
+        ]
+
+    graph_passes += [
+        partial(compute_shared_memory_usage, trace, options.kernel_launch_info),
+        partial(
+            add_shared_memory_barriers,
+            trace,
+            target=options.target,
+            is_specialized=options.specialize,
+        ),
+        partial(add_cluster_barriers, trace, launchable.constraints, options),
+    ]
 
     raw_graph_passes = [raw_graph_pass(graph_pass) for graph_pass in graph_passes]
     return wrap_graph_passes_with_region_adapters(trace, raw_graph_passes)
