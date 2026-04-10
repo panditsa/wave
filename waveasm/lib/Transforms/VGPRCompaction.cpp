@@ -503,6 +503,7 @@ applyRemapping(ProgramOp program,
 
 struct WAVEASMVGPRCompaction
     : waveasm::impl::WAVEASMVGPRCompactionBase<WAVEASMVGPRCompaction> {
+  using WAVEASMVGPRCompactionBase::WAVEASMVGPRCompactionBase;
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
@@ -540,15 +541,27 @@ struct WAVEASMVGPRCompaction
         }
       }
 
-      if (!anyChange)
-        return;
+      if (anyChange) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "VGPR compaction: " << maxBefore << " -> " << maxAfter
+                   << " (saved " << (maxBefore - maxAfter) << ")\n");
 
-      LLVM_DEBUG(llvm::dbgs()
-                 << "VGPR compaction: " << maxBefore << " -> " << maxAfter
-                 << " (saved " << (maxBefore - maxAfter) << ")\n");
+        auto subElementMap = buildSubElementMap(ranges);
+        applyRemapping(program, oldToNew, subElementMap);
+      }
 
-      auto subElementMap = buildSubElementMap(ranges);
-      applyRemapping(program, oldToNew, subElementMap);
+      // Enforce the hardware VGPR limit after compaction.  The linear
+      // scan allocator uses a pool larger than the HW limit to tolerate
+      // alignment fragmentation; compaction packs assignments back down.
+      // If the post-compaction peak still exceeds the limit, the kernel
+      // genuinely needs more VGPRs than the hardware provides.
+      if (maxVGPRs > 0 && maxAfter > maxVGPRs) {
+        program.emitError()
+            << "Failed to allocate VGPR: kernel requires " << maxAfter
+            << " VGPRs after compaction but only " << maxVGPRs
+            << " are available (pre-compaction: " << maxBefore << ")";
+        signalPassFailure();
+      }
     });
   }
 };

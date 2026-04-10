@@ -258,8 +258,14 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
   stats.totalSRegs = liveness.sregRanges.size();
   stats.totalARegs = liveness.aregRanges.size();
 
+  // Give the VGPR pool 32 registers of headroom beyond the hardware
+  // limit so alignment fragmentation never causes allocation failure.
+  // VGPRCompaction packs the result back down and enforces the real
+  // hardware limit.
+  int64_t vgprPoolSize = maxVGPRs + 32;
+
   // Step 3: Create register pools with reserved registers
-  RegPool vgprPool(RegClass::VGPR, maxVGPRs, reservedVGPRs);
+  RegPool vgprPool(RegClass::VGPR, vgprPoolSize, reservedVGPRs);
   RegPool sgprPool(RegClass::SGPR, maxSGPRs, reservedSGPRs);
   RegPool agprPool(RegClass::AGPR, maxAGPRs, reservedAGPRs);
 
@@ -280,7 +286,7 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
   // Step 5: Allocate VGPRs using linear scan (with optional strategy)
   if (failed(allocateRegClass(liveness.vregRanges, vgprPool, mapping, stats,
                               tiedOperands, precoloredValues, "VGPR", program,
-                              maxVGPRs, liveness.maxVRegPressure,
+                              vgprPoolSize, liveness.maxVRegPressure,
                               vgprStrategy.get()))) {
     return failure();
   }

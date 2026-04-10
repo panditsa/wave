@@ -292,8 +292,17 @@ def WAVEASMVGPRCompaction : Pass<"waveasm-vgpr-compaction"> {
     Scope: VGPRs only (PVRegType).  SGPRs and AGPRs are not compacted
     because SGPR pressure is rarely the bottleneck and AGPRs have fixed
     hardware mapping for MFMA accumulators.
+
+    When max-vgprs is set, the pass emits an error if the post-compaction
+    peak exceeds the hardware limit.  This defers the register-pressure
+    check from the allocator (which may over-allocate due to alignment
+    fragmentation) to after compaction has packed assignments down.
   }];
   let dependentDialects = ["::waveasm::WaveASMDialect"];
+  let options = [
+    Option<"maxVGPRs", "max-vgprs", "int64_t", "0",
+           "Hardware VGPR limit (0 = no check)">
+  ];
 }
 
 //===----------------------------------------------------------------------===//
