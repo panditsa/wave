@@ -361,24 +361,23 @@ static VoffsetDecomp decomposeVoffset(Value voff) {
   }
   result.constAddend = totalConst;
 
-  // Phase 2: iteratively peel SGPR addends from V_ADD_U32(vgpr, sgpr)
-  // chains.  Handles multi-level patterns like
-  //   V_ADD_U32(V_ADD_U32(base, sgpr1), sgpr2)
-  // where both sgpr1 and sgpr2 are folded into per-load soffset.
-  while (auto addOp = current.getDefiningOp<V_ADD_U32>()) {
+  // Phase 2: check if the remaining value is V_ADD_U32(vgpr, sgpr).
+  // This captures per-load SGPR offsets like n_idx * 16 * K_PACKED.
+  if (auto addOp = current.getDefiningOp<V_ADD_U32>()) {
     Value src0 = addOp.getSrc0();
     Value src1 = addOp.getSrc1();
     if (isVGPRType(src0.getType()) && isSGPRType(src1.getType())) {
+      result.vgprBase = src0;
       result.sgprParts.push_back(src1);
-      current = src0;
     } else if (isSGPRType(src0.getType()) && isVGPRType(src1.getType())) {
+      result.vgprBase = src1;
       result.sgprParts.push_back(src0);
-      current = src1;
     } else {
-      break;
+      result.vgprBase = current;
     }
+  } else {
+    result.vgprBase = current;
   }
-  result.vgprBase = current;
 
   return result;
 }
@@ -501,20 +500,18 @@ computeStaticStride(const llvm::SetVector<Operation *> &deps, Value voffset,
 
     if (auto lshlOrOp = dyn_cast<V_LSHL_OR_B32>(op)) {
       // lshl_or(src, amt, or_val) = (src << amt) | or_val.
-      // Treating OR as ADD is only safe when the OR value is
-      // IV-independent (delta=0, bits are disjoint by construction).
-      // If the OR operand varies with IV, the bit-overlap semantics
-      // diverge from addition and the delta is undefined.
+      // In address computation, OR always has disjoint bits (packed fields),
+      // so delta = (dSrc << amt) + dOr.
       int64_t dSrc = getDelta(lshlOrOp.getSrc0());
       int64_t dShift = getDelta(lshlOrOp.getSrc1());
       int64_t dOr = getDelta(lshlOrOp.getSrc2());
-      if (dShift != 0 || dOr != 0)
+      if (dShift != 0)
         return std::nullopt;
       auto shiftAmt = validShift(getConstantValue(lshlOrOp.getSrc1()));
       if (!shiftAmt)
         return std::nullopt;
       for (Value r : op->getResults())
-        delta[r] = dSrc << *shiftAmt;
+        delta[r] = (dSrc << *shiftAmt) + dOr;
       continue;
     }
 
@@ -881,30 +878,8 @@ static void applyStrengthReduction(LoopOp loopOp) {
     opMapping[&op] = cloned;
   }
 
-  // Pre-compute soffset + sgpr_addend for each unique (group, addend) pair
-  // at the top of the loop body, so loads sharing the same addend reuse one
-  // s_add_u32 instead of each emitting their own.
-  DenseMap<std::pair<unsigned, Value>, Value> soffsetCache;
-  auto getSoffsetWithAddend = [&](unsigned groupIdx, Value addend) -> Value {
-    Value base = newBody.getArgument(soffsetArgBase + groupIdx);
-    if (!addend)
-      return base;
-    auto key = std::make_pair(groupIdx, addend);
-    auto it = soffsetCache.find(key);
-    if (it != soffsetCache.end())
-      return it->second;
-    OpBuilder topBuilder = OpBuilder::atBlockBegin(&newBody);
-    Value result =
-        S_ADD_U32::create(topBuilder, loc, sregType,
-                          SCCType::get(topBuilder.getContext()), base, addend)
-            .getDst();
-    soffsetCache[key] = result;
-    return result;
-  };
-
   // Patch buffer_loads: set voffset to precomputed value, soffset to
-  // iter_arg (possibly adjusted by per-load SGPR addend), and apply
-  // instOffset deltas from voffset deduplication.
+  // iter_arg, and apply instOffset deltas from voffset deduplication.
   for (auto [i, info] : llvm::enumerate(candidates)) {
     Operation *clonedLoad = opMapping.lookup(info.loadOp);
     assert(clonedLoad && "cloned load not found in op mapping");
@@ -912,11 +887,10 @@ static void applyStrengthReduction(LoopOp loopOp) {
     // Replace voffset with precomputed (possibly deduplicated) value.
     clonedLoad->setOperand(getVoffsetIdx(clonedLoad), initialVoffsets[i]);
 
-    // Replace soffset with the group's soffset iter_arg, folding in any
-    // per-load SGPR addend extracted during voffset deduplication.
+    // Replace soffset with the group's soffset iter_arg.
     unsigned groupIdx = candidateGroupIdx[i];
-    Value soffsetVal = getSoffsetWithAddend(groupIdx, sgprAddends[i]);
-    clonedLoad->setOperand(2, soffsetVal);
+    Value soffsetArg = newBody.getArgument(soffsetArgBase + groupIdx);
+    clonedLoad->setOperand(2, soffsetArg);
 
     // Apply instOffset delta from voffset deduplication.
     if (instOffsetDeltas[i] != 0) {

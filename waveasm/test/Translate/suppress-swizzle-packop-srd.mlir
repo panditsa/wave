@@ -47,11 +47,10 @@ module {
 
       // Second cast: source is the RESULT of the first cast (so srcMapped
       // is the PackOp SRD). Only vector.load consumers (suppress=true),
-      // non-max validBytes (8192) -> enters suppress-swizzle path.
+      // non-max validBytes (8192) -> falls through to full rebuild.
       //
-      // With InsertOp, only word 2 is replaced in the source SRD.
       // CHECK: waveasm.s_mov_b32 %{{.*}} : !waveasm.imm<8192>
-      // CHECK: waveasm.insert %{{.*}} into %{{.*}}[2]
+      // CHECK: waveasm.pack
       %buf2 = amdgpu.fat_raw_buffer_cast %buf1
           validBytes(%valid_tight) cacheSwizzleStride(%stride) resetOffset
           : memref<?xf16, #amdgpu.address_space<fat_raw_buffer>>
