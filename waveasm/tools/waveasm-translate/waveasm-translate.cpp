@@ -77,6 +77,11 @@ static llvm::cl::opt<bool>
                  llvm::cl::desc("Emit AMDGCN assembly instead of MLIR"),
                  llvm::cl::init(false));
 
+static llvm::cl::opt<bool> printIRAfterAll(
+    "print-ir-after-all",
+    llvm::cl::desc("Print IR after each pass to stderr"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> runPreTranslationCSE(
     "mlir-cse",
     llvm::cl::desc("Run MLIR CSE before translation (reduces redundant index "
@@ -223,6 +228,11 @@ int main(int argc, char **argv) {
   // TODO: Upstream areTypesCompatible to LoopLikeOpInterface.
   if (disablePassVerifier)
     pm.enableVerifier(false);
+
+  if (printIRAfterAll) {
+    context.disableMultithreading();
+    pm.enableIRPrinting();
+  }
 
   if (pm.size() > 0) {
     if (failed(pm.run(*module))) {

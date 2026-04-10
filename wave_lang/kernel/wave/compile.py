@@ -1342,6 +1342,7 @@ def _generate_asm_code(mb, options):
             "--waveasm-memory-offset-opt",
             "--canonicalize",
             "--waveasm-scoped-cse",
+            "--loop-invariant-code-motion",
         ]
         # (2,2) wave shapes generate extract_strided_slice -> V_BFE_U32
         # for scale extraction, creating load->VALU data hazards that
@@ -1353,10 +1354,7 @@ def _generate_asm_code(mb, options):
         threads_per_wave = 64
         waves_in_m = wg[0] // threads_per_wave
         waves_in_n = wg[1]
-        # TODO: improve Ticketing logic (better latency-covering heuristics,
-        # smarter coalescing) so ticketed waitcnt can be always-on without
-        # a performance hit, removing this wave-shape conditional.
-        use_ticketed_waitcnt = waves_in_m >= 2 and waves_in_n >= 2
+        use_ticketed_waitcnt = False
         waitcnt_flag = (
             "--waveasm-insert-waitcnt"
             if use_ticketed_waitcnt
@@ -1367,6 +1365,7 @@ def _generate_asm_code(mb, options):
             "--waveasm-scc-verifier",
             "--waveasm-linear-scan=max-vgprs=256 max-agprs=256",
             "--waveasm-vgpr-compaction",
+            "--disable-pass-verifier",
             waitcnt_flag,
             f"--waveasm-hazard-mitigation=target={options.target}",
             "--emit-assembly",
@@ -1376,9 +1375,17 @@ def _generate_asm_code(mb, options):
             mlir_path,
         ]
 
+        ir_dump_flags = []
+        waveasm_ir_dump = getattr(options, "waveasm_print_ir_after", None)
+        if waveasm_ir_dump == "all":
+            ir_dump_flags = ["--print-ir-after-all"]
+        elif waveasm_ir_dump:
+            ir_dump_flags = [f"--print-ir-after={waveasm_ir_dump}"]
+
         def _run_translate(extra_passes):
             full_cmd = (
                 [waveasm_translate, f"--target={options.target}"]
+                + ir_dump_flags
                 + base_passes
                 + extra_passes
                 + tail_passes
@@ -1401,18 +1408,40 @@ def _generate_asm_code(mb, options):
             m = re.search(r"\.vgpr_count:\s*(\d+)", result.stdout)
             if m and int(m.group(1)) > HW_VGPR_LIMIT:
                 result = _run_translate([])
+        elif "Failed to allocate VGPR" in result.stderr:
+            result = _run_translate([])
 
         if result.returncode != 0:
+            if options.dump_intermediates:
+                import shutil
+                os.makedirs(options.dump_intermediates, exist_ok=True)
+                shutil.copy2(
+                    mlir_path,
+                    os.path.join(options.dump_intermediates, f"{kernel_name}.failed.mlir"),
+                )
+                if result.stdout:
+                    with open(os.path.join(options.dump_intermediates, f"{kernel_name}.failed.rocmasm"), "w") as f:
+                        f.write(result.stdout)
+                if result.stderr:
+                    with open(os.path.join(options.dump_intermediates, f"{kernel_name}.failed.log"), "w") as f:
+                        f.write(result.stderr)
             raise RuntimeError(f"waveasm-translate failed:\n{result.stderr}")
         asm_text = result.stdout
     finally:
-        os.unlink(mlir_path)
+        if result.returncode == 0:
+            import shutil; shutil.copy2(mlir_path, "/tmp/lowered_gemm.mlir")
+            os.unlink(mlir_path)
 
     if options.dump_intermediates:
-        asm_path = os.path.join(options.dump_intermediates, f"{kernel_name}.rocmasm")
         os.makedirs(options.dump_intermediates, exist_ok=True)
+        asm_path = os.path.join(options.dump_intermediates, f"{kernel_name}.rocmasm")
         with open(asm_path, "w") as f:
             f.write(asm_text)
+        if ir_dump_flags and result.stderr:
+            ir_path = os.path.join(options.dump_intermediates, f"{kernel_name}_waveasm_passes.txt")
+            with open(ir_path, "w") as f:
+                f.write(result.stderr)
+            print(f"WaveASM IR dump saved to {ir_path} ({len(result.stderr)} bytes)")
 
     return asm_text
 

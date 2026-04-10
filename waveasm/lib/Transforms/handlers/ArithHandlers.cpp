@@ -408,7 +408,13 @@ LogicalResult handleArithExtUI(Operation *op, TranslationContext &ctx) {
   auto extOp = cast<arith::ExtUIOp>(op);
   auto src = ctx.getMapper().getMapped(extOp.getIn());
   if (src) {
-    ctx.getMapper().mapValue(extOp.getResult(), *src);
+    Value mapped = *src;
+    if (isSCCType(mapped.getType())) {
+      auto &builder = ctx.getBuilder();
+      auto loc = op->getLoc();
+      mapped = ensureNotSCC(builder, loc, ctx, mapped);
+    }
+    ctx.getMapper().mapValue(extOp.getResult(), mapped);
   } else {
     LLVM_DEBUG(llvm::dbgs() << "ExtUI source not mapped (may be constant)\n");
   }
@@ -466,6 +472,16 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
       rhsOp = S_MOV_B32::create(builder, loc, sregType, rhsOp);
     Value result =
         emitScalarCmp(builder, loc, cmpOp.getPredicate(), lhsOp, rhsOp, ctx);
+
+    bool needsImmediate = !cmpOp.getResult().hasOneUse();
+    if (cmpOp.getResult().hasOneUse()) {
+      Operation *user = *cmpOp.getResult().getUsers().begin();
+      needsImmediate = !isa<ConditionOp>(user) &&
+                       !isa<arith::SelectOp>(user);
+    }
+    if (needsImmediate)
+      result = ensureNotSCC(builder, loc, ctx, result);
+
     ctx.getMapper().mapValue(cmpOp.getResult(), result);
     return success();
   }

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "waveasm/Transforms/Liveness.h"
+#include "waveasm/Dialect/WaveASMInterfaces.h"
 #include "waveasm/Dialect/WaveASMOps.h"
 #include "waveasm/Dialect/WaveASMTypes.h"
 
@@ -17,6 +18,16 @@
 using namespace mlir;
 
 namespace waveasm {
+
+static bool isSCCResult(Value def) {
+  auto result = dyn_cast<OpResult>(def);
+  if (!result)
+    return false;
+  Operation *op = result.getOwner();
+  if (op->hasTrait<OpTrait::SCCDef>() && result.getResultNumber() == 1)
+    return true;
+  return false;
+}
 
 //===----------------------------------------------------------------------===//
 // Iter-arg classification helpers
@@ -308,7 +319,7 @@ LivenessInfo computeLiveness(ProgramOp program) {
         }
       }
       for (Value def : op->getResults()) {
-        if (isVirtualRegType(def.getType())) {
+        if (isVirtualRegType(def.getType()) && !isSCCResult(def)) {
           if (!info.defPoints.contains(def)) {
             info.defPoints[def] = loopResultDefPoint;
           }
@@ -316,7 +327,7 @@ LivenessInfo computeLiveness(ProgramOp program) {
       }
     } else {
       for (Value def : op->getResults()) {
-        if (isVirtualRegType(def.getType())) {
+        if (isVirtualRegType(def.getType()) && !isSCCResult(def)) {
           if (!info.defPoints.contains(def)) {
             info.defPoints[def] = idx;
           }

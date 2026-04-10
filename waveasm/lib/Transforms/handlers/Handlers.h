@@ -302,6 +302,21 @@ inline mlir::Value ensureVGPR(mlir::OpBuilder &builder, mlir::Location loc,
   return v;
 }
 
+/// Materialize SCC to SGPR via s_cselect_b32(scc, 1, 0).
+/// Returns the value unchanged if it is not SCC.
+inline mlir::Value ensureNotSCC(mlir::OpBuilder &builder, mlir::Location loc,
+                                TranslationContext &ctx, mlir::Value v) {
+  if (isSCCType(v.getType())) {
+    auto sregType = ctx.createSRegType();
+    mlir::Value one =
+        ConstantOp::create(builder, loc, ctx.createImmType(1), 1);
+    mlir::Value zero =
+        ConstantOp::create(builder, loc, ctx.createImmType(0), 0);
+    return S_CSELECT_B32::create(builder, loc, sregType, v, one, zero);
+  }
+  return v;
+}
+
 //===----------------------------------------------------------------------===//
 // Auto-select SALU/VALU Emit Helpers
 //===----------------------------------------------------------------------===//

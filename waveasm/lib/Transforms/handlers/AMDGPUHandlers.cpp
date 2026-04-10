@@ -577,9 +577,9 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // allocating a new SRD (which would risk SGPR overflow).
   if (suppressWord3Swizzle) {
     if (hasNonMaxValidBytes && !adj) {
-      // Patch word 2 (NUM_RECORDS) in the source SRD. For prologue SRDs
-      // with known physical base, write directly. For PackOp-built SRDs,
-      // use InsertOp to replace the single word without a full rebuild.
+      // Try to patch word 2 in place for prologue SRDs (known physical
+      // register base). For PackOp-built SRDs (SRegType, no physical
+      // index), fall through to the full rebuild path below.
       int64_t srdBase = -1;
       if (auto psreg = dyn_cast<PSRegType>(srcMapped->getType()))
         srdBase = psreg.getIndex();
@@ -592,13 +592,8 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
         ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
         return success();
       }
-      // PackOp-built SRD: use InsertOp to replace word 2 in place.
-      Value newWord2 = buildSrdWord2(builder, loc, op, ctx);
-      auto srdType = srcMapped->getType();
-      Value updated =
-          InsertOp::create(builder, loc, srdType, newWord2, *srcMapped, 2);
-      ctx.getMapper().mapValue(op->getResult(0), updated);
-      return success();
+      // PackOp SRD -- fall through to full rebuild which handles
+      // suppressWord3Swizzle via the word1/word3 conditionals.
     } else {
       ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
       if (adj) {
@@ -692,15 +687,12 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
     int64_t srdWord1Bits = static_cast<int64_t>(swizzleStride | 0x4000) << 16;
     auto maskImm = ctx.createImmType(0xffff);
     auto maskVal = ConstantOp::create(builder, loc, maskImm, 0xffff);
-    Value cleared = S_AND_B32::create(builder, loc, sregTy, ctx.createSCCType(),
-                                      srcWord1, maskVal)
-                        .getDst();
+    auto sccTy = ctx.createSCCType();
+    Value cleared = S_AND_B32::create(builder, loc, sregTy, sccTy, srcWord1, maskVal).getDst();
     auto swizzleImm = ctx.createImmType(srdWord1Bits);
     auto swizzleVal =
         ConstantOp::create(builder, loc, swizzleImm, srdWord1Bits);
-    word1 = S_OR_B32::create(builder, loc, sregTy, ctx.createSCCType(), cleared,
-                             swizzleVal)
-                .getDst();
+    word1 = S_OR_B32::create(builder, loc, sregTy, sccTy, cleared, swizzleVal).getDst();
   } else {
     word1 = S_MOV_B32::create(builder, loc, sregTy, srcWord1);
   }

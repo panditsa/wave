@@ -28,7 +28,6 @@ module {
       //
       // Swizzle SRD construction sequence:
       //   s_and_b32 + s_or_b32 (set swizzle bits in base hi)
-      //   s_mov_b32 (copy num_records from source SRD word 2)
       //   s_mov_b32 (stride/swizzle flags)
       //   pack into 4-wide SRD
       //
